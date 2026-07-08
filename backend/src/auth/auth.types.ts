@@ -65,7 +65,12 @@ export interface ProjectAccess {
 export interface AuthedRequest {
   headers: Record<string, string | string[] | undefined>;
   params: Record<string, string | undefined>;
+  query?: Record<string, unknown>;
   body: unknown;
+  method?: string;
+  path?: string;
+  originalUrl?: string;
+  requestId?: string;
   ip?: string;
   socket?: { remoteAddress?: string };
   principal?: Principal;

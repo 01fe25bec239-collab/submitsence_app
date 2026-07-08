@@ -35,7 +35,8 @@ per-IP rate limits; integration tokens hashed/referenced and rotated. All contro
 checksum. DB auto-emits `status_change` + `human_signoff`; backend emits the other 12. Each row
 carries tenant, actor type + id, action, entity type + id, timestamp, checksum; backend adds
 `request_id`, `project_id`, source IP, and safe before/after into `payload` (checksum-covered).
-Exports run as read-only `submitsense_auditor`, tenant-scoped.
+Tenant/project-scoped exports run as the app role under RLS (tenant-isolated); `submitsense_auditor`
+is reserved for a future platform-level cross-tenant export.
 
 **Compliance guardrail rules:** no component may system-set an approval/compliance/certification
 state — only an authenticated `human` actor with `submittal.approve` can reach `human_approved`
@@ -132,9 +133,11 @@ Shipped as `backend/src/compliance/language-policy.json` + `language.ts`
 - **Project-level export:** filter `audit_events` by `tenant_id` + `payload->>'project_id'`.
 - **Tenant-level export (admins):** requires permission `audit.read` (held by owner/admin/PM/reviewer/
   billing_admin/integration_admin per `permission-policy.json`).
-- **Cross-tenant safety (f6, NFR2):** run exports through the read-only **`submitsense_auditor`** role
-  and always bind `tenant_id` from trusted context. The auditor role has a SELECT-only audit policy
-  (`db/docs/rls.md`); never widen it, never accept a tenant id from the request body.
+- **Cross-tenant safety (f6, NFR2):** tenant/project export runs as the **app role inside
+  `withTenantClient`**, so RLS scopes it to the caller's tenant — this is correct and *safer* than the
+  auditor role, which **bypasses** tenant RLS. Reserve **`submitsense_auditor`** for a future
+  *platform-level* cross-tenant export only (breach investigation, ops). Always bind `tenant_id` from
+  trusted context; never accept a tenant id from the request body.
 - **Format:** stream CSV/JSONL including `checksum` so recipients can verify tamper-evidence.
 
 ## 5. Data-residency control checklist (deliverable 4; f20, NFR4) — DevOps owns
@@ -275,7 +278,7 @@ migrated DB, `psql ... -f db/test/test_guardrails.sql` (expect 8 PASS).
   pre-signed URL config; security headers + rate limits at the edge; AU-only logs/backups/analytics;
   CI runs both test suites (§13). Region allow-list assertion is your test to add.
 - **Backend:** `recordAudit` helper + emit the 12 non-auto event types with required `payload`
-  fields (§1); audit export endpoints via `submitsense_auditor` (§4); call
+  fields (§1); tenant/project audit export via the app role under RLS (§4); call
   `assertSafeStatusLanguage()` on system copy (§3); enforce human-only transitions on every new
   component (§2); short-lived pre-signed URLs with permission check (§8); consent honoured (§11).
 - **Frontend:** only render system status text that passed the language guard; never display an

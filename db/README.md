@@ -25,7 +25,7 @@ for f in db/migrations/0*.sql; do
 done
 ```
 
-`0001`–`0014` build the schema, `0099_seed.sql` seeds roles/permissions/plans + a test fixture.
+`0001`–`0015` build the schema, `0099_seed.sql` seeds roles/permissions/plans + a test fixture.
 Run migrations as the **owner/superuser** role (it owns the tables and therefore bypasses RLS, which
 is why seeding works). The runtime application connects as a different role — see below.
 
@@ -76,7 +76,7 @@ any `FAIL`. The script rolls back, leaving the DB as seeded.
 
 ```
 db/
-  migrations/   0001..0014 schema, 0099 seed, 9999 teardown
+  migrations/   0001..0015 schema, 0099 seed, 9999 teardown
   test/         test_guardrails.sql — runnable compliance self-check
   docs/         ERD, table/enum docs, RLS, indexing, retention, queries, HANDOFF contract
 ```

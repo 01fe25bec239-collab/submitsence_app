@@ -1,7 +1,7 @@
 # Handoff contract — SubmitSense database layer
 
 For the backend, auth, frontend, QA, and infra agents. This is the stable surface the persistence
-layer exposes. Migrations: `db/migrations/0001–0014`, seed `0099`, teardown `9999`.
+layer exposes. Migrations: `db/migrations/0001–0015`, seed `0099`, teardown `9999`.
 Database guardrails were validated on PostgreSQL 17.10 + pgvector 0.8.4 for `0001`-`0013`
 (all 8 guardrails pass; see `db/test/`). Re-run the same check after applying `0014`.
 

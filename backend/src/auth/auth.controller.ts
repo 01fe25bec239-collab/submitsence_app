@@ -128,10 +128,4 @@ export class AuthController {
     };
   }
 
-  @UseGuards(CognitoAuthGuard, TenantGuard, PermissionGuard)
-  @RequirePermission("sign_off", "projectId")
-  @Post("tenants/:tenantId/projects/:projectId/sign-off-example")
-  signOffExample() {
-    return { ok: true };
-  }
 }

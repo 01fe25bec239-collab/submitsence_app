@@ -6,6 +6,6 @@ import { CognitoAuthGuard, PermissionGuard, TenantGuard } from "./auth.guards";
 @Module({
   controllers: [AuthController],
   providers: [AuthService, CognitoAuthGuard, TenantGuard, PermissionGuard],
-  exports: [AuthService],
+  exports: [AuthService, CognitoAuthGuard, TenantGuard, PermissionGuard],
 })
 export class AuthModule {}

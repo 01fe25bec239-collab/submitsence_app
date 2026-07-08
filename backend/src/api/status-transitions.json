@@ -1,0 +1,9 @@
+{
+  "draft": ["submitted", "cancelled"],
+  "submitted": ["human_approved", "revise_and_resubmit", "rejected", "closed", "cancelled"],
+  "human_approved": ["closed", "cancelled"],
+  "revise_and_resubmit": ["submitted", "closed", "cancelled"],
+  "rejected": ["closed", "cancelled"],
+  "closed": [],
+  "cancelled": []
+}
