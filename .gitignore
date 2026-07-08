@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# Test / coverage
+coverage/
+
+# Terraform (never commit state or vars — they hold secrets)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+# keep .terraform.lock.hcl checked in
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
