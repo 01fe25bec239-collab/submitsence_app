@@ -7,7 +7,7 @@ import {
 } from "@nestjs/common";
 import { createHash, randomBytes } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
-import { withTenantClient } from "../../../db/orm/tenant-db";
+import { withTenantClient } from "../db/tenant-db";
 import { PG_POOL } from "../db.module";
 import type {
   ActorType,
@@ -172,7 +172,7 @@ export class AuthService {
           userKind: ctx.principal.kind,
         },
         action,
-        project,
+        project ?? undefined,
       )
     ) {
       return project ?? null;

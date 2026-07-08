@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "outDir": "dist"
   },
-  "include": ["src/**/*.ts", "../db/orm/**/*.ts"]
+  "include": ["src/**/*.ts"]
 }

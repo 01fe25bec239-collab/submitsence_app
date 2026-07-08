@@ -23,7 +23,7 @@
 - Every protected tenant route requires `Authorization: Bearer <access-token>`.
 - Active tenant is explicit: route `:tenantId` or `x-tenant-id`.
 - Request bodies are never trusted for tenant identity.
-- Tenant DB work must run through `withTenantClient(pool, { tenantId, userId, actorType }, fn)`.
+- Tenant DB work must run through `backend/src/db/tenant-db.ts` `withTenantClient(pool, { tenantId, userId, actorType }, fn)`.
 - Human users map to DB `actorType = human`; service accounts map to `system`, so they cannot sign off.
 
 ## Endpoints
