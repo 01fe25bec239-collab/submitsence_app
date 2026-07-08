@@ -1,0 +1,23 @@
+{
+  "_doc": "System-generated status/label/certification copy must pass assertSafeStatusLanguage() (language.ts). SubmitSense is assistive and non-certifying: it never issues a compliance judgment. Banned = words that assert compliance/approval on the system's behalf (req f11). Allowed = review-oriented framing (req f12). Match is case-insensitive substring; keep entries as short lowercase phrases.",
+  "bannedSystemJudgmentTerms": [
+    "certified",
+    "verified compliant",
+    "guaranteed compliant",
+    "compliance guaranteed",
+    "approved by submitsense",
+    "submitsense certifies",
+    "submitsense approves",
+    "will not be rejected",
+    "guaranteed to pass",
+    "fully compliant",
+    "meets all requirements"
+  ],
+  "allowedReviewTerms": [
+    "likely risk",
+    "needs review",
+    "for your engineer to confirm",
+    "source cited",
+    "prepared for review"
+  ]
+}
