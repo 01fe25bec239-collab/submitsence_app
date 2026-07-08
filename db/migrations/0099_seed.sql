@@ -33,7 +33,8 @@ insert into roles (key, name, description) values
   ('reviewer',        'Reviewer',        'Licensed human reviewer — may record sign-off'),
   ('contributor',     'Contributor',     'Prepare submittals and matches'),
   ('viewer',          'Viewer',          'Read-only'),
-  ('billing_admin',   'Billing Admin',   'Billing only');
+  ('billing_admin',   'Billing Admin',   'Billing only'),
+  ('integration_admin','Integration Admin','Manage consultant-platform integrations');
 
 -- --- Role -> permission mapping --------------------------------------------
 -- owner + admin: every permission.
@@ -71,6 +72,11 @@ where r.key = 'viewer';
 insert into role_permissions (role_id, permission_id)
 select r.id, p.id from roles r join permissions p on p.key in ('billing.manage','audit.read')
 where r.key = 'billing_admin';
+
+-- integration_admin
+insert into role_permissions (role_id, permission_id)
+select r.id, p.id from roles r join permissions p on p.key in ('integration.manage','audit.read')
+where r.key = 'integration_admin';
 
 -- --- Plans ------------------------------------------------------------------
 insert into plans (key, name, tier, price_cents, currency, billing_interval, features) values

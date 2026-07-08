@@ -1,5 +1,5 @@
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 
 export type ActorType = "human" | "service_account" | "system";
 
@@ -25,13 +25,21 @@ export async function withTenant<T>(
   ctx: TenantContext,
   fn: (db: NodePgDatabase) => Promise<T>,
 ): Promise<T> {
+  return withTenantClient(pool, ctx, (client) => fn(drizzle(client)));
+}
+
+export async function withTenantClient<T>(
+  pool: Pool,
+  ctx: TenantContext,
+  fn: (client: PoolClient) => Promise<T>,
+): Promise<T> {
   const client = await pool.connect();
   try {
     await client.query("begin");
     await client.query("select set_config('app.tenant_id', $1, true)", [ctx.tenantId]);
     await client.query("select set_config('app.user_id', $1, true)", [ctx.userId ?? ""]);
     await client.query("select set_config('app.actor_type', $1, true)", [ctx.actorType]);
-    const result = await fn(drizzle(client));
+    const result = await fn(client);
     await client.query("commit");
     return result;
   } catch (e) {

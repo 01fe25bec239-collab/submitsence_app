@@ -43,4 +43,4 @@ await withTenant(pool, { tenantId, userId, actorType: "human" }, async (db) => {
 });
 ```
 
-Moves into the NestJS app when it exists; kept here so the DB layer is self-contained.
+The NestJS auth package imports this helper directly; kept here so the DB layer is still self-contained.

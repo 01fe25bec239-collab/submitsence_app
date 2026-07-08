@@ -1,8 +1,9 @@
 # Handoff contract — SubmitSense database layer
 
 For the backend, auth, frontend, QA, and infra agents. This is the stable surface the persistence
-layer exposes. Migrations: `db/migrations/0001–0013`, seed `0099`, teardown `9999`.
-Validated end-to-end on PostgreSQL 17.10 + pgvector 0.8.4 (all 8 guardrails pass; see `db/test/`).
+layer exposes. Migrations: `db/migrations/0001–0014`, seed `0099`, teardown `9999`.
+Database guardrails were validated on PostgreSQL 17.10 + pgvector 0.8.4 for `0001`-`0013`
+(all 8 guardrails pass; see `db/test/`). Re-run the same check after applying `0014`.
 
 ## 1. Connection & request context (backend + auth)
 
@@ -94,7 +95,7 @@ tenant (RLS `WITH CHECK`), `actor_user_id`/`actor_type` from context; `checksum`
 
 ## 6. Seeded roles & permissions (auth)
 
-Roles: `owner, admin, project_manager, reviewer, contributor, viewer, billing_admin`.
+Roles: `owner, admin, project_manager, reviewer, contributor, viewer, billing_admin, integration_admin`.
 Key permission: **`submittal.approve`** (held by owner/admin/reviewer) — the app-layer gate that
 should precede a `human_approved` write; the DB additionally enforces the human-actor guard.
 Full permission list is seeded in `0099_seed.sql`.

@@ -1,0 +1,35 @@
+{
+  "actions": {
+    "read": { "permission": "project.read", "projectScoped": true },
+    "upload": { "permission": "document.upload", "projectScoped": true },
+    "edit": { "permission": "register.manage", "projectScoped": true },
+    "generate": { "permission": "package.manage", "projectScoped": true },
+    "review": { "permission": "risk.review", "projectScoped": true },
+    "sign_off": { "permission": "submittal.approve", "projectScoped": true, "humanOnly": true },
+    "export": { "permission": "package.manage", "projectScoped": true },
+    "archive": { "permission": "project.manage", "projectScoped": true },
+    "billing": { "permission": "billing.manage", "projectScoped": false },
+    "content_admin": { "permission": "content.author", "projectScoped": false },
+    "integration_admin": { "permission": "integration.manage", "projectScoped": false },
+    "member_manage": { "permission": "member.manage", "projectScoped": false },
+    "project_manage": { "permission": "project.manage", "projectScoped": true },
+    "tenant_settings": { "permission": "member.manage", "projectScoped": false }
+  },
+  "projectRoles": {
+    "lead": ["read", "upload", "edit", "generate", "review", "sign_off", "export", "archive", "project_manage"],
+    "reviewer": ["read", "review", "sign_off", "export"],
+    "contributor": ["read", "upload", "edit"],
+    "viewer": ["read"]
+  },
+  "tenantWideProjectRoles": ["owner", "admin"],
+  "tenantRolePermissions": {
+    "owner": ["project.read", "project.manage", "document.read", "document.upload", "register.read", "register.manage", "submittal.approve", "risk.review", "rfi.manage", "product.match", "vendor.manage", "package.manage", "integration.manage", "billing.manage", "content.author", "member.manage", "audit.read"],
+    "admin": ["project.read", "project.manage", "document.read", "document.upload", "register.read", "register.manage", "submittal.approve", "risk.review", "rfi.manage", "product.match", "vendor.manage", "package.manage", "integration.manage", "billing.manage", "content.author", "member.manage", "audit.read"],
+    "project_manager": ["project.read", "project.manage", "document.read", "document.upload", "register.read", "register.manage", "rfi.manage", "product.match", "vendor.manage", "package.manage", "audit.read"],
+    "reviewer": ["project.read", "document.read", "register.read", "register.manage", "submittal.approve", "risk.review", "rfi.manage", "package.manage", "audit.read"],
+    "contributor": ["project.read", "document.read", "document.upload", "register.read", "register.manage", "product.match", "rfi.manage"],
+    "viewer": ["project.read", "document.read", "register.read"],
+    "billing_admin": ["billing.manage", "audit.read"],
+    "integration_admin": ["integration.manage", "audit.read"]
+  }
+}
