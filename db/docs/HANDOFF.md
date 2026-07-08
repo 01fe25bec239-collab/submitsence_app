@@ -1,7 +1,8 @@
 # Handoff contract — SubmitSense database layer
 
-For the backend, auth, frontend, and QA agents. This is the stable surface the persistence layer
-exposes. Migrations: `db/migrations/0001–0013`, seed `0099`, teardown `9999`.
+For the backend, auth, frontend, QA, and infra agents. This is the stable surface the persistence
+layer exposes. Migrations: `db/migrations/0001–0013`, seed `0099`, teardown `9999`.
+Validated end-to-end on PostgreSQL 17.10 + pgvector 0.8.4 (all 8 guardrails pass; see `db/test/`).
 
 ## 1. Connection & request context (backend + auth)
 
@@ -108,3 +109,33 @@ Full permission list is seeded in `0099_seed.sql`.
   inserting arbitrary `users`). Auth agent owns signup/invite flows.
 - **Not in scope here:** APIs, OCR, LLM prompts, PDF generation, billing-provider integration, auth
   provider setup, deployment, external Aconex/Procore calls.
+
+## 8. Infra / RDS requirements (for the infra agent)
+
+What this schema needs from Amazon RDS. Provisioning (VPC, KMS, DR, ECS/Redis) is the infra agent's;
+these are the persistence-layer constraints it must satisfy.
+
+- **Engine:** RDS for PostgreSQL **17** (validated on 17.10). Region `ap-southeast-2` (Sydney);
+  automated backups + DR replica to `ap-southeast-4` (Melbourne) — both AU, satisfies residency.
+- **Extensions:** `vector` (pgvector ≥ 0.5 for HNSW), `pg_trgm`, `citext` — all on the RDS
+  trusted-extension list; the migrations run `CREATE EXTENSION`. pgvector needs **no** `shared_preload_libraries`.
+- **Roles / who applies migrations:** run `0001–0099` as the **RDS master user** (it owns the tables
+  and so bypasses RLS — required for seeding). The master is not a superuser on RDS, which is fine:
+  `CREATE EXTENSION` (trusted) and `CREATE ROLE` (master has `CREATEROLE`) both work. The migrations
+  create the app roles `submitsense_app` (RLS-scoped) and `submitsense_auditor` (read-only audit).
+- **App connection:** the API/workers connect as a **login role in `submitsense_app`** — never the
+  master. Create it after migrating and store the secret in AWS Secrets Manager:
+  `create role app_login login password '<secret>' in role submitsense_app;` (auditor login likewise).
+- **SSL / encryption:** set `rds.force_ssl=1` (app uses `sslmode=require`); KMS-encrypt storage and
+  backups — this mirrors the per-object `kms_key_arn` the `documents` table already records for S3.
+- **Connection pooling:** if you front RDS with RDS Proxy / PgBouncer, use **transaction** mode. The
+  app sets tenant context via `SET LOCAL` GUCs inside a transaction (`db/orm/tenant-db.ts`);
+  statement-level pooling breaks that and would silently drop tenant isolation.
+- **Apply to the provisioned instance** (as master), then verify:
+  ```bash
+  export PGSSLMODE=require
+  export DATABASE_URL="postgres://<master>:<pw>@<rds-endpoint>:5432/submitsense"
+  for f in db/migrations/0*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" || break; done
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/test/test_guardrails.sql   # expect 8× PASS
+  ```
+  If the test's `set role submitsense_app` is denied, run `grant submitsense_app to <master>;` once.
