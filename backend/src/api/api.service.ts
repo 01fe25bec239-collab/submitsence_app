@@ -975,7 +975,8 @@ export class ApiService {
                 actor_user_id as "actorUserId", entity_type as "entityType", entity_id as "entityId",
                 action, summary, payload, checksum
            from audit_events ae
-          where ($1::timestamptz is null or ae.occurred_at >= $1)
+          where ae.tenant_id = $4::uuid
+            and ($1::timestamptz is null or ae.occurred_at >= $1)
             and ($2::timestamptz is null or ae.occurred_at <= $2)
             and (
               $3::uuid is null
@@ -985,7 +986,7 @@ export class ApiService {
             )
           order by ae.occurred_at desc
           limit 1000`,
-        [api.optionalDate(query.from, "from"), api.optionalDate(query.to, "to"), pid],
+        [api.optionalDate(query.from, "from"), api.optionalDate(query.to, "to"), pid, ctx.tenantId],
       );
       return result.rows;
     });

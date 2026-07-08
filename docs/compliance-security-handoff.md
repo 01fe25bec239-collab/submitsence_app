@@ -134,10 +134,14 @@ Shipped as `backend/src/compliance/language-policy.json` + `language.ts`
 - **Tenant-level export (admins):** requires permission `audit.read` (held by owner/admin/PM/reviewer/
   billing_admin/integration_admin per `permission-policy.json`).
 - **Cross-tenant safety (f6, NFR2):** tenant/project export runs as the **app role inside
-  `withTenantClient`**, so RLS scopes it to the caller's tenant — this is correct and *safer* than the
-  auditor role, which **bypasses** tenant RLS. Reserve **`submitsense_auditor`** for a future
-  *platform-level* cross-tenant export only (breach investigation, ops). Always bind `tenant_id` from
-  trusted context; never accept a tenant id from the request body.
+  `withTenantClient`**, so RLS scopes it to the caller's tenant, **plus** the query carries an explicit
+  `ae.tenant_id = <ctx.tenant>` filter (defence-in-depth). This is correct and *safer* than the
+  `submitsense_auditor` role, whose policy is `using (true)` — it reads **every** tenant's rows
+  (`0013_rls_policies.sql:66`). Do **not** route the tenant/project endpoints through `submitsense_auditor`:
+  with no per-row tenant scoping it would return all tenants' audit logs. Reserve `submitsense_auditor`
+  strictly for an **out-of-band platform-level** cross-tenant export (breach investigation, ops) that
+  intentionally spans tenants — it is not wired into the tenant app pool. Always bind `tenant_id` from
+  trusted context; never from the request body.
 - **Format:** stream CSV/JSONL including `checksum` so recipients can verify tamper-evidence.
 
 ## 5. Data-residency control checklist (deliverable 4; f20, NFR4) — DevOps owns
