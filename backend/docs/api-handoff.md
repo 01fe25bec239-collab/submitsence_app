@@ -18,11 +18,12 @@ Base URL: `/api/v1`. OpenAPI JSON: `/api/v1/openapi.json`.
 - Parsed specs: worksections, clauses, clause references, source pages, superseded markers, submittal requirements.
 - Register: list/filter/sort, assignment, deadline update, status transition, exact-item human sign-off, export request.
 - Physical deliverables: sample/stamped drawing status records only.
-- Vendors/products: catalogue upload/create/parse status, vendors, products, product details, product document links.
-- Matching: list suggestions, accept, reject, human override, rematch job.
+- Vendors/products: catalogue upload/create/parse status, vendors (list + create), products (list + create + review/correct), product details, product document links.
+- Matching: list suggestions, accept, reject, human override, rematch job. The `product_rematch` /
+  `ingest_*` jobs are executed by the B6-B7 worker — see [matching-handoff.md](matching-handoff.md).
 - Risk/RFI: risk generation/list/review/task; RFI generation/retrieve/edit/review/export/integration handoff.
 - Packages: draft, preview, regenerate, PDF export, Aconex-ready bundle export.
-- Dashboard/audit/learning: project status dashboard, tenant/project audit export, consent-gated learning event recording.
+- Dashboard/audit/learning: project status dashboard, tenant/project audit export, consent-gated learning event recording, learning-loop consent opt-in/opt-out, anonymised consent-gated learning-pattern aggregate.
 - Billing/content/help: public plans, tenant trial/subscription, published KB articles, contextual help.
 - Integrations: connection status, mappings, sync jobs, errors, provider webhooks.
 
@@ -41,7 +42,7 @@ The API emits: `document_upload`, `extraction`, `match`, `flag`, `rfi_action`, `
 - Current implementation uses the database as the durable job ledger: `processing_jobs` for document/extraction/package/export/billing work, `sync_jobs` for integration sync, and `webhook_events`/`sync_errors` for inbound integration events.
 - Job lifecycle is `queued -> running -> succeeded | failed`, with `retrying` and `cancelled` available.
 - Every produced job carries an idempotency key; API callers must send `Idempotency-Key` or `X-Idempotency-Key` for upload finalisation, generated jobs, package/export generation, billing webhooks, and integration webhooks.
-- Workers must run with `withTenantClient(pool, { tenantId, userId, actorType: "system" }, fn)` using the job row's trusted `tenant_id`. Background jobs cannot set `human_approved`; the DB rejects system sign-off.
+- Workers must run with `withTenantClient(pool, { tenantId, userId, actorType: "system" }, fn)` using the job row's trusted `tenant_id`. Background jobs cannot set `human_approved`; the DB rejects system sign-off. The B6-B7 worker (`src/worker/worker.ts`) claims jobs cross-tenant via `app.claim_next_job()` (SECURITY DEFINER, `0016`) then processes each in-tenant — the template for other workers.
 - Job audit events must be written inside the tenant transaction, with no PII, secrets, or raw document text in payload.
 - Queue broker/runtime/retry/DLQ policy is still open. Recommended default: keep these DB ledgers and add AWS SQS in `ap-southeast-2` for dispatch, with AU-only DLQ/scratch storage.
 

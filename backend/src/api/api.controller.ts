@@ -160,14 +160,29 @@ export class ApiController {
     return this.service.listVendors(req.auth!, query);
   }
 
+  @Post("vendors")
+  createVendor(@Req() req: AuthedRequest, @Body() body: unknown) {
+    return this.service.createVendor(req.auth!, api.object(body), req);
+  }
+
   @Get("products")
   products(@Req() req: AuthedRequest, @Query() query: Record<string, unknown>) {
     return this.service.listProducts(req.auth!, query);
   }
 
+  @Post("products")
+  createProduct(@Req() req: AuthedRequest, @Body() body: unknown) {
+    return this.service.createProduct(req.auth!, api.object(body), req);
+  }
+
   @Get("products/:productId")
   product(@Req() req: AuthedRequest, @Param("productId") productId: string) {
     return this.service.productDetail(req.auth!, productId);
+  }
+
+  @Patch("products/:productId")
+  updateProduct(@Req() req: AuthedRequest, @Param("productId") productId: string, @Body() body: unknown) {
+    return this.service.updateProduct(req.auth!, productId, api.object(body), req);
   }
 
   @Get("products/:productId/documents")
@@ -337,6 +352,21 @@ export class ApiController {
   @Post("projects/:projectId/learning-events")
   learning(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Body() body: unknown) {
     return this.service.recordLearningEvent(req.auth!, projectId, api.object(body), req);
+  }
+
+  @Get("learning-consent")
+  getLearningConsent(@Req() req: AuthedRequest) {
+    return this.service.getLearningConsent(req.auth!);
+  }
+
+  @Post("learning-consent")
+  setLearningConsent(@Req() req: AuthedRequest, @Body() body: unknown) {
+    return this.service.setLearningConsent(req.auth!, api.object(body), req);
+  }
+
+  @Get("learning-patterns")
+  learningPatterns(@Req() req: AuthedRequest, @Query() query: Record<string, unknown>) {
+    return this.service.learningAggregate(req.auth!, query);
   }
 
   @Get("subscription")

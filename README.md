@@ -15,7 +15,7 @@ TypeScript-first on AWS Australia (`ap-southeast-2`): Next.js + NestJS, PostgreS
 | Path | What | Status |
 |---|---|---|
 | [`db/`](db/) | PostgreSQL data model — 15 migrations, RLS, guardrails, seed, docs | ✅ built & validated on PG 17.10 (8/8 guardrails pass) |
-| [`backend/`](backend/) | NestJS API — auth, RBAC/ABAC, tenant scoping | 🚧 in progress (auth layer) |
+| [`backend/`](backend/) | NestJS API + B6-B7 matching worker — auth, RBAC/ABAC, tenant scoping, catalogue ingestion, requirement→product matching | 🚧 in progress |
 | `terraform/` | AWS infrastructure (RDS, KMS, VPC, ECS) | ⏳ pending infra agent |
 
 ## Getting started

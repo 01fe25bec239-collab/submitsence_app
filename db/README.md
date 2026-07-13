@@ -20,12 +20,14 @@ Run migrations in ascending filename order on a blank database:
 
 ```bash
 export DATABASE_URL="postgres://owner@localhost:5432/submitsense"
-for f in db/migrations/0*.sql; do
+# apply forward migrations in order, skipping paired *.down.sql rollback files
+for f in $(ls db/migrations/0*.sql | grep -v '\.down\.'); do
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
 done
 ```
 
-`0001`–`0015` build the schema, `0099_seed.sql` seeds roles/permissions/plans + a test fixture.
+`0001`–`0016` build the schema (`0016` adds the `app.claim_next_job()` worker-queue claimer),
+`0099_seed.sql` seeds roles/permissions/plans + a test fixture.
 Run migrations as the **owner/superuser** role (it owns the tables and therefore bypasses RLS, which
 is why seeding works). The runtime application connects as a different role — see below.
 
@@ -76,7 +78,7 @@ any `FAIL`. The script rolls back, leaving the DB as seeded.
 
 ```
 db/
-  migrations/   0001..0015 schema, 0099 seed, 9999 teardown
+  migrations/   0001..0016 schema, 0099 seed, 9999 teardown
   test/         test_guardrails.sql — runnable compliance self-check
   docs/         ERD, table/enum docs, RLS, indexing, retention, queries, HANDOFF contract
 ```

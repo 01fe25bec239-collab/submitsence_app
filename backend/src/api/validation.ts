@@ -9,9 +9,12 @@ export const physicalKinds = new Set(["physical_sample", "stamped_shop_drawing",
 export const physicalStatuses = new Set(["required", "requested", "in_transit", "received", "returned", "waived"]);
 export const matchDecisions = new Set(["accepted", "rejected"]);
 export const riskStates = new Set(["confirmed", "dismissed", "resolved"]);
+export const consultantOutcomes = new Set(["approved", "revise_and_resubmit", "rejected", "withdrawn", "unknown"]);
 export const rfiConflictTypes = new Set(["ambiguity", "conflict", "missing_information", "discrepancy", "other"]);
 export const integrationProviders = new Set(["aconex", "procore", "other"]);
 export const syncJobTypes = new Set(["package_push", "response_pull"]);
+export const consentStates = new Set(["opted_in", "opted_out"]); // 'unset' is the default, never a user choice
+export const requirementCategories = new Set(["submission", "hold_point", "evidence_of_conformity", "sample", "shop_drawing", "product_data", "test_report", "certificate", "manual", "commissioning_record", "other"]);
 
 export function object(body: unknown): Record<string, unknown> {
   return body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};

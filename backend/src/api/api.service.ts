@@ -12,6 +12,8 @@ import { AuthService } from "../auth/auth.service";
 import type { AuthContext, AuthedRequest } from "../auth/auth.types";
 import * as v from "../auth/validation";
 import { assertSafeStatusLanguage } from "../compliance/language";
+import { getEmbedder, toVectorLiteral } from "../ingestion/embedder";
+import { extractStandards } from "../ingestion/extraction";
 import { withTenantClient } from "../db/tenant-db";
 import { PG_POOL } from "../db.module";
 import transitions from "./status-transitions.json";
@@ -619,6 +621,177 @@ export class ApiService {
     });
   }
 
+  // --- Manual vendor/product entry + review/correction (req f: product review APIs). Lets a tenant
+  //     curate its own catalogue without an OCR pipeline; corrections use source='manual_entry' so a
+  //     later catalogue re-ingest never overwrites them.
+  async createVendor(ctx: AuthContext, body: Record<string, unknown>, req?: AuthedRequest) {
+    await this.auth.requireTenantPermission(ctx, "vendor.manage", req);
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      const result = await client.query(
+        `insert into vendors (tenant_id, name, website, contact_email, contact_phone)
+         values ($1, $2, $3, $4, $5)
+         returning id, name, website, contact_email as "contactEmail", contact_phone as "contactPhone"`,
+        [ctx.tenantId, v.string(body.name, "name"), api.optionalString(body.website), api.optionalString(body.contactEmail), api.optionalString(body.contactPhone)],
+      );
+      await this.recordAudit(client, ctx, "admin_action", "vendor", result.rows[0].id, "vendor_create", "Vendor created", {}, req);
+      return result.rows[0];
+    });
+  }
+
+  async createProduct(ctx: AuthContext, body: Record<string, unknown>, req?: AuthedRequest) {
+    await this.auth.requireTenantPermission(ctx, "vendor.manage", req);
+    const vendorId = v.uuid(body.vendorId, "vendorId");
+    const attributes = this.parseAttributes(body.attributes);
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      const vendor = await client.query(`select id from vendors where id = $1`, [vendorId]);
+      if (!vendor.rows[0]) throw new BadRequestException("vendorId must be an existing tenant vendor");
+      const product = await client.query<{ id: string; name: string; model_number: string | null }>(
+        `insert into products (tenant_id, vendor_id, catalogue_id, name, model_number, category, description, datasheet_document_id)
+         values ($1, $2, $3, $4, $5, $6, $7, $8)
+         returning id, name, model_number`,
+        [
+          ctx.tenantId,
+          vendorId,
+          api.optionalUuid(body.catalogueId, "catalogueId"),
+          v.string(body.name, "name"),
+          api.optionalString(body.modelNumber),
+          api.optionalString(body.category),
+          api.optionalString(body.description),
+          api.optionalUuid(body.datasheetDocumentId, "datasheetDocumentId"),
+        ],
+      );
+      await this.writeManualAttributes(client, ctx.tenantId, product.rows[0].id, attributes);
+      await this.indexProductEmbedding(client, ctx.tenantId, product.rows[0].id);
+      await this.recordAudit(client, ctx, "admin_action", "product", product.rows[0].id, "product_create", "Product created", { vendorId }, req);
+      return { id: product.rows[0].id, name: product.rows[0].name, modelNumber: product.rows[0].model_number };
+    });
+  }
+
+  async updateProduct(ctx: AuthContext, productId: string, body: Record<string, unknown>, req?: AuthedRequest) {
+    await this.auth.requireTenantPermission(ctx, "vendor.manage", req);
+    const id = v.uuid(productId, "productId");
+    const attributes = body.attributes === undefined ? null : this.parseAttributes(body.attributes);
+    const archived = body.isArchived === undefined ? null : body.isArchived === true;
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      const result = await client.query(
+        `update products
+            set name = coalesce($2, name), model_number = coalesce($3, model_number),
+                category = coalesce($4, category), description = coalesce($5, description),
+                is_archived = coalesce($6, is_archived)
+          where id = $1
+          returning id, name, model_number as "modelNumber", is_archived as "isArchived"`,
+        [id, api.optionalString(body.name), api.optionalString(body.modelNumber), api.optionalString(body.category), api.optionalString(body.description), archived],
+      );
+      const row = result.rows[0] ?? this.notFound("product");
+      if (attributes) await this.writeManualAttributes(client, ctx.tenantId, id, attributes, true);
+      await this.indexProductEmbedding(client, ctx.tenantId, id);
+      await this.recordAudit(client, ctx, "admin_action", "product", id, "product_correction", "Product reviewed/corrected", {}, req);
+      return row;
+    });
+  }
+
+  // --- Learning-loop consent (req f: tenant opt-in/opt-out) + anonymised aggregation ------------
+  async getLearningConsent(ctx: AuthContext) {
+    await this.auth.requireTenantPermission(ctx, "member.manage");
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      const result = await client.query(
+        `select learning_loop as "learningLoop", data_use_preferences as "dataUsePreferences", decided_at as "decidedAt"
+           from tenant_consents where tenant_id = $1`,
+        [ctx.tenantId],
+      );
+      return result.rows[0] ?? { learningLoop: "unset", dataUsePreferences: {}, decidedAt: null };
+    });
+  }
+
+  async setLearningConsent(ctx: AuthContext, body: Record<string, unknown>, req?: AuthedRequest) {
+    await this.auth.requireTenantPermission(ctx, "member.manage", req);
+    const state = api.enumValue(body.learningLoop, "learningLoop", api.consentStates);
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      const result = await client.query(
+        `insert into tenant_consents (tenant_id, learning_loop, decided_by, decided_at)
+         values ($1, $2::consent_state, $3, now())
+         on conflict (tenant_id) do update set learning_loop = excluded.learning_loop, decided_by = excluded.decided_by, decided_at = now()
+         returning learning_loop as "learningLoop", decided_at as "decidedAt"`,
+        [ctx.tenantId, state, ctx.principal.id],
+      );
+      // Opt-out permanently excludes all events collected before this decision.
+      if (state === "opted_out") {
+        await client.query(`update rejection_learning_events set opted_out = true where tenant_id = $1 and opted_out = false`, [ctx.tenantId]);
+      }
+      await this.recordAudit(client, ctx, "consent_change", "tenant_consent", ctx.tenantId, `learning_${state}`, `Learning-loop consent set to ${state}`, { learningLoop: state }, req);
+      return result.rows[0];
+    });
+  }
+
+  // Anonymised pattern aggregation, gated on this tenant's opt-in and the DB eligibility filter.
+  // Stays inside withTenantClient so RLS scopes it to the tenant (NFR2: no cross-tenant retrieval).
+  // Output carries counts + non-identifying dimensions only — no user, no external consultant ref.
+  async learningAggregate(ctx: AuthContext, query: Record<string, unknown>) {
+    await this.auth.requireTenantPermission(ctx, "risk.review");
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      const consent = await client.query<{ learning_loop: string }>(`select learning_loop from tenant_consents where tenant_id = $1 for share`, [ctx.tenantId]);
+      if (consent.rows[0]?.learning_loop !== "opted_in") return { consent: "not_opted_in", patterns: [] };
+      const result = await client.query(
+        `select ws.code as "worksectionCode", sr.category::text as "requirementCategory",
+                rf.risk_type::text as "riskType", e.consultant_outcome::text as "consultantOutcome",
+                count(*)::int as count
+           from rejection_learning_events e
+           left join risk_flags rf on rf.id = e.risk_flag_id and rf.tenant_id = e.tenant_id
+           left join register_items ri on ri.id = e.register_item_id and ri.tenant_id = e.tenant_id
+           left join submittal_requirements sr on sr.id = ri.requirement_id and sr.tenant_id = e.tenant_id
+           left join worksections ws on ws.id = sr.worksection_id and ws.tenant_id = e.tenant_id
+          where e.anonymised_eligible = true and e.opted_out = false and e.consent_state = 'opted_in'
+          group by ws.code, sr.category, rf.risk_type, e.consultant_outcome
+          order by count desc
+          limit 200`,
+      );
+      return { consent: "opted_in", patterns: result.rows };
+    });
+  }
+
+  private parseAttributes(value: unknown): { key: string; value: string | null; unit: string | null }[] {
+    if (value === undefined || value === null) return [];
+    if (!Array.isArray(value)) throw new BadRequestException("attributes must be an array");
+    return value.map((a) => {
+      const obj = api.object(a);
+      return { key: v.string(obj.key, "attributes[].key"), value: api.optionalString(obj.value), unit: api.optionalString(obj.unit) };
+    });
+  }
+
+  private async writeManualAttributes(client: PoolClient, tenantId: string, productId: string, attrs: { key: string; value: string | null; unit: string | null }[], replace = false) {
+    if (replace) await client.query(`delete from product_attributes where tenant_id = $1 and product_id = $2 and source = 'manual_entry'`, [tenantId, productId]);
+    for (const a of attrs) {
+      await client.query(
+        `insert into product_attributes (tenant_id, product_id, attr_key, attr_value, unit, source) values ($1, $2, $3, $4, $5, 'manual_entry')`,
+        [tenantId, productId, a.key, a.value, a.unit],
+      );
+    }
+  }
+
+  // Best-effort embedding index for a product (semantic search input). Local deterministic embedder
+  // by default; a real AU-hosted model is a processor-approval decision (embedder.ts).
+  private async indexProductEmbedding(client: PoolClient, tenantId: string, productId: string) {
+    const p = await client.query<{ name: string; model_number: string | null; category: string | null; description: string | null }>(
+      `select name, model_number, category, description from products where id = $1`,
+      [productId],
+    );
+    if (!p.rows[0]) return;
+    const attrs = await client.query<{ attr_key: string; attr_value: string | null }>(`select attr_key, attr_value from product_attributes where tenant_id = $1 and product_id = $2`, [tenantId, productId]);
+    const text = [p.rows[0].name, p.rows[0].model_number, p.rows[0].category, p.rows[0].description, ...attrs.rows.map((a) => `${a.attr_key} ${a.attr_value ?? ""}`), ...extractStandards(p.rows[0].description)].filter(Boolean).join(" ");
+    try {
+      const embedder = getEmbedder();
+      const vec = await embedder.embed(text);
+      await client.query(
+        `insert into product_embeddings (tenant_id, product_id, embedding_model, embedding)
+         values ($1, $2, $3, $4::vector)
+         on conflict (product_id, embedding_model) do update set embedding = excluded.embedding, created_at = now()`,
+        [tenantId, productId, embedder.model, toVectorLiteral(vec)],
+      );
+    } catch {
+      // semantic index is optional; lexical matching still works without it
+    }
+  }
+
   async listProductMatches(ctx: AuthContext, projectId: string) {
     await this.auth.requireTenantPermission(ctx, "product.match");
     const pid = v.uuid(projectId, "projectId");
@@ -994,9 +1167,24 @@ export class ApiService {
 
   async recordLearningEvent(ctx: AuthContext, projectId: string, body: Record<string, unknown>, req?: AuthedRequest) {
     const pid = v.uuid(projectId, "projectId");
+    const riskFlagId = api.optionalUuid(body.riskFlagId, "riskFlagId");
+    const registerItemId = api.optionalUuid(body.registerItemId, "registerItemId");
+    const humanDecision = body.humanDecision === undefined || body.humanDecision === null || body.humanDecision === ""
+      ? null
+      : api.enumValue(body.humanDecision, "humanDecision", api.riskStates);
+    const consultantOutcome = body.consultantOutcome === undefined || body.consultantOutcome === null || body.consultantOutcome === ""
+      ? "unknown"
+      : api.enumValue(body.consultantOutcome, "consultantOutcome", api.consultantOutcomes);
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
-      const consent = await client.query<{ learning_loop: string }>(`select learning_loop from tenant_consents where tenant_id = $1`, [ctx.tenantId]);
+      const consent = await client.query<{ learning_loop: string }>(`select learning_loop from tenant_consents where tenant_id = $1 for share`, [ctx.tenantId]);
       if (consent.rows[0]?.learning_loop !== "opted_in") throw new ForbiddenException("Learning loop consent is not opted in");
+      if (registerItemId) await this.requireRegisterItem(client, pid, registerItemId);
+      if (riskFlagId) {
+        const flag = await this.requireRiskFlag(client, pid, riskFlagId);
+        if (registerItemId && flag.register_item_id && flag.register_item_id !== registerItemId) {
+          throw new BadRequestException("riskFlagId and registerItemId must refer to the same register item");
+        }
+      }
       const result = await client.query(
         `insert into rejection_learning_events (tenant_id, risk_flag_id, register_item_id, human_decision, consultant_outcome,
                                                 anonymised_eligible, consent_state, opted_out)
@@ -1004,10 +1192,10 @@ export class ApiService {
          returning id, consent_state as "consentState"`,
         [
           ctx.tenantId,
-          api.optionalUuid(body.riskFlagId, "riskFlagId"),
-          api.optionalUuid(body.registerItemId, "registerItemId"),
-          api.optionalString(body.humanDecision),
-          api.optionalString(body.consultantOutcome) ?? "unknown",
+          riskFlagId,
+          registerItemId,
+          humanDecision,
+          consultantOutcome,
           body.anonymisedEligible === true,
         ],
       );
@@ -1273,6 +1461,12 @@ export class ApiService {
   private async requireRegisterItem(client: PoolClient, projectId: string, itemId: string) {
     const result = await client.query(`select id from register_items where project_id = $1 and id = $2`, [projectId, itemId]);
     if (!result.rows[0]) throw new NotFoundException("register item not found");
+  }
+
+  private async requireRiskFlag(client: PoolClient, projectId: string, flagId: string) {
+    const result = await client.query<{ register_item_id: string | null }>(`select register_item_id from risk_flags where project_id = $1 and id = $2`, [projectId, flagId]);
+    if (!result.rows[0]) throw new NotFoundException("risk flag not found");
+    return result.rows[0];
   }
 
   private async requireProjectDocument(client: PoolClient, projectId: string, documentId: string) {

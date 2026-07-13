@@ -5,7 +5,8 @@
   "scripts": {
     "start:dev": "tsx src/main.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/*.test.mjs"
+    "worker": "tsx src/worker/worker.ts",
+    "test": "node --import tsx --test test/*.test.mjs test/*.test.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.0",
