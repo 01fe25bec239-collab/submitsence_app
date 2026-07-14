@@ -82,16 +82,34 @@ async function upsertVendor(client: PoolClient, tenantId: string, name: string, 
 // model) is treated as the same product and updated in place, keeping ingestion idempotent.
 async function upsertProduct(client: PoolClient, input: IngestInput, vendorId: string, p: ExtractedProduct): Promise<{ productId: string; created: boolean }> {
   const dup = await client.query<{ id: string }>(
-    `select id from products
-      where tenant_id = $1 and vendor_id = $2
-        and ($3::text is not null and lower(model_number) = lower($3)
-             or $3::text is null and lower(name) = lower($4))
+    `select p.id from products p
+      where p.tenant_id = $1 and p.vendor_id = $2
+        and (
+          $3::text is not null and (
+            lower(p.model_number) = lower($3)
+            or exists (
+              select 1 from extracted_product_data extracted
+               where extracted.tenant_id = p.tenant_id and extracted.product_id = p.id
+                 and lower(extracted.data->>'modelNumber') = lower($3)
+            )
+          )
+          or $3::text is null and (
+            lower(p.name) = lower($4)
+            or exists (
+              select 1 from extracted_product_data extracted
+               where extracted.tenant_id = p.tenant_id and extracted.product_id = p.id
+                 and lower(extracted.data->>'name') = lower($4)
+            )
+          )
+        )
       limit 1`,
     [input.tenantId, vendorId, p.modelNumber ?? null, p.name],
   );
   if (dup.rows[0]) {
     await client.query(
-      `update products set name = $2, category = coalesce($3, category), description = coalesce($4, description),
+      `update products set name = case when manually_reviewed then name else $2 end,
+              category = case when manually_reviewed then category else coalesce($3, category) end,
+              description = case when manually_reviewed then description else coalesce($4, description) end,
               catalogue_id = coalesce($5, catalogue_id), is_archived = false, updated_at = now()
         where id = $1`,
       [dup.rows[0].id, p.name, p.category, p.description, input.catalogueId],

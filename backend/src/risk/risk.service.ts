@@ -100,7 +100,13 @@ async function loadRiskItems(client: PoolClient, input: RiskJobInput): Promise<R
       order by ri.created_at, ri.id`,
     [input.tenantId, input.projectId, input.registerItemId ?? null, input.packageId ?? null],
   );
-  if (input.registerItemId && base.rows.length === 0) throw new Error("Risk pre-check register item does not belong to the project or package");
+  if (input.registerItemId && base.rows.length === 0) {
+    const owned = await client.query(
+      `select 1 from register_items where tenant_id = $1 and project_id = $2 and id = $3`,
+      [input.tenantId, input.projectId, input.registerItemId],
+    );
+    if (!owned.rows[0]) throw new Error("Risk pre-check register item does not belong to the project");
+  }
   const ids = base.rows.map((row) => row.register_item_id);
   if (ids.length === 0) return [];
 
@@ -224,7 +230,7 @@ export async function runRiskPrecheck(client: PoolClient, input: RiskJobInput): 
        on conflict (tenant_id, project_id, register_item_id, rule_key) where register_item_id is not null
        do update set risk_type = excluded.risk_type, severity = excluded.severity, summary = excluded.summary,
                      evidence = excluded.evidence, risk_score = excluded.risk_score, scoring_version = excluded.scoring_version,
-                     generation_job_id = excluded.generation_job_id, updated_at = now()
+                     generation_job_id = excluded.generation_job_id, is_active = true, updated_at = now()
          where risk_flags.state = 'open'
        returning id, (xmax = 0) as inserted`,
       [input.tenantId, input.projectId, item.registerItemId, item.clauseReferenceId,
@@ -256,10 +262,61 @@ export async function runRiskPrecheck(client: PoolClient, input: RiskJobInput): 
     if (consent.rows[0]?.learning_loop === "opted_in") {
       await client.query(
         `insert into rejection_learning_events (tenant_id, risk_flag_id, register_item_id, anonymised_eligible, consent_state, opted_out)
-         values ($1, $2, $3, true, 'opted_in', false)`,
+         values ($1, $2, $3, true, 'opted_in', false)
+         on conflict (tenant_id, risk_flag_id) where risk_flag_id is not null and opted_out = false
+         do nothing`,
         [input.tenantId, row.id, item.registerItemId],
       );
     }
+  }
+  await client.query(
+    `update risk_flags rf
+        set is_active = false, updated_at = now()
+      where rf.tenant_id = $1 and rf.project_id = $2
+        and rf.state = 'open' and rf.is_active = true
+        and (
+          (
+            ($3::uuid is null or rf.register_item_id = $3)
+            and not exists (
+              select 1 from register_items ri
+               where ri.tenant_id = rf.tenant_id and ri.project_id = rf.project_id
+                 and ri.id = rf.register_item_id and ri.archived_at is null
+            )
+          )
+          or (
+            $4::uuid is not null
+            and (
+              ($3::uuid is not null and rf.register_item_id = $3)
+              or exists (
+                select 1 from processing_jobs job
+                 where job.tenant_id = rf.tenant_id and job.id = rf.generation_job_id
+                   and nullif(job.worker_output->>'packageId', '')::uuid = $4
+              )
+            )
+            and not exists (
+              select 1 from package_items pi
+               where pi.tenant_id = rf.tenant_id and pi.package_id = $4
+                 and pi.register_item_id = rf.register_item_id and pi.included = true
+            )
+          )
+        )`,
+    [input.tenantId, input.projectId, input.registerItemId ?? null, input.packageId ?? null],
+  );
+  const currentRules = new Map<string, string[]>();
+  for (const item of items) currentRules.set(item.registerItemId, []);
+  for (const finding of findings) {
+    const itemId = finding.evidence.find((ref) => ref.kind === "register_item")?.id;
+    if (itemId) currentRules.get(itemId)?.push(finding.ruleKey);
+  }
+  for (const [itemId, rules] of currentRules) {
+    await client.query(
+      `update risk_flags
+          set is_active = false, updated_at = now()
+        where tenant_id = $1 and project_id = $2 and register_item_id = $3
+          and state = 'open' and is_active = true
+          and not (rule_key = any($4::text[]))`,
+      [input.tenantId, input.projectId, itemId, rules],
+    );
   }
   return { projectId: input.projectId, packageId: input.packageId ?? null, registerItemId: input.registerItemId ?? null, scoringVersion: RISK_SCORING_VERSION, checkedItems: items.length, findings: findings.length, created, refreshed, flagIds };
 }
@@ -296,7 +353,7 @@ export async function generateRfiDraft(client: PoolClient, input: RfiJobInput): 
        from register_items ri
        left join submittal_requirements sr on sr.tenant_id = ri.tenant_id and sr.id = ri.requirement_id
        left join risk_flags rf on rf.tenant_id = ri.tenant_id and rf.register_item_id = ri.id
-                               and ($3::uuid is null or rf.id = $3) and rf.state in ('open', 'confirmed')
+                               and ($3::uuid is null or rf.id = $3) and rf.state in ('open', 'confirmed') and rf.is_active = true
        left join clause_references cr on cr.tenant_id = ri.tenant_id and cr.id = coalesce(rf.clause_reference_id, sr.clause_reference_id)
       where ri.tenant_id = $1 and ri.project_id = $2 and ri.archived_at is null
         and ($4::uuid is null or ri.id = $4)

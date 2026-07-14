@@ -61,7 +61,7 @@ export class CognitoAuthGuard implements CanActivate {
 
   private async verify(token: string): Promise<Record<string, unknown>> {
     if (this.verifier) return this.verifier.verify(token);
-    if (process.env.AUTH_ALLOW_UNSIGNED_JWT === "true") return this.decodeUnsignedJwt(token);
+    if (["development", "test"].includes(process.env.NODE_ENV ?? "") && process.env.AUTH_ALLOW_UNSIGNED_JWT === "true") return this.decodeUnsignedJwt(token);
     throw new UnauthorizedException("Cognito verifier is not configured");
   }
 

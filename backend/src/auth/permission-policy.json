@@ -5,6 +5,7 @@
     "edit": { "permission": "register.manage", "projectScoped": true },
     "generate": { "permission": "package.manage", "projectScoped": true },
     "review": { "permission": "risk.review", "projectScoped": true },
+    "rfi_manage": { "permission": "rfi.manage", "projectScoped": true },
     "sign_off": { "permission": "submittal.approve", "projectScoped": true, "humanOnly": true },
     "export": { "permission": "package.manage", "projectScoped": true },
     "archive": { "permission": "project.manage", "projectScoped": true },
@@ -16,9 +17,9 @@
     "tenant_settings": { "permission": "member.manage", "projectScoped": false }
   },
   "projectRoles": {
-    "lead": ["read", "upload", "edit", "generate", "review", "sign_off", "export", "archive", "project_manage"],
-    "reviewer": ["read", "review", "sign_off", "export"],
-    "contributor": ["read", "upload", "edit"],
+    "lead": ["read", "upload", "edit", "generate", "review", "rfi_manage", "sign_off", "export", "archive", "project_manage"],
+    "reviewer": ["read", "review", "rfi_manage", "sign_off", "export"],
+    "contributor": ["read", "upload", "edit", "rfi_manage"],
     "viewer": ["read"]
   },
   "tenantWideProjectRoles": ["owner", "admin"],

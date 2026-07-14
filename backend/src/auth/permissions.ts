@@ -31,7 +31,7 @@ export function canPerformAction(ctx: PermissionContext, action: AuthAction, pro
   if (!ctx.permissions.includes(rule.permission)) return false;
   if (rule.humanOnly && (ctx.actorType !== "human" || ctx.userKind !== "human")) return false;
   if (!rule.projectScoped) return true;
-  if (!project || project.isArchived) return false;
+  if (!project || (project.isArchived && action !== "archive")) return false;
   if (tenantWideProjectRoles.has(ctx.tenantRole)) return true;
   return !!project.projectRole && projectRoles[project.projectRole].includes(action);
 }

@@ -6,7 +6,7 @@ const policyUrl = new URL("../src/auth/permission-policy.json", import.meta.url)
 const policy = JSON.parse(readFileSync(policyUrl, "utf8"));
 
 test("all prompt-2 actions have permission mappings", () => {
-  for (const action of ["read", "upload", "edit", "generate", "review", "sign_off", "export", "archive", "billing", "content_admin", "integration_admin"]) {
+  for (const action of ["read", "upload", "edit", "generate", "review", "rfi_manage", "sign_off", "export", "archive", "billing", "content_admin", "integration_admin"]) {
     assert.ok(policy.actions[action], action);
   }
 });
@@ -21,6 +21,12 @@ test("human sign-off requires app permission and human actor gate", () => {
 test("viewer and billing admin stay least privilege", () => {
   assert.deepEqual(policy.projectRoles.viewer, ["read"]);
   assert.deepEqual(policy.tenantRolePermissions.billing_admin, ["billing.manage", "audit.read"]);
+});
+
+test("RFI drafting requires rfi.manage and a non-viewer project role", () => {
+  assert.equal(policy.actions.rfi_manage.permission, "rfi.manage");
+  for (const role of ["lead", "reviewer", "contributor"]) assert.ok(policy.projectRoles[role].includes("rfi_manage"));
+  assert.ok(!policy.projectRoles.viewer.includes("rfi_manage"));
 });
 
 test("integration admin does not inherit billing or member management", () => {

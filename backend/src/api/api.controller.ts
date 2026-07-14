@@ -36,11 +36,13 @@ export class ApiController {
     return this.service.updateProject(req.auth!, projectId, api.object(body), req);
   }
 
+  @RequirePermission("archive", "projectId")
   @Post("projects/:projectId/archive")
   archiveProject(@Req() req: AuthedRequest, @Param("projectId") projectId: string) {
     return this.service.archiveProject(req.auth!, projectId, true, req);
   }
 
+  @RequirePermission("archive", "projectId")
   @Post("projects/:projectId/unarchive")
   unarchiveProject(@Req() req: AuthedRequest, @Param("projectId") projectId: string) {
     return this.service.archiveProject(req.auth!, projectId, false, req);
@@ -274,7 +276,7 @@ export class ApiController {
     return this.service.createRiskRfi(req.auth!, projectId, flagId, input, api.idempotencyKey(req.headers, input), req);
   }
 
-  @RequirePermission("read", "projectId")
+  @RequirePermission("rfi_manage", "projectId")
   @Post("projects/:projectId/rfis/generate")
   @HttpCode(202)
   generateRfi(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Body() body: unknown) {
@@ -288,25 +290,25 @@ export class ApiController {
     return this.service.getRfi(req.auth!, projectId, rfiId);
   }
 
-  @RequirePermission("read", "projectId")
+  @RequirePermission("rfi_manage", "projectId")
   @Patch("projects/:projectId/rfis/:rfiId")
   updateRfi(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Param("rfiId") rfiId: string, @Body() body: unknown) {
     return this.service.updateRfi(req.auth!, projectId, rfiId, api.object(body), req);
   }
 
-  @RequirePermission("read", "projectId")
+  @RequirePermission("review", "projectId")
   @Post("projects/:projectId/rfis/:rfiId/mark-reviewed")
   reviewRfi(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Param("rfiId") rfiId: string) {
     return this.service.markRfiReviewed(req.auth!, projectId, rfiId, req);
   }
 
-  @RequirePermission("read", "projectId")
+  @RequirePermission("review", "projectId")
   @Post("projects/:projectId/rfis/:rfiId/export")
   exportRfi(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Param("rfiId") rfiId: string, @Body() body: unknown) {
     return this.service.exportRfi(req.auth!, projectId, rfiId, api.idempotencyKey(req.headers, api.object(body)), req);
   }
 
-  @RequirePermission("read", "projectId")
+  @RequirePermission("review", "projectId")
   @Post("projects/:projectId/rfis/:rfiId/handoff")
   handoffRfi(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Param("rfiId") rfiId: string, @Body() body: unknown) {
     const input = api.object(body);

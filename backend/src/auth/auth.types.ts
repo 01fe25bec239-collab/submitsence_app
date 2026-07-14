@@ -16,6 +16,7 @@ export type AuthAction =
   | "edit"
   | "generate"
   | "review"
+  | "rfi_manage"
   | "sign_off"
   | "export"
   | "archive"

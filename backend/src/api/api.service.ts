@@ -54,6 +54,7 @@ const ingestJobType: Record<string, string> = {
   other: "ingest_document",
 };
 const externalConsultantStatuses = new Set(["submitted", "revise_and_resubmit", "rejected"]);
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 
 @Injectable()
 export class ApiService {
@@ -190,29 +191,32 @@ export class ApiService {
     const filename = api.safeFilename(body.filename);
     const mimeType = v.string(body.mimeType, "mimeType").toLowerCase();
     this.assertAllowedMime(docType, mimeType);
-    const sizeBytes = api.positiveInt(body.sizeBytes, "sizeBytes");
+    const sizeBytes = this.uploadSize(body.sizeBytes);
     const bucket = process.env.S3_UPLOAD_BUCKET ?? process.env.S3_BUCKET ?? "submitsense-dev-uploads";
     const objectKey = `tenants/${ctx.tenantId}/projects/${pid}/${docType}/${randomUUID()}-${filename}`;
     const expiresSeconds = Math.min(Number(process.env.S3_UPLOAD_EXPIRES_SECONDS ?? 900), 900);
-    const signed = this.presignPutObject(bucket, objectKey, mimeType, expiresSeconds);
+    const signed = this.presignPutObject(bucket, objectKey, mimeType, sizeBytes, expiresSeconds);
     await withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
       await this.requireProject(client, pid, false);
       await this.recordAudit(client, ctx, "document_upload", "project", pid, "upload_initiated", "Document upload initiated", { project_id: pid, docType, objectKey, sizeBytes }, req);
     });
-    return { bucket, objectKey, uploadUrl: signed.url, expiresAt: signed.expiresAt, requiredHeaders: { "content-type": mimeType } };
+    return { bucket, objectKey, uploadUrl: signed.url, expiresAt: signed.expiresAt, requiredHeaders: { "content-length": String(sizeBytes), "content-type": mimeType } };
   }
 
   async finalizeUpload(ctx: AuthContext, projectId: string, body: Record<string, unknown>, idempotencyKey: string, req?: AuthedRequest) {
     const pid = v.uuid(projectId, "projectId");
     const docType = api.enumValue(body.docType, "docType", api.documentTypes);
     if (docType === "vendor_catalogue") await this.auth.requireTenantPermission(ctx, "vendor.manage", req);
-    const bucket = api.optionalString(body.bucket) ?? process.env.S3_UPLOAD_BUCKET ?? process.env.S3_BUCKET ?? "submitsense-dev-uploads";
+    const bucket = process.env.S3_UPLOAD_BUCKET ?? process.env.S3_BUCKET ?? "submitsense-dev-uploads";
+    const requestedBucket = api.optionalString(body.bucket);
+    if (requestedBucket && requestedBucket !== bucket) throw new BadRequestException("bucket does not match the configured upload bucket");
     const objectKey = v.string(body.objectKey, "objectKey");
     const prefix = `tenants/${ctx.tenantId}/projects/${pid}/`;
     if (!objectKey.startsWith(prefix)) throw new BadRequestException("objectKey is outside tenant/project scope");
     const mimeType = v.string(body.mimeType, "mimeType").toLowerCase();
     this.assertAllowedMime(docType, mimeType);
     const checksum = api.hexSha256(body.checksumSha256);
+    const sizeBytes = this.uploadSize(body.sizeBytes);
     const jobType = ingestJobType[docType] ?? "ingest_document";
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
       await this.requireProject(client, pid, false);
@@ -237,7 +241,7 @@ export class ApiService {
           objectKey,
           checksum,
           mimeType,
-          api.positiveInt(body.sizeBytes, "sizeBytes"),
+          sizeBytes,
           api.optionalString(body.s3VersionId),
           api.optionalString(body.kmsKeyArn),
           ctx.principal.id,
@@ -684,8 +688,8 @@ export class ApiService {
       const vendor = await client.query(`select id from vendors where id = $1`, [vendorId]);
       if (!vendor.rows[0]) throw new BadRequestException("vendorId must be an existing tenant vendor");
       const product = await client.query<{ id: string; name: string; model_number: string | null }>(
-        `insert into products (tenant_id, vendor_id, catalogue_id, name, model_number, category, description, datasheet_document_id)
-         values ($1, $2, $3, $4, $5, $6, $7, $8)
+        `insert into products (tenant_id, vendor_id, catalogue_id, name, model_number, category, description, datasheet_document_id, manually_reviewed)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, true)
          returning id, name, model_number`,
         [
           ctx.tenantId,
@@ -710,15 +714,20 @@ export class ApiService {
     const id = v.uuid(productId, "productId");
     const attributes = body.attributes === undefined ? null : this.parseAttributes(body.attributes);
     const archived = body.isArchived === undefined ? null : body.isArchived === true;
+    const name = api.optionalString(body.name);
+    const modelNumber = api.optionalString(body.modelNumber);
+    const category = api.optionalString(body.category);
+    const description = api.optionalString(body.description);
+    const reviewedCoreField = [name, modelNumber, category, description].some((value) => value !== null);
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
       const result = await client.query(
         `update products
             set name = coalesce($2, name), model_number = coalesce($3, model_number),
                 category = coalesce($4, category), description = coalesce($5, description),
-                is_archived = coalesce($6, is_archived)
+                is_archived = coalesce($6, is_archived), manually_reviewed = manually_reviewed or $7
           where id = $1
           returning id, name, model_number as "modelNumber", is_archived as "isArchived"`,
-        [id, api.optionalString(body.name), api.optionalString(body.modelNumber), api.optionalString(body.category), api.optionalString(body.description), archived],
+        [id, name, modelNumber, category, description, archived, reviewedCoreField],
       );
       const row = result.rows[0] ?? this.notFound("product");
       if (attributes) await this.writeManualAttributes(client, ctx.tenantId, id, attributes, true);
@@ -961,13 +970,14 @@ export class ApiService {
       const result = await client.query(
         `select rf.id, rf.register_item_id as "registerItemId", rf.risk_type as "riskType", rf.severity,
                 rf.rule_key as "ruleKey", rf.risk_score as "riskScore", rf.scoring_version as "scoringVersion",
-                rf.summary, rf.evidence, rf.state, rf.resolution_note as "resolutionNote",
+                rf.summary, rf.evidence, rf.state, rf.is_active as "isActive", rf.resolution_note as "resolutionNote",
                 cr.reference_label as "referenceLabel", rf.created_at as "createdAt"
            from risk_flags rf
            left join clause_references cr on cr.id = rf.clause_reference_id and cr.tenant_id = rf.tenant_id
           where rf.project_id = $1 and ($2::text is null or rf.state::text = $2)
+            and ($3::boolean or rf.is_active = true)
           order by rf.created_at desc`,
-        [pid, api.optionalString(query.state)],
+        [pid, api.optionalString(query.state), query.includeInactive === "true"],
       );
       return result.rows;
     });
@@ -1467,6 +1477,14 @@ export class ApiService {
         `insert into rejection_learning_events (tenant_id, risk_flag_id, register_item_id, human_decision, consultant_outcome,
                                                 anonymised_eligible, consent_state, opted_out)
          values ($1, $2, $3, $4::risk_state, $5::consultant_outcome, $6, 'opted_in', false)
+         on conflict (tenant_id, risk_flag_id) where risk_flag_id is not null and opted_out = false
+         do update set register_item_id = coalesce(excluded.register_item_id, rejection_learning_events.register_item_id),
+                       human_decision = coalesce(excluded.human_decision, rejection_learning_events.human_decision),
+                       consultant_outcome = case when excluded.consultant_outcome = 'unknown'
+                                                 then rejection_learning_events.consultant_outcome
+                                                 else excluded.consultant_outcome end,
+                       anonymised_eligible = excluded.anonymised_eligible,
+                       consent_state = excluded.consent_state
          returning id, consent_state as "consentState"`,
         [
           ctx.tenantId,
@@ -1704,14 +1722,12 @@ export class ApiService {
               `insert into rejection_learning_events (tenant_id, risk_flag_id, register_item_id, consultant_outcome, anonymised_eligible, consent_state, opted_out)
                select $1, rf.id, rf.register_item_id, $3::consultant_outcome, true, 'opted_in', false
                  from risk_flags rf
-                where rf.tenant_id = $1 and rf.register_item_id = $2
-                  and not exists (select 1 from rejection_learning_events e where e.tenant_id = rf.tenant_id and e.risk_flag_id = rf.id and e.opted_out = false)`,
-              [tenantId, registerItemId, consultantOutcome],
-            );
-            await client.query(
-              `update rejection_learning_events e set consultant_outcome = $3::consultant_outcome
-                 from risk_flags rf
-                where e.tenant_id = $1 and e.risk_flag_id = rf.id and rf.register_item_id = $2 and e.opted_out = false`,
+                where rf.tenant_id = $1 and rf.register_item_id = $2 and rf.is_active = true
+               on conflict (tenant_id, risk_flag_id) where risk_flag_id is not null and opted_out = false
+               do update set register_item_id = excluded.register_item_id,
+                             consultant_outcome = excluded.consultant_outcome,
+                             anonymised_eligible = true,
+                             consent_state = 'opted_in'`,
               [tenantId, registerItemId, consultantOutcome],
             );
             await client.query(
@@ -1815,18 +1831,16 @@ export class ApiService {
   private async recordConsentLearningDecision(client: PoolClient, tenantId: string, riskFlagId: string, registerItemId: string | null, state: string) {
     const consent = await client.query<{ learning_loop: string }>(`select learning_loop from tenant_consents where tenant_id = $1`, [tenantId]);
     if (consent.rows[0]?.learning_loop !== "opted_in") return;
-    const updated = await client.query(
-      `update rejection_learning_events set human_decision = $3::risk_state
-        where id = (select id from rejection_learning_events where tenant_id = $1 and risk_flag_id = $2 and opted_out = false order by created_at desc limit 1)`,
-      [tenantId, riskFlagId, state],
+    await client.query(
+      `insert into rejection_learning_events (tenant_id, risk_flag_id, register_item_id, human_decision, anonymised_eligible, consent_state, opted_out)
+       values ($1, $2, $3, $4::risk_state, true, 'opted_in', false)
+       on conflict (tenant_id, risk_flag_id) where risk_flag_id is not null and opted_out = false
+       do update set register_item_id = coalesce(excluded.register_item_id, rejection_learning_events.register_item_id),
+                     human_decision = excluded.human_decision,
+                     anonymised_eligible = true,
+                     consent_state = 'opted_in'`,
+      [tenantId, riskFlagId, registerItemId, state],
     );
-    if (!updated.rowCount) {
-      await client.query(
-        `insert into rejection_learning_events (tenant_id, risk_flag_id, register_item_id, human_decision, anonymised_eligible, consent_state, opted_out)
-         values ($1, $2, $3, $4::risk_state, true, 'opted_in', false)`,
-        [tenantId, riskFlagId, registerItemId, state],
-      );
-    }
   }
 
   private async attachAcceptedProductDocuments(client: PoolClient, tenantId: string, packageId: string, projectId: string, onlyPackageItemId: string | null = null) {
@@ -1946,7 +1960,13 @@ export class ApiService {
     if (!ok) throw new BadRequestException("mimeType is not allowed for docType");
   }
 
-  private presignPutObject(bucket: string, key: string, mimeType: string, expiresSeconds: number) {
+  private uploadSize(value: unknown): number {
+    const size = api.positiveInt(value, "sizeBytes");
+    if (!size || size > MAX_UPLOAD_BYTES) throw new BadRequestException(`sizeBytes must be between 1 and ${MAX_UPLOAD_BYTES}`);
+    return size;
+  }
+
+  private presignPutObject(bucket: string, key: string, mimeType: string, sizeBytes: number, expiresSeconds: number) {
     const accessKey = process.env.AWS_ACCESS_KEY_ID;
     const secretKey = process.env.AWS_SECRET_ACCESS_KEY;
     const region = process.env.AWS_REGION ?? "ap-southeast-2";
@@ -1961,7 +1981,7 @@ export class ApiService {
       "X-Amz-Credential": `${accessKey}/${scope}`,
       "X-Amz-Date": amzDate,
       "X-Amz-Expires": String(expiresSeconds),
-      "X-Amz-SignedHeaders": "content-type;host",
+      "X-Amz-SignedHeaders": "content-length;content-type;host",
       "X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD",
     };
     if (process.env.AWS_SESSION_TOKEN) query["X-Amz-Security-Token"] = process.env.AWS_SESSION_TOKEN;
@@ -1970,8 +1990,8 @@ export class ApiService {
       .map((k) => `${this.rfc3986(k)}=${this.rfc3986(query[k])}`)
       .join("&");
     const canonicalUri = `/${key.split("/").map((part) => this.rfc3986(part)).join("/")}`;
-    const canonicalHeaders = `content-type:${mimeType}\nhost:${host}\n`;
-    const canonicalRequest = ["PUT", canonicalUri, canonicalQuery, canonicalHeaders, "content-type;host", "UNSIGNED-PAYLOAD"].join("\n");
+    const canonicalHeaders = `content-length:${sizeBytes}\ncontent-type:${mimeType}\nhost:${host}\n`;
+    const canonicalRequest = ["PUT", canonicalUri, canonicalQuery, canonicalHeaders, "content-length;content-type;host", "UNSIGNED-PAYLOAD"].join("\n");
     const stringToSign = ["AWS4-HMAC-SHA256", amzDate, scope, this.sha256(canonicalRequest)].join("\n");
     const signingKey = this.hmac(this.hmac(this.hmac(this.hmac(`AWS4${secretKey}`, date), region), "s3"), "aws4_request");
     const signature = createHmac("sha256", signingKey).update(stringToSign).digest("hex");

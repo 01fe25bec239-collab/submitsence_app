@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Inject,
   Injectable,
@@ -204,23 +205,29 @@ export class AuthService {
 
     const token = randomBytes(32).toString("base64url");
     const expiresAt = new Date(Date.now() + Number(process.env.INVITE_TTL_DAYS ?? 7) * 86_400_000);
-    const result = await this.pool.query<{
-      invitation_id: string;
-      invited_user_id: string;
-      membership_id: string;
-    }>(
-      `select * from app.create_tenant_invitation($1, $2, $3, $4, $5, $6, $7)`,
-      [
-        ctx.tenantId,
-        v.email(body.email),
-        typeof body.fullName === "string" ? body.fullName : "",
-        roleKey,
-        ctx.principal.id,
-        this.hashToken(token),
-        expiresAt,
-      ],
-    );
-    const row = result.rows[0];
+    let row: { invitation_id: string; invited_user_id: string; membership_id: string };
+    try {
+      row = await withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+        const result = await client.query<typeof row>(
+          `select * from app.create_tenant_invitation($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            ctx.tenantId,
+            v.email(body.email),
+            typeof body.fullName === "string" ? body.fullName : "",
+            roleKey,
+            ctx.principal.id,
+            this.hashToken(token),
+            expiresAt,
+          ],
+        );
+        return result.rows[0];
+      });
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "55000") {
+        throw new ConflictException("User is already an active tenant member");
+      }
+      throw error;
+    }
     await this.audit(ctx, "invite_create", "Tenant invitation created", { invitationId: row.invitation_id, roleKey }, req);
     return { ...row, roleKey, expiresAt: expiresAt.toISOString(), token };
   }
@@ -288,18 +295,6 @@ export class AuthService {
           returning id`,
         [ctx.tenantId, targetUserId],
       );
-      if (result.rows[0]) {
-        await client.query(
-          `update users
-              set status = 'deactivated'
-            where id = $1
-              and not exists (
-                select 1 from tenant_memberships
-                 where user_id = $1 and status = 'active'
-              )`,
-          [targetUserId],
-        );
-      }
       return result.rows[0];
     });
     if (!row) throw new ForbiddenException("Forbidden");
@@ -388,17 +383,21 @@ export class AuthService {
   }
 
   async createServiceAccount(ctx: AuthContext, body: Record<string, unknown>, req?: AuthedRequest) {
-    const result = await this.pool.query<{ service_user_id: string; membership_id: string }>(
-      `select * from app.create_service_account($1, $2, $3, $4, $5)`,
-      [
-        ctx.tenantId,
-        v.email(body.email),
-        v.string(body.fullName ?? body.email, "fullName"),
-        typeof body.roleKey === "string" ? v.tenantRole(body.roleKey) : "integration_admin",
-        ctx.principal.id,
-      ],
-    );
-    const row = result.rows[0];
+    const roleKey = typeof body.roleKey === "string" ? v.tenantRole(body.roleKey) : "integration_admin";
+    if (roleKey !== "integration_admin") throw new ForbiddenException("Forbidden");
+    const row = await withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      const result = await client.query<{ service_user_id: string; membership_id: string }>(
+        `select * from app.create_service_account($1, $2, $3, $4, $5)`,
+        [
+          ctx.tenantId,
+          v.email(body.email),
+          v.string(body.fullName ?? body.email, "fullName"),
+          roleKey,
+          ctx.principal.id,
+        ],
+      );
+      return result.rows[0];
+    });
     await this.audit(ctx, "service_account_create", "Service account created", { userId: row.service_user_id }, req, "admin_action");
     return row;
   }
