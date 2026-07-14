@@ -14,8 +14,8 @@ TypeScript-first on AWS Australia (`ap-southeast-2`): Next.js + NestJS, PostgreS
 
 | Path | What | Status |
 |---|---|---|
-| [`db/`](db/) | PostgreSQL data model — 15 migrations, RLS, guardrails, seed, docs | ✅ built & validated on PG 17.10 (8/8 guardrails pass) |
-| [`backend/`](backend/) | NestJS API + B6-B7 matching worker — auth, RBAC/ABAC, tenant scoping, catalogue ingestion, requirement→product matching | 🚧 in progress |
+| [`db/`](db/) | PostgreSQL data model — migrations through `0018`, RLS, guardrails, seed, docs | Built and validated on PG 17.10 (23/23 database checks pass) |
+| [`backend/`](backend/) | NestJS API + worker — auth, tenant scoping, matching, package assembly/versioning, PDF/XLSX/CSV/ZIP exports | In progress |
 | `terraform/` | AWS infrastructure (RDS, KMS, VPC, ECS) | ⏳ pending infra agent |
 
 ## Getting started
@@ -23,3 +23,6 @@ TypeScript-first on AWS Australia (`ap-southeast-2`): Next.js + NestJS, PostgreS
 The database is the foundation — see [`db/README.md`](db/README.md) to apply migrations and run the
 guardrail test, and [`db/docs/HANDOFF.md`](db/docs/HANDOFF.md) for the contract every other layer
 builds against.
+
+Package assembly and register-export operations are documented in
+[`backend/docs/package-assembly-handoff.md`](backend/docs/package-assembly-handoff.md).

@@ -18,6 +18,8 @@ npm-debug.log*
 
 # Test / coverage
 coverage/
+output/
+tmp/
 
 # Terraform (never commit state or vars — they hold secrets)
 .terraform/

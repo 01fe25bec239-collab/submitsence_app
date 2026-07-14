@@ -10,6 +10,7 @@ export const physicalStatuses = new Set(["required", "requested", "in_transit", 
 export const matchDecisions = new Set(["accepted", "rejected"]);
 export const riskStates = new Set(["confirmed", "dismissed", "resolved"]);
 export const consultantOutcomes = new Set(["approved", "revise_and_resubmit", "rejected", "withdrawn", "unknown"]);
+export const registerExportFormats = new Set(["csv", "xlsx", "pdf"]);
 export const rfiConflictTypes = new Set(["ambiguity", "conflict", "missing_information", "discrepancy", "other"]);
 export const integrationProviders = new Set(["aconex", "procore", "other"]);
 export const syncJobTypes = new Set(["package_push", "response_pull"]);
@@ -50,6 +51,12 @@ export function stringArray(value: unknown, name: string): string[] {
 
 export function uuidArray(value: unknown, name: string): string[] {
   if (!Array.isArray(value) || value.length === 0) throw new BadRequestException(`${name} must be a non-empty UUID array`);
+  return value.map((item, i) => v.uuid(item, `${name}[${i}]`));
+}
+
+export function optionalUuidArray(value: unknown, name: string): string[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new BadRequestException(`${name} must be a UUID array`);
   return value.map((item, i) => v.uuid(item, `${name}[${i}]`));
 }
 

@@ -129,7 +129,12 @@ insert into submittal_requirements (id, tenant_id, project_id, worksection_id, c
 insert into register_items (id, tenant_id, project_id, requirement_id, title, status, responsible_user_id) values
   ('99999999-9999-9999-9999-999999999999', '11111111-1111-1111-1111-111111111111',
    '55555555-5555-5555-5555-555555555555', '88888888-8888-8888-8888-888888888888',
-   'Fire hydrant product data submittal', 'draft', '33333333-3333-3333-3333-333333333333');
+   'Fire hydrant product data submittal', 'draft', '33333333-3333-3333-3333-333333333333')
+on conflict (tenant_id, requirement_id) where requirement_id is not null do update
+  set id = excluded.id,
+      title = excluded.title,
+      status = excluded.status,
+      responsible_user_id = excluded.responsible_user_id;
 
 insert into vendors (id, tenant_id, name) values
   ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '11111111-1111-1111-1111-111111111111', 'Pyrotech Supplies');

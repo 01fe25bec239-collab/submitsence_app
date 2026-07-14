@@ -14,6 +14,7 @@ import * as v from "../auth/validation";
 import { assertSafeStatusLanguage } from "../compliance/language";
 import { getEmbedder, toVectorLiteral } from "../ingestion/embedder";
 import { extractStandards } from "../ingestion/extraction";
+import { resolveCoverSheet } from "../package/package.service";
 import { withTenantClient } from "../db/tenant-db";
 import { PG_POOL } from "../db.module";
 import transitions from "./status-transitions.json";
@@ -52,6 +53,7 @@ const ingestJobType: Record<string, string> = {
   attachment: "ingest_attachment",
   other: "ingest_document",
 };
+const externalConsultantStatuses = new Set(["submitted", "revise_and_resubmit", "rejected"]);
 
 @Injectable()
 export class ApiService {
@@ -327,6 +329,7 @@ export class ApiService {
 
   async listRegister(ctx: AuthContext, projectId: string, query: Record<string, unknown>) {
     const pid = v.uuid(projectId, "projectId");
+    const overdue = query.overdue === undefined ? null : String(query.overdue).toLowerCase() === "true" ? true : String(query.overdue).toLowerCase() === "false" ? false : (() => { throw new BadRequestException("overdue must be true or false"); })();
     const sort = String(query.sort ?? "due_date");
     const sortSql = new Map([
       ["due_date", "ri.due_date nulls last"],
@@ -338,18 +341,22 @@ export class ApiService {
       const result = await client.query(
         `select ri.id, ri.title, ri.description, ri.status, ri.due_date as "dueDate",
                 ri.responsible_user_id as "responsibleUserId", u.full_name as "responsibleName",
-                ri.consultant_platform_ref as "consultantPlatformRef", ri.revision,
-                sr.category, cr.reference_label as "referenceLabel"
+                ri.consultant_platform_ref as "consultantPlatformRef", ri.consultant_response_ref as "consultantResponseRef",
+                ri.consultant_response_at as "consultantResponseAt", ri.revision,
+                sr.category, cr.reference_label as "referenceLabel", ws.code as "worksectionCode",
+                coalesce(ri.due_date < (now() at time zone 'Australia/Sydney')::date and ri.status not in ('closed', 'cancelled'), false) as overdue
            from register_items ri
            left join users u on u.id = ri.responsible_user_id
            left join submittal_requirements sr on sr.id = ri.requirement_id and sr.tenant_id = ri.tenant_id
            left join clause_references cr on cr.id = sr.clause_reference_id and cr.tenant_id = sr.tenant_id
-           left join package_items pi on pi.register_item_id = ri.id and pi.tenant_id = ri.tenant_id
+           left join worksections ws on ws.id = sr.worksection_id and ws.tenant_id = sr.tenant_id
           where ri.project_id = $1 and ri.archived_at is null
             and ($2::text is null or ri.status::text = $2)
             and ($3::uuid is null or ri.responsible_user_id = $3)
             and ($4::date is null or ri.due_date <= $4)
-            and ($5::uuid is null or pi.package_id = $5)
+            and ($5::uuid is null or exists (select 1 from package_items pi where pi.tenant_id = ri.tenant_id and pi.register_item_id = ri.id and pi.package_id = $5))
+            and ($6::date is null or ri.due_date >= $6)
+            and ($7::boolean is null or coalesce(ri.due_date < (now() at time zone 'Australia/Sydney')::date and ri.status not in ('closed', 'cancelled'), false) = $7)
           order by ${sortSql}`,
         [
           pid,
@@ -357,6 +364,8 @@ export class ApiService {
           api.optionalUuid(query.assignedUserId, "assignedUserId"),
           api.optionalDate(query.dueBefore, "dueBefore"),
           api.optionalUuid(query.packageId, "packageId"),
+          api.optionalDate(query.dueAfter, "dueAfter"),
+          overdue,
         ],
       );
       return result.rows;
@@ -368,10 +377,7 @@ export class ApiService {
     const id = v.uuid(itemId, "itemId");
     const userId = api.optionalUuid(body.userId, "userId");
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
-      if (userId) {
-        const member = await client.query(`select 1 from tenant_memberships where user_id = $1 and status = 'active'`, [userId]);
-        if (!member.rows[0]) throw new BadRequestException("assigned user must be an active tenant member");
-      }
+      await this.requireActiveTenantMember(client, userId);
       const result = await client.query(
         `update register_items set responsible_user_id = $3 where project_id = $1 and id = $2 returning id, responsible_user_id as "responsibleUserId"`,
         [pid, id, userId],
@@ -410,10 +416,12 @@ export class ApiService {
         `update register_items
             set status = $3::submittal_status,
                 submitted_at = case when $3 = 'submitted' then now() else submitted_at end,
-                closed_at = case when $3 = 'closed' then now() else closed_at end
+                closed_at = case when $3 = 'closed' then now() else closed_at end,
+                consultant_response_ref = coalesce($4, consultant_response_ref),
+                consultant_response_at = case when $4::text is not null then now() else consultant_response_at end
           where project_id = $1 and id = $2
           returning id, status`,
-        [pid, id, next],
+        [pid, id, next, api.optionalString(body.consultantResponseRef)],
       );
       return result.rows[0];
     });
@@ -439,9 +447,10 @@ export class ApiService {
     });
   }
 
-  async requestRegisterExport(ctx: AuthContext, projectId: string, idempotencyKey: string, req?: AuthedRequest) {
+  async requestRegisterExport(ctx: AuthContext, projectId: string, body: Record<string, unknown>, idempotencyKey: string, req?: AuthedRequest) {
     const pid = v.uuid(projectId, "projectId");
-    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => this.createExportJob(client, ctx, pid, null, "register_csv", `register_export:${idempotencyKey}`, req));
+    const format = api.enumValue(body.format ?? "csv", "format", api.registerExportFormats);
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => this.createExportJob(client, ctx, pid, null, `register_${format}`, `register_export:${format}:${idempotencyKey}`, req));
   }
 
   async listPhysicalDeliverables(ctx: AuthContext, projectId: string) {
@@ -450,7 +459,8 @@ export class ApiService {
       const result = await client.query(
         `select pd.id, pd.register_item_id as "registerItemId", pd.kind, pd.status, pd.description, pd.quantity,
                 pd.tracking_ref as "trackingRef", pd.responsible_user_id as "responsibleUserId",
-                pd.sent_at as "sentAt", pd.received_at as "receivedAt", pd.returned_at as "returnedAt"
+                pd.sent_at as "sentAt", pd.received_at as "receivedAt", pd.returned_at as "returnedAt",
+                pd.due_date as "dueDate", pd.notes, pd.attachment_document_id as "attachmentDocumentId"
            from physical_deliverables pd
            join register_items ri on ri.id = pd.register_item_id and ri.tenant_id = pd.tenant_id
           where ri.project_id = $1
@@ -466,11 +476,13 @@ export class ApiService {
     const rid = v.uuid(itemId, "itemId");
     const kind = api.enumValue(body.kind, "kind", api.physicalKinds);
     const status = api.enumValue(body.status ?? "required", "status", api.physicalStatuses);
+    const responsibleUserId = api.optionalUuid(body.responsibleUserId, "responsibleUserId");
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
       await this.requireRegisterItem(client, pid, rid);
+      await this.requireActiveTenantMember(client, responsibleUserId);
       const result = await client.query(
-        `insert into physical_deliverables (tenant_id, register_item_id, kind, status, description, quantity, tracking_ref, responsible_user_id)
-         values ($1, $2, $3::physical_deliverable_type, $4::physical_deliverable_status, $5, $6, $7, $8)
+        `insert into physical_deliverables (tenant_id, register_item_id, kind, status, description, quantity, tracking_ref, responsible_user_id, due_date, notes, attachment_document_id)
+         values ($1, $2, $3::physical_deliverable_type, $4::physical_deliverable_status, $5, $6, $7, $8, $9, $10, $11)
          returning id, register_item_id as "registerItemId", kind, status`,
         [
           ctx.tenantId,
@@ -480,7 +492,10 @@ export class ApiService {
           api.optionalString(body.description),
           api.positiveInt(body.quantity, "quantity"),
           api.optionalString(body.trackingRef),
-          api.optionalUuid(body.responsibleUserId, "responsibleUserId"),
+          responsibleUserId,
+          api.optionalDate(body.dueDate, "dueDate"),
+          api.optionalString(body.notes),
+          body.attachmentDocumentId ? await this.requireUsableDocument(client, pid, v.uuid(body.attachmentDocumentId, "attachmentDocumentId")) : null,
         ],
       );
       await this.recordAudit(client, ctx, "status_change", "physical_deliverable", result.rows[0].id, "physical_deliverable_create", "Physical deliverable status record created", { project_id: pid, registerItemId: rid }, req);
@@ -492,25 +507,48 @@ export class ApiService {
     const pid = v.uuid(projectId, "projectId");
     const id = v.uuid(deliverableId, "deliverableId");
     const status = body.status === undefined ? null : api.enumValue(body.status, "status", api.physicalStatuses);
+    const has = (field: string) => Object.prototype.hasOwnProperty.call(body, field);
+    const responsibleUserId = has("responsibleUserId") ? api.optionalUuid(body.responsibleUserId, "responsibleUserId") : null;
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      if (has("responsibleUserId")) await this.requireActiveTenantMember(client, responsibleUserId);
+      const attachmentDocumentId = has("attachmentDocumentId") && body.attachmentDocumentId
+        ? await this.requireUsableDocument(client, pid, v.uuid(body.attachmentDocumentId, "attachmentDocumentId"))
+        : null;
       const result = await client.query(
         `update physical_deliverables pd
             set status = coalesce($3::physical_deliverable_status, pd.status),
-                tracking_ref = coalesce($4, pd.tracking_ref),
-                sent_at = coalesce($5, pd.sent_at),
-                received_at = coalesce($6, pd.received_at),
-                returned_at = coalesce($7, pd.returned_at)
+                tracking_ref = case when $4 then $5 else pd.tracking_ref end,
+                sent_at = case when $6 then $7 else pd.sent_at end,
+                received_at = case when $8 then $9 else pd.received_at end,
+                returned_at = case when $10 then $11 else pd.returned_at end,
+                due_date = case when $12 then $13 else pd.due_date end,
+                notes = case when $14 then $15 else pd.notes end,
+                attachment_document_id = case when $16 then $17 else pd.attachment_document_id end,
+                responsible_user_id = case when $18 then $19 else pd.responsible_user_id end
            from register_items ri
           where pd.id = $1 and pd.register_item_id = ri.id and ri.project_id = $2
-          returning pd.id, pd.status, pd.tracking_ref as "trackingRef"`,
+          returning pd.id, pd.status, pd.tracking_ref as "trackingRef", pd.due_date as "dueDate", pd.notes,
+                    pd.attachment_document_id as "attachmentDocumentId", pd.responsible_user_id as "responsibleUserId"`,
         [
           id,
           pid,
           status,
+          has("trackingRef"),
           api.optionalString(body.trackingRef),
+          has("sentAt"),
           api.optionalDate(body.sentAt, "sentAt"),
+          has("receivedAt"),
           api.optionalDate(body.receivedAt, "receivedAt"),
+          has("returnedAt"),
           api.optionalDate(body.returnedAt, "returnedAt"),
+          has("dueDate"),
+          api.optionalDate(body.dueDate, "dueDate"),
+          has("notes"),
+          api.optionalString(body.notes),
+          has("attachmentDocumentId"),
+          attachmentDocumentId,
+          has("responsibleUserId"),
+          responsibleUserId,
         ],
       );
       const row = result.rows[0] ?? this.notFound("physical deliverable");
@@ -687,6 +725,40 @@ export class ApiService {
       await this.indexProductEmbedding(client, ctx.tenantId, id);
       await this.recordAudit(client, ctx, "admin_action", "product", id, "product_correction", "Product reviewed/corrected", {}, req);
       return row;
+    });
+  }
+
+  async getBranding(ctx: AuthContext) {
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      const result = await client.query(`select branding from tenants where id = $1`, [ctx.tenantId]);
+      return result.rows[0]?.branding ?? {};
+    });
+  }
+
+  async updateBranding(ctx: AuthContext, body: Record<string, unknown>, req?: AuthedRequest) {
+    await this.auth.requireTenantPermission(ctx, "member.manage", req);
+    const patch: Record<string, string | null> = {};
+    for (const field of ["companyName", "legalName", "abn", "address", "phone", "email"] as const) {
+      if (body[field] !== undefined) patch[field] = api.optionalString(body[field]);
+    }
+    if (patch.abn && !/^[0-9]{11}$/.test(patch.abn)) throw new BadRequestException("abn must contain 11 digits");
+    if (patch.email) patch.email = v.email(patch.email);
+    if (body.primaryColour === null || body.primaryColour === "") {
+      patch.primaryColour = null;
+    } else if (body.primaryColour !== undefined) {
+      const colour = v.string(body.primaryColour, "primaryColour");
+      if (!/^#[0-9a-f]{6}$/i.test(colour)) throw new BadRequestException("primaryColour must be a six-digit hex colour");
+      patch.primaryColour = colour.toUpperCase();
+    }
+    if (body.logoDocumentId !== undefined) patch.logoDocumentId = api.optionalUuid(body.logoDocumentId, "logoDocumentId");
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      if (patch.logoDocumentId) {
+        const logo = await client.query(`select id from documents where id = $1 and project_id is null and archived_at is null and mime_type in ('image/png', 'image/jpeg')`, [patch.logoDocumentId]);
+        if (!logo.rows[0]) throw new BadRequestException("logoDocumentId must reference a tenant-library PNG or JPEG document");
+      }
+      const result = await client.query(`update tenants set branding = branding || $2::jsonb where id = $1 returning branding`, [ctx.tenantId, JSON.stringify(patch)]);
+      await this.recordAudit(client, ctx, "admin_action", "tenant", ctx.tenantId, "branding_update", "Package cover-sheet branding updated", { fields: Object.keys(patch) }, req);
+      return result.rows[0]?.branding ?? {};
     });
   }
 
@@ -869,11 +941,16 @@ export class ApiService {
     });
   }
 
-  async generateRiskFlags(ctx: AuthContext, projectId: string, idempotencyKey: string, req?: AuthedRequest) {
+  async generateRiskFlags(ctx: AuthContext, projectId: string, body: Record<string, unknown>, idempotencyKey: string, req?: AuthedRequest) {
     const pid = v.uuid(projectId, "projectId");
+    const packageId = api.optionalUuid(body.packageId, "packageId");
+    const registerItemId = api.optionalUuid(body.registerItemId, "registerItemId");
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
-      const job = await this.enqueueProjectJob(client, ctx, pid, "risk_flag_generation", `risk_flags:${idempotencyKey}`, {});
-      await this.recordAudit(client, ctx, "flag", "project", pid, "risk_generation_request", "Risk flag generation requested", { project_id: pid, jobId: job.id }, req);
+      await this.requireProject(client, pid, false);
+      if (packageId) await this.requirePackage(client, pid, packageId);
+      if (registerItemId) await this.requireRegisterItem(client, pid, registerItemId);
+      const job = await this.enqueueProjectJob(client, ctx, pid, "risk_flag_generation", `risk_flags:${idempotencyKey}`, { packageId, registerItemId });
+      if (job.inserted) await this.recordAudit(client, ctx, "flag", "project", pid, "risk_generation_request", "Rejection-risk pre-check requested", { project_id: pid, packageId, registerItemId, jobId: job.id }, req);
       return job;
     });
   }
@@ -883,6 +960,7 @@ export class ApiService {
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
       const result = await client.query(
         `select rf.id, rf.register_item_id as "registerItemId", rf.risk_type as "riskType", rf.severity,
+                rf.rule_key as "ruleKey", rf.risk_score as "riskScore", rf.scoring_version as "scoringVersion",
                 rf.summary, rf.evidence, rf.state, rf.resolution_note as "resolutionNote",
                 cr.reference_label as "referenceLabel", rf.created_at as "createdAt"
            from risk_flags rf
@@ -903,10 +981,11 @@ export class ApiService {
         `update risk_flags
             set state = $3::risk_state, reviewed_by = $4, reviewed_at = now(), resolution_note = coalesce($5, resolution_note)
           where id = $1 and project_id = $2
-          returning id, state, reviewed_at as "reviewedAt"`,
+          returning id, register_item_id, state, reviewed_at as "reviewedAt"`,
         [id, pid, state, ctx.principal.id, api.optionalString(body.comment)],
       );
       const row = result.rows[0] ?? this.notFound("risk flag");
+      await this.recordConsentLearningDecision(client, ctx.tenantId, id, row.register_item_id, state);
       await this.recordAudit(client, ctx, "flag", "risk_flag", id, `risk_${state}`, `Risk flag ${state}`, { project_id: pid }, req);
       return row;
     });
@@ -919,7 +998,7 @@ export class ApiService {
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
       const result = await client.query(
         `update risk_flags
-            set resolution_note = concat_ws(E'\n', resolution_note, $3)
+            set resolution_note = concat_ws(E'\n', resolution_note, $3::text)
           where id = $1 and project_id = $2
           returning id, resolution_note as "resolutionNote"`,
         [id, pid, comment],
@@ -934,46 +1013,48 @@ export class ApiService {
     const pid = v.uuid(projectId, "projectId");
     const id = v.uuid(flagId, "flagId");
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
-      const flag = await client.query<{ register_item_id: string | null }>(`select register_item_id from risk_flags where id = $1 and project_id = $2`, [id, pid]);
+      const flag = await client.query<{ register_item_id: string | null; summary: string | null }>(`select register_item_id, summary from risk_flags where id = $1 and project_id = $2`, [id, pid]);
       if (!flag.rows[0]) return this.notFound("risk flag");
+      const customLabel = api.optionalString(body.label);
+      const label = customLabel ?? `Review likely risk: ${flag.rows[0].summary ?? "source evidence needs reviewer confirmation"}`;
+      if (!customLabel) assertSafeStatusLanguage(label);
       const result = await client.query(
         `insert into checklist_items (tenant_id, register_item_id, risk_flag_id, label)
          values ($1, $2, $3, $4)
+         on conflict do nothing
          returning id, label, risk_flag_id as "riskFlagId"`,
-        [ctx.tenantId, flag.rows[0].register_item_id, id, v.string(body.label, "label")],
+        [ctx.tenantId, flag.rows[0].register_item_id, id, label],
       );
-      await this.recordAudit(client, ctx, "flag", "checklist_item", result.rows[0].id, "risk_task_create", "Risk task created", { project_id: pid, flagId: id }, req);
-      return result.rows[0];
+      const row = result.rows[0] ?? (await client.query(`select id, label, risk_flag_id as "riskFlagId" from checklist_items where risk_flag_id = $1`, [id])).rows[0];
+      await this.recordAudit(client, ctx, "flag", "checklist_item", row.id, "risk_task_create", "Human-review checklist task created", { project_id: pid, flagId: id }, req);
+      return row;
+    });
+  }
+
+  async createRiskRfi(ctx: AuthContext, projectId: string, flagId: string, body: Record<string, unknown>, idempotencyKey: string, req?: AuthedRequest) {
+    await this.auth.requireTenantPermission(ctx, "rfi.manage", req);
+    const pid = v.uuid(projectId, "projectId");
+    const id = v.uuid(flagId, "flagId");
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      const flag = await this.requireRiskFlag(client, pid, id);
+      const job = await this.enqueueProjectJob(client, ctx, pid, "rfi_generation", `risk_rfi:${id}:${idempotencyKey}`, this.rfiJobPayload(ctx, body, { riskFlagId: id, registerItemId: flag.register_item_id }));
+      if (job.inserted) await this.recordAudit(client, ctx, "rfi_action", "risk_flag", id, "rfi_draft_request", "RFI draft requested from likely risk", { project_id: pid, jobId: job.id }, req);
+      return job;
     });
   }
 
   async generateRfi(ctx: AuthContext, projectId: string, body: Record<string, unknown>, idempotencyKey: string, req?: AuthedRequest) {
     await this.auth.requireTenantPermission(ctx, "rfi.manage", req);
     const pid = v.uuid(projectId, "projectId");
-    const title = api.optionalString(body.title) ?? "Draft RFI - needs review";
-    const text = api.optionalString(body.body) ?? "Prepared for review. Source cited where available.";
-    assertSafeStatusLanguage(title);
-    assertSafeStatusLanguage(text);
+    const riskFlagId = api.optionalUuid(body.riskFlagId, "riskFlagId");
+    const registerItemId = api.optionalUuid(body.registerItemId, "registerItemId");
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
-      const job = await this.enqueueProjectJob(client, ctx, pid, "rfi_generation", `rfi_generation:${idempotencyKey}`, {});
-      if (!job.inserted && job.worker_output?.rfiId) return { job, rfiId: job.worker_output.rfiId };
-      const result = await client.query<{ id: string }>(
-        `insert into rfi_drafts (tenant_id, project_id, register_item_id, title, body, conflict_type, created_by)
-         values ($1, $2, $3, $4, $5, $6::rfi_conflict_type, $7)
-         returning id, title, review_status as "reviewStatus"`,
-        [
-          ctx.tenantId,
-          pid,
-          api.optionalUuid(body.registerItemId, "registerItemId"),
-          title,
-          text,
-          api.enumValue(body.conflictType ?? "ambiguity", "conflictType", api.rfiConflictTypes),
-          ctx.principal.id,
-        ],
-      );
-      await this.patchJobOutput(client, job.id, { rfiId: result.rows[0].id });
-      await this.recordAudit(client, ctx, "rfi_action", "rfi_draft", result.rows[0].id, "rfi_generate", "RFI draft generated for review", { project_id: pid, jobId: job.id }, req);
-      return { rfi: result.rows[0], job: { ...job, worker_output: { ...(job.worker_output ?? {}), rfiId: result.rows[0].id } } };
+      await this.requireProject(client, pid, false);
+      if (riskFlagId) await this.requireRiskFlag(client, pid, riskFlagId);
+      if (registerItemId) await this.requireRegisterItem(client, pid, registerItemId);
+      const job = await this.enqueueProjectJob(client, ctx, pid, "rfi_generation", `rfi_generation:${idempotencyKey}`, this.rfiJobPayload(ctx, body, { riskFlagId, registerItemId }));
+      if (job.inserted) await this.recordAudit(client, ctx, "rfi_action", "project", pid, "rfi_draft_request", "RFI draft generation requested", { project_id: pid, riskFlagId, registerItemId, jobId: job.id }, req);
+      return job;
     });
   }
 
@@ -982,8 +1063,29 @@ export class ApiService {
     const pid = v.uuid(projectId, "projectId");
     const id = v.uuid(rfiId, "rfiId");
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
-      const result = await client.query(`select * from rfi_drafts where id = $1 and project_id = $2`, [id, pid]);
-      return result.rows[0] ?? this.notFound("RFI draft");
+      const result = await client.query(
+        `select id, register_item_id as "registerItemId", source_risk_flag_id as "sourceRiskFlagId", title,
+                issue_summary as "issueSummary", question, body, conflict_type as "conflictType",
+                suggested_attachments as "suggestedAttachments", review_status as "reviewStatus",
+                send_status as "sendStatus", reviewed_by as "reviewedBy", reviewed_at as "reviewedAt",
+                created_by as "createdBy", created_at as "createdAt", updated_at as "updatedAt"
+           from rfi_drafts where id = $1 and project_id = $2`,
+        [id, pid],
+      );
+      const rfi = result.rows[0] ?? this.notFound("RFI draft");
+      const clauses = await client.query(
+        `select cr.id, cr.reference_label as "referenceLabel", cr.source_page as "sourcePage"
+           from rfi_cited_clauses rc join clause_references cr on cr.tenant_id = rc.tenant_id and cr.id = rc.clause_reference_id
+          where rc.rfi_id = $1 order by cr.reference_label`,
+        [id],
+      );
+      const documents = await client.query(
+        `select d.id, d.title, d.original_filename as "filename", d.doc_type as "docType", rd.note
+           from rfi_cited_documents rd join documents d on d.tenant_id = rd.tenant_id and d.id = rd.document_id
+          where rd.rfi_id = $1 order by d.title`,
+        [id],
+      );
+      return { ...rfi, clauseReferences: clauses.rows, documentReferences: documents.rows };
     });
   }
 
@@ -991,24 +1093,67 @@ export class ApiService {
     await this.auth.requireTenantPermission(ctx, "rfi.manage", req);
     const pid = v.uuid(projectId, "projectId");
     const id = v.uuid(rfiId, "rfiId");
+    const has = (field: string) => Object.prototype.hasOwnProperty.call(body, field);
+    const clauseReferenceIds = has("clauseReferenceIds") ? api.optionalUuidArray(body.clauseReferenceIds, "clauseReferenceIds") : [];
+    const drawingDocumentIds = has("drawingDocumentIds") ? api.optionalUuidArray(body.drawingDocumentIds, "drawingDocumentIds") : [];
+    const suggestedAttachmentIds = has("suggestedAttachmentIds") ? api.optionalUuidArray(body.suggestedAttachmentIds, "suggestedAttachmentIds") : [];
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      let clauseRows: { id: string }[] = [];
+      if (has("clauseReferenceIds")) {
+        clauseRows = (await client.query<{ id: string }>(
+          `select distinct cr.id from clause_references cr
+             join submittal_requirements sr on sr.tenant_id = cr.tenant_id and sr.clause_reference_id = cr.id
+            where sr.project_id = $1 and cr.id = any($2::uuid[])`,
+          [pid, clauseReferenceIds],
+        )).rows;
+        if (clauseRows.length !== clauseReferenceIds.length) throw new BadRequestException("all clauseReferenceIds must belong to the project");
+      }
+      const allDocumentIds = [...new Set([...drawingDocumentIds, ...suggestedAttachmentIds])];
+      let documentRows: { id: string; title: string; doc_type: string }[] = [];
+      if (has("drawingDocumentIds") || has("suggestedAttachmentIds")) {
+        documentRows = allDocumentIds.length === 0 ? [] : (await client.query<{ id: string; title: string; doc_type: string }>(
+          `select id, title, doc_type::text from documents where id = any($1::uuid[]) and archived_at is null and (project_id is null or project_id = $2)`,
+          [allDocumentIds, pid],
+        )).rows;
+        if (documentRows.length !== allDocumentIds.length) throw new BadRequestException("all RFI document references must belong to the project or tenant library");
+      }
+      const attachments = documentRows.filter((document) => suggestedAttachmentIds.includes(document.id)).map((document) => ({ documentId: document.id, title: document.title, reason: "Suggested source attachment" }));
       const result = await client.query(
         `update rfi_drafts
             set title = coalesce($3, title),
-                body = coalesce($4, body),
-                conflict_type = coalesce($5::rfi_conflict_type, conflict_type),
+                issue_summary = coalesce($4, issue_summary),
+                question = coalesce($5, question),
+                body = coalesce($6, body),
+                conflict_type = coalesce($7::rfi_conflict_type, conflict_type),
+                suggested_attachments = case when $8 then $9::jsonb else suggested_attachments end,
                 review_status = 'in_review'
           where id = $1 and project_id = $2
-          returning id, title, review_status as "reviewStatus"`,
+          returning id, title, issue_summary as "issueSummary", question, conflict_type as "conflictType",
+                    suggested_attachments as "suggestedAttachments", review_status as "reviewStatus"`,
         [
           id,
           pid,
           api.optionalString(body.title),
+          api.optionalString(body.issueSummary),
+          api.optionalString(body.question),
           api.optionalString(body.body),
           body.conflictType === undefined ? null : api.enumValue(body.conflictType, "conflictType", api.rfiConflictTypes),
+          has("suggestedAttachmentIds"),
+          JSON.stringify(attachments),
         ],
       );
       const row = result.rows[0] ?? this.notFound("RFI draft");
+      if (has("clauseReferenceIds")) {
+        await client.query(`delete from rfi_cited_clauses where rfi_id = $1`, [id]);
+        for (const clause of clauseRows) await client.query(`insert into rfi_cited_clauses (tenant_id, rfi_id, clause_reference_id) values ($1, $2, $3)`, [ctx.tenantId, id, clause.id]);
+      }
+      if (has("drawingDocumentIds") || has("suggestedAttachmentIds")) {
+        await client.query(`delete from rfi_cited_documents where rfi_id = $1`, [id]);
+        for (const document of documentRows) await client.query(
+          `insert into rfi_cited_documents (tenant_id, rfi_id, document_id, note) values ($1, $2, $3, $4)`,
+          [ctx.tenantId, id, document.id, drawingDocumentIds.includes(document.id) ? "Drawing reference" : "Suggested source attachment"],
+        );
+      }
       await this.recordAudit(client, ctx, "rfi_action", "rfi_draft", id, "rfi_edit", "RFI draft edited", { project_id: pid }, req);
       return row;
     });
@@ -1016,6 +1161,7 @@ export class ApiService {
 
   async markRfiReviewed(ctx: AuthContext, projectId: string, rfiId: string, req?: AuthedRequest) {
     await this.auth.requireTenantPermission(ctx, "rfi.manage", req);
+    if (ctx.actorType !== "human" || ctx.principal.kind !== "human") throw new ForbiddenException("RFI review requires an active human user");
     const pid = v.uuid(projectId, "projectId");
     const id = v.uuid(rfiId, "rfiId");
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
@@ -1037,8 +1183,9 @@ export class ApiService {
     const pid = v.uuid(projectId, "projectId");
     const id = v.uuid(rfiId, "rfiId");
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
-      await this.requireRfi(client, pid, id);
-      return this.createExportJob(client, ctx, pid, null, "rfi_pdf", `rfi_export:${id}:${idempotencyKey}`, req);
+      const rfi = await this.requireRfi(client, pid, id);
+      if (rfi.review_status !== "approved") throw new BadRequestException("RFI draft requires human review before export handoff");
+      return this.createExportJob(client, ctx, pid, null, "rfi_pdf", `rfi_export:${id}:${idempotencyKey}`, req, { rfiId: id });
     });
   }
 
@@ -1048,7 +1195,8 @@ export class ApiService {
     const id = v.uuid(rfiId, "rfiId");
     const connectionId = v.uuid(body.connectionId, "connectionId");
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
-      await this.requireRfi(client, pid, id);
+      const rfi = await this.requireRfi(client, pid, id);
+      if (rfi.review_status !== "approved") throw new BadRequestException("RFI draft requires human review before send handoff");
       const job = await this.enqueueSyncJob(client, ctx, connectionId, pid, null, "package_push", `rfi_handoff:${id}:${idempotencyKey}`, { rfiId: id });
       await this.recordAudit(client, ctx, "integration_sync", "rfi_draft", id, "rfi_handoff", "RFI handoff requested", { project_id: pid, jobId: job.id }, req);
       return job;
@@ -1058,27 +1206,49 @@ export class ApiService {
   async createPackage(ctx: AuthContext, projectId: string, body: Record<string, unknown>, idempotencyKey: string, req?: AuthedRequest) {
     const pid = v.uuid(projectId, "projectId");
     const itemIds = api.uuidArray(body.registerItemIds, "registerItemIds");
+    if (new Set(itemIds).size !== itemIds.length) throw new BadRequestException("registerItemIds must not contain duplicates");
     const name = api.optionalString(body.name) ?? "Submittal package draft";
+    const coverOverrides = v.object(body.coverSheet, "coverSheet");
     assertSafeStatusLanguage(name);
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
       const job = await this.enqueueProjectJob(client, ctx, pid, "package_draft", `package_draft:${idempotencyKey}`, { itemIds });
-      if (!job.inserted && job.worker_output?.packageId) return { job, packageId: job.worker_output.packageId };
+      if (!job.inserted && job.worker_output?.packageId) {
+        const existing = await client.query(`select id, name, status from packages where id = $1 and project_id = $2`, [job.worker_output.packageId, pid]);
+        if (!existing.rows[0]) throw new Error("Idempotent package draft resource is missing");
+        return { package: existing.rows[0], job };
+      }
+      await this.requireProject(client, pid, false);
+      const cover = await resolveCoverSheet(client, ctx.tenantId, pid, ctx.principal.id, coverOverrides);
+      if (cover.logoDocumentId) await this.requireUsableDocument(client, pid, cover.logoDocumentId, ["image/png", "image/jpeg"]);
       const pkg = await client.query<{ id: string }>(
-        `insert into packages (tenant_id, project_id, name, assembled_by)
-         values ($1, $2, $3, $4)
+        `insert into packages (tenant_id, project_id, name, assembled_by, cover_sheet, manual_notes)
+         values ($1, $2, $3, $4, $5::jsonb, $6)
          returning id, name, status`,
-        [ctx.tenantId, pid, name, ctx.principal.id],
+        [ctx.tenantId, pid, name, ctx.principal.id, JSON.stringify(cover), api.optionalString(body.manualNotes)],
       );
-      await client.query(
+      const items = await client.query<{ id: string; register_item_id: string; sequence: number }>(
         `insert into package_items (tenant_id, package_id, register_item_id, sequence)
-         select $1, $2, ri.id, row_number() over ()
-           from register_items ri
-          where ri.project_id = $3 and ri.id = any($4::uuid[])`,
+         select $1, $2, ri.id, selected.ordinality::int
+           from unnest($4::uuid[]) with ordinality selected(id, ordinality)
+           join register_items ri on ri.id = selected.id and ri.project_id = $3 and ri.archived_at is null
+          order by selected.ordinality
+         returning id, register_item_id, sequence`,
         [ctx.tenantId, pkg.rows[0].id, pid, itemIds],
       );
-      await this.patchJobOutput(client, job.id, { packageId: pkg.rows[0].id });
+      if (items.rowCount !== itemIds.length) throw new BadRequestException("all registerItemIds must belong to the project");
+      const attached = await this.attachAcceptedProductDocuments(client, ctx.tenantId, pkg.rows[0].id, pid);
+      await client.query(
+        `update processing_jobs set status = 'succeeded', finished_at = now(), worker_output = worker_output || $2::jsonb where id = $1`,
+        [job.id, JSON.stringify({ packageId: pkg.rows[0].id })],
+      );
       await this.recordAudit(client, ctx, "package_generation", "package", pkg.rows[0].id, "package_draft_create", "Package draft created", { project_id: pid, itemIds, jobId: job.id }, req);
-      return { package: pkg.rows[0], job: { ...job, worker_output: { ...(job.worker_output ?? {}), packageId: pkg.rows[0].id } } };
+      for (const item of items.rows) {
+        await this.recordAudit(client, ctx, "package_generation", "package_item", item.id, "package_item_added", "Register item added to package", { project_id: pid, packageId: pkg.rows[0].id, registerItemId: item.register_item_id, sequence: item.sequence }, req);
+      }
+      for (const document of attached) {
+        await this.recordAudit(client, ctx, "package_generation", "package_item", document.package_item_id, "package_file_attached", "Accepted product document attached to package", { project_id: pid, packageId: pkg.rows[0].id, documentId: document.document_id }, req);
+      }
+      return { package: pkg.rows[0], job: { ...job, status: "succeeded", worker_output: { ...(job.worker_output ?? {}), packageId: pkg.rows[0].id } } };
     });
   }
 
@@ -1086,18 +1256,123 @@ export class ApiService {
     const pid = v.uuid(projectId, "projectId");
     const id = v.uuid(packageId, "packageId");
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
-      const pkg = await client.query(`select id, name, status from packages where id = $1 and project_id = $2`, [id, pid]);
+      const pkg = await client.query(`select id, name, status, current_version as "currentVersion", cover_sheet as "coverSheet", manual_notes as "manualNotes", output_document_id as "outputDocumentId" from packages where id = $1 and project_id = $2`, [id, pid]);
       if (!pkg.rows[0]) return this.notFound("package");
       const items = await client.query(
-        `select pi.sequence, ri.id as "registerItemId", ri.title, ri.status, d.id as "documentId", d.title as "documentTitle"
+        `select pi.id as "packageItemId", pi.sequence, pi.included, pi.manual_notes as "manualNotes",
+                ri.id as "registerItemId", ri.title, ri.status, ri.due_date as "dueDate",
+                ws.code as "worksectionCode", cr.reference_label as "clauseReference", sr.category::text as "requiredEvidence",
+                count(distinct d.id)::int as "documentCount",
+                coalesce(sum(d.size_bytes) filter (where pid.included), 0)::bigint as "estimatedAttachmentBytes",
+                coalesce(jsonb_agg(jsonb_build_object(
+                  'id', pid.id, 'documentId', d.id, 'title', d.title, 'filename', d.original_filename,
+                  'mimeType', d.mime_type, 'role', pid.doc_role, 'included', pid.included,
+                  'sequence', pid.sequence, 'sizeBytes', d.size_bytes
+                ) order by pid.sequence, d.title) filter (where d.id is not null), '[]'::jsonb) as documents
            from package_items pi
            join register_items ri on ri.id = pi.register_item_id and ri.tenant_id = pi.tenant_id
-           left join documents d on d.id = pi.document_id and d.tenant_id = pi.tenant_id
+           left join submittal_requirements sr on sr.id = ri.requirement_id and sr.tenant_id = ri.tenant_id
+           left join worksections ws on ws.id = sr.worksection_id and ws.tenant_id = sr.tenant_id
+           left join clause_references cr on cr.id = sr.clause_reference_id and cr.tenant_id = sr.tenant_id
+           left join package_item_documents pid on pid.package_item_id = pi.id and pid.tenant_id = pi.tenant_id
+           left join documents d on d.id = pid.document_id and d.tenant_id = pid.tenant_id and (d.project_id is null or d.project_id = $2)
           where pi.package_id = $1
+          group by pi.id, ri.id, ws.code, cr.reference_label, sr.category
           order by pi.sequence nulls last, ri.title`,
+        [id, pid],
+      );
+      const physical = await client.query(
+        `select pd.id, pd.register_item_id as "registerItemId", pd.kind::text, pd.status::text, pd.due_date as "dueDate", pd.notes, pd.attachment_document_id as "attachmentDocumentId"
+           from physical_deliverables pd join register_items ri on ri.tenant_id = pd.tenant_id and ri.id = pd.register_item_id
+          where ri.project_id = $1 and ri.id in (select register_item_id from package_items where package_id = $2) order by pd.created_at`,
+        [pid, id],
+      );
+      return { package: pkg.rows[0], items: items.rows, physicalDeliverables: physical.rows };
+    });
+  }
+
+  async addPackageItem(ctx: AuthContext, projectId: string, packageId: string, body: Record<string, unknown>, req?: AuthedRequest) {
+    const pid = v.uuid(projectId, "projectId");
+    const id = v.uuid(packageId, "packageId");
+    const registerItemId = v.uuid(body.registerItemId, "registerItemId");
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      await this.requirePackage(client, pid, id);
+      await this.requireRegisterItem(client, pid, registerItemId);
+      const result = await client.query<{ id: string }>(
+        `insert into package_items (tenant_id, package_id, register_item_id, sequence, manual_notes)
+         select $1, $2, $3, coalesce(max(sequence), 0) + 1, $4 from package_items where package_id = $2
+         on conflict (package_id, register_item_id) do update set included = true, manual_notes = coalesce(excluded.manual_notes, package_items.manual_notes)
+         returning id`,
+        [ctx.tenantId, id, registerItemId, api.optionalString(body.manualNotes)],
+      );
+      const attached = await this.attachAcceptedProductDocuments(client, ctx.tenantId, id, pid, result.rows[0].id);
+      await this.recordAudit(client, ctx, "package_generation", "package_item", result.rows[0].id, "package_item_added", "Register item added to package", { project_id: pid, packageId: id, registerItemId }, req);
+      for (const document of attached) await this.recordAudit(client, ctx, "package_generation", "package_item", result.rows[0].id, "package_file_attached", "Accepted product document attached to package", { project_id: pid, packageId: id, documentId: document.document_id }, req);
+      return { id: result.rows[0].id, registerItemId, attachedDocumentCount: attached.length };
+    });
+  }
+
+  async updatePackageItem(ctx: AuthContext, projectId: string, packageId: string, packageItemId: string, body: Record<string, unknown>, req?: AuthedRequest) {
+    const pid = v.uuid(projectId, "projectId");
+    const id = v.uuid(packageId, "packageId");
+    const itemId = v.uuid(packageItemId, "packageItemId");
+    const included = body.included === undefined ? null : v.boolean(body.included, "included");
+    const sequence = body.sequence === undefined ? null : api.positiveInt(body.sequence, "sequence");
+    const hasManualNotes = Object.prototype.hasOwnProperty.call(body, "manualNotes");
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      const result = await client.query<{ id: string; included: boolean; register_item_id: string }>(
+        `update package_items pi set included = coalesce($4, included), sequence = coalesce($5, sequence),
+                                    manual_notes = case when $6 then $7 else manual_notes end
+          from packages p where pi.id = $1 and pi.package_id = $2 and p.id = pi.package_id and p.project_id = $3
+          returning pi.id, pi.included, pi.register_item_id`,
+        [itemId, id, pid, included, sequence, hasManualNotes, api.optionalString(body.manualNotes)],
+      );
+      const row = result.rows[0] ?? this.notFound("package item");
+      const action = included === false ? "package_item_removed" : included === true ? "package_item_added" : "package_item_updated";
+      await this.recordAudit(client, ctx, "package_generation", "package_item", itemId, action, included === false ? "Register item excluded from package" : "Package item updated", { project_id: pid, packageId: id, registerItemId: row.register_item_id, sequence }, req);
+      return row;
+    });
+  }
+
+  async removePackageItem(ctx: AuthContext, projectId: string, packageId: string, packageItemId: string, req?: AuthedRequest) {
+    return this.updatePackageItem(ctx, projectId, packageId, packageItemId, { included: false }, req);
+  }
+
+  async attachPackageDocument(ctx: AuthContext, projectId: string, packageId: string, packageItemId: string, body: Record<string, unknown>, req?: AuthedRequest) {
+    const pid = v.uuid(projectId, "projectId");
+    const id = v.uuid(packageId, "packageId");
+    const itemId = v.uuid(packageItemId, "packageItemId");
+    const documentId = v.uuid(body.documentId, "documentId");
+    const role = api.optionalString(body.role) ?? "attachment";
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      await this.requireUsableDocument(client, pid, documentId);
+      const result = await client.query<{ id: string }>(
+        `insert into package_item_documents (tenant_id, package_item_id, document_id, doc_role, sequence)
+         select $1, pi.id, $4, $5, coalesce((select max(sequence) + 1 from package_item_documents where package_item_id = pi.id), 0)
+           from package_items pi join packages p on p.tenant_id = pi.tenant_id and p.id = pi.package_id
+          where pi.id = $2 and pi.package_id = $3 and p.project_id = $6
+         on conflict (package_item_id, document_id) do update set included = true, doc_role = excluded.doc_role
+         returning id`,
+        [ctx.tenantId, itemId, id, documentId, role, pid],
+      );
+      const row = result.rows[0] ?? this.notFound("package item");
+      await this.recordAudit(client, ctx, "package_generation", "package_item", itemId, "package_file_attached", "File attached to package item", { project_id: pid, packageId: id, documentId, role }, req);
+      return { id: row.id, packageItemId: itemId, documentId, role };
+    });
+  }
+
+  async packageVersions(ctx: AuthContext, projectId: string, packageId: string) {
+    const pid = v.uuid(projectId, "projectId");
+    const id = v.uuid(packageId, "packageId");
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      await this.requirePackage(client, pid, id);
+      const result = await client.query(
+        `select pv.id, pv.version_number as "version", pv.status, pv.output_document_id as "outputDocumentId", pv.manifest,
+                pv.checksum_sha256 as "checksumSha256", pv.error_message as "errorMessage", pv.created_at as "createdAt"
+           from package_versions pv where pv.package_id = $1 order by pv.version_number desc`,
         [id],
       );
-      return { package: pkg.rows[0], items: items.rows };
+      return result.rows;
     });
   }
 
@@ -1106,9 +1381,11 @@ export class ApiService {
     const id = v.uuid(packageId, "packageId");
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
       await this.requirePackage(client, pid, id);
-      await client.query(`update packages set status = 'assembling' where id = $1`, [id]);
       const job = await this.enqueueProjectJob(client, ctx, pid, "package_generation", `package_regenerate:${id}:${idempotencyKey}`, { packageId: id });
-      await this.recordAudit(client, ctx, "package_generation", "package", id, "package_regenerate", "Package regeneration requested", { project_id: pid, jobId: job.id }, req);
+      if (job.inserted) {
+        await client.query(`update packages set status = 'assembling' where id = $1`, [id]);
+        await this.recordAudit(client, ctx, "package_generation", "package", id, "package_regenerate", "Package regeneration requested", { project_id: pid, jobId: job.id }, req);
+      }
       return job;
     });
   }
@@ -1133,9 +1410,10 @@ export class ApiService {
           group by due_date order by due_date limit 30`,
         [pid],
       );
+      const overdue = await client.query(`select count(*)::int as count from register_items where project_id = $1 and due_date < (now() at time zone 'Australia/Sydney')::date and status not in ('closed', 'cancelled')`, [pid]);
       const items = await this.listRegister(ctx, pid, query);
-      const packages = await client.query(`select id, name, status, consultant_platform_ref as "consultantPlatformRef" from packages where project_id = $1 order by created_at desc`, [pid]);
-      return { status: status.rows, due: due.rows, packages: packages.rows, items };
+      const packages = await client.query(`select id, name, status, current_version as "currentVersion", output_document_id as "outputDocumentId", consultant_platform_ref as "consultantPlatformRef" from packages where project_id = $1 order by created_at desc`, [pid]);
+      return { status: status.rows, due: due.rows, overdueCount: overdue.rows[0]?.count ?? 0, packages: packages.rows, items };
     });
   }
 
@@ -1373,28 +1651,94 @@ export class ApiService {
     const connectionId = v.uuid(body.connectionId, "connectionId");
     const checkedProvider = api.enumValue(provider, "provider", api.integrationProviders);
     const externalEventId = api.optionalString(body.externalEventId) ?? idempotencyKey;
+    const eventType = api.optionalString(body.eventType);
+    const payload = api.object(body.payload);
     // Tenant resolved from the connection's server-side row, NEVER body.tenantId.
     const tenantId = await this.resolveIntegrationTenant(connectionId, checkedProvider);
     return withTenantClient(this.pool, { tenantId, actorType: "system", userId: null }, async (client) => {
-      const result = await client.query(
+      const connection = await client.query(`select 1 from integration_connections where id = $1 and provider = $2::integration_provider and status = 'connected'`, [connectionId, checkedProvider]);
+      if (!connection.rows[0]) throw new ForbiddenException("Forbidden");
+      const result = await client.query<{ id: string; status: string; inserted: boolean }>(
         `insert into webhook_events (tenant_id, connection_id, provider, external_event_id, event_type, payload)
          values ($1, $2, $3::integration_provider, $4, $5, $6::jsonb)
          on conflict (connection_id, external_event_id) do update set status = webhook_events.status
-         returning id, status`,
-        [tenantId, connectionId, checkedProvider, externalEventId, api.optionalString(body.eventType), JSON.stringify(api.object(body.payload))],
+         returning id, status, (xmax = 0) as inserted`,
+        [tenantId, connectionId, checkedProvider, externalEventId, eventType, JSON.stringify(payload)],
       );
+      if (!result.rows[0].inserted && result.rows[0].status === "processed") {
+        return { id: result.rows[0].id, status: result.rows[0].status };
+      }
+      if (eventType === "consultant_status") {
+        const projectId = v.uuid(payload.projectId, "payload.projectId");
+        const registerItemId = v.uuid(payload.registerItemId, "payload.registerItemId");
+        const next = v.string(payload.status, "payload.status");
+        if (!externalConsultantStatuses.has(next)) throw new BadRequestException("external consultant status must be submitted, revise_and_resubmit, or rejected");
+        const mapping = await client.query(
+          `select 1 from external_project_mappings where tenant_id = $1 and connection_id = $2 and project_id = $3`,
+          [tenantId, connectionId, projectId],
+        );
+        if (!mapping.rows[0]) throw new BadRequestException("consultant status project is not mapped to this integration connection");
+        const current = await client.query<{ status: keyof typeof transitions }>(`select status from register_items where tenant_id = $1 and project_id = $2 and id = $3`, [tenantId, projectId, registerItemId]);
+        const from = current.rows[0]?.status ?? this.notFound("register item");
+        if (from !== next && !(transitions[from] as string[]).includes(next)) throw new BadRequestException(`invalid status transition ${from} -> ${next}`);
+        await client.query(
+          `update register_items
+              set status = $4::submittal_status,
+                  consultant_platform_ref = coalesce($5, consultant_platform_ref),
+                  consultant_response_ref = $6,
+                  consultant_response_at = now(),
+                  submitted_at = case when $4 = 'submitted' then coalesce(submitted_at, now()) else submitted_at end
+            where tenant_id = $1 and project_id = $2 and id = $3`,
+          [tenantId, projectId, registerItemId, next, api.optionalString(payload.consultantPlatformRef), api.optionalString(payload.responseRef) ?? externalEventId],
+        );
+        await client.query(
+          `insert into audit_events (tenant_id, event_type, actor_type, entity_type, entity_id, action, summary, payload)
+           values ($1, 'integration_sync', 'system', 'register_item', $2, 'consultant_response_update', 'Consultant response reference and status recorded', $3::jsonb)`,
+          [tenantId, registerItemId, JSON.stringify({ project_id: projectId, provider: checkedProvider, status: next, responseRef: api.optionalString(payload.responseRef) ?? externalEventId })],
+        );
+        const consultantOutcome = next === "rejected" ? "rejected" : next === "revise_and_resubmit" ? "revise_and_resubmit" : null;
+        if (consultantOutcome) {
+          const consent = await client.query<{ learning_loop: string }>(`select learning_loop from tenant_consents where tenant_id = $1`, [tenantId]);
+          if (consent.rows[0]?.learning_loop === "opted_in") {
+            await client.query(
+              `insert into rejection_learning_events (tenant_id, risk_flag_id, register_item_id, consultant_outcome, anonymised_eligible, consent_state, opted_out)
+               select $1, rf.id, rf.register_item_id, $3::consultant_outcome, true, 'opted_in', false
+                 from risk_flags rf
+                where rf.tenant_id = $1 and rf.register_item_id = $2
+                  and not exists (select 1 from rejection_learning_events e where e.tenant_id = rf.tenant_id and e.risk_flag_id = rf.id and e.opted_out = false)`,
+              [tenantId, registerItemId, consultantOutcome],
+            );
+            await client.query(
+              `update rejection_learning_events e set consultant_outcome = $3::consultant_outcome
+                 from risk_flags rf
+                where e.tenant_id = $1 and e.risk_flag_id = rf.id and rf.register_item_id = $2 and e.opted_out = false`,
+              [tenantId, registerItemId, consultantOutcome],
+            );
+            await client.query(
+              `insert into audit_events (tenant_id, event_type, actor_type, entity_type, entity_id, action, summary, payload)
+               values ($1, 'flag', 'system', 'register_item', $2, 'learning_outcome_recorded', 'Known consultant outcome recorded for consented learning', $3::jsonb)`,
+              [tenantId, registerItemId, JSON.stringify({ project_id: projectId, consultantOutcome })],
+            );
+          }
+        }
+      }
       await client.query(
         `insert into audit_events (tenant_id, event_type, actor_type, entity_type, entity_id, action, summary, payload, ip_address, user_agent)
          values ($1, 'integration_sync', 'system', 'webhook_event', $2, 'integration_webhook_received', 'Integration webhook received', $3::jsonb, nullif($4::text, '')::inet, $5)`,
         [tenantId, result.rows[0].id, JSON.stringify({ request_id: req?.requestId, provider: checkedProvider, externalEventId }), this.ip(req) ?? "", this.userAgent(req)],
       );
-      return result.rows[0];
+      await client.query(`update webhook_events set status = 'processed', processed_at = now() where id = $1`, [result.rows[0].id]);
+      return { id: result.rows[0].id, status: "processed" };
     });
   }
 
-  private async createExportJob(client: PoolClient, ctx: AuthContext, projectId: string, packageId: string | null, exportType: string, idempotencyKey: string, req?: AuthedRequest) {
-    const job = await this.enqueueProjectJob(client, ctx, projectId, `export_${exportType}`, idempotencyKey, { packageId, exportType });
-    if (!job.inserted && job.worker_output?.exportId) return { job, exportId: job.worker_output.exportId };
+  private async createExportJob(client: PoolClient, ctx: AuthContext, projectId: string, packageId: string | null, exportType: string, idempotencyKey: string, req?: AuthedRequest, payload: Record<string, unknown> = {}) {
+    const job = await this.enqueueProjectJob(client, ctx, projectId, `export_${exportType}`, idempotencyKey, { packageId, exportType, ...payload });
+    if (!job.inserted && job.worker_output?.exportId) {
+      const existing = await client.query(`select id, export_type as "exportType", status from exports where id = $1 and project_id = $2`, [job.worker_output.exportId, projectId]);
+      if (!existing.rows[0]) throw new Error("Idempotent export resource is missing");
+      return { export: existing.rows[0], job };
+    }
     const result = await client.query<{ id: string }>(
       `insert into exports (tenant_id, project_id, package_id, export_type, requested_by)
        values ($1, $2, $3, $4, $5)
@@ -1453,6 +1797,72 @@ export class ApiService {
     await client.query(`update processing_jobs set worker_output = worker_output || $2::jsonb where id = $1`, [jobId, JSON.stringify(patch)]);
   }
 
+  private rfiJobPayload(ctx: AuthContext, body: Record<string, unknown>, scope: { riskFlagId: string | null; registerItemId: string | null }) {
+    return {
+      requestedBy: ctx.principal.id,
+      riskFlagId: scope.riskFlagId,
+      registerItemId: scope.registerItemId,
+      title: api.optionalString(body.title),
+      issueSummary: api.optionalString(body.issueSummary) ?? api.optionalString(body.body),
+      question: api.optionalString(body.question),
+      conflictType: body.conflictType === undefined ? null : api.enumValue(body.conflictType, "conflictType", api.rfiConflictTypes),
+      clauseReferenceIds: api.optionalUuidArray(body.clauseReferenceIds, "clauseReferenceIds"),
+      drawingDocumentIds: api.optionalUuidArray(body.drawingDocumentIds, "drawingDocumentIds"),
+      suggestedAttachmentIds: api.optionalUuidArray(body.suggestedAttachmentIds, "suggestedAttachmentIds"),
+    };
+  }
+
+  private async recordConsentLearningDecision(client: PoolClient, tenantId: string, riskFlagId: string, registerItemId: string | null, state: string) {
+    const consent = await client.query<{ learning_loop: string }>(`select learning_loop from tenant_consents where tenant_id = $1`, [tenantId]);
+    if (consent.rows[0]?.learning_loop !== "opted_in") return;
+    const updated = await client.query(
+      `update rejection_learning_events set human_decision = $3::risk_state
+        where id = (select id from rejection_learning_events where tenant_id = $1 and risk_flag_id = $2 and opted_out = false order by created_at desc limit 1)`,
+      [tenantId, riskFlagId, state],
+    );
+    if (!updated.rowCount) {
+      await client.query(
+        `insert into rejection_learning_events (tenant_id, risk_flag_id, register_item_id, human_decision, anonymised_eligible, consent_state, opted_out)
+         values ($1, $2, $3, $4::risk_state, true, 'opted_in', false)`,
+        [tenantId, riskFlagId, registerItemId, state],
+      );
+    }
+  }
+
+  private async attachAcceptedProductDocuments(client: PoolClient, tenantId: string, packageId: string, projectId: string, onlyPackageItemId: string | null = null) {
+    const result = await client.query<{ package_item_id: string; document_id: string }>(
+      `with candidates as (
+         select pi.id as package_item_id, pd.document_id, pd.doc_role
+           from package_items pi
+           join product_matches pm on pm.tenant_id = pi.tenant_id and pm.register_item_id = pi.register_item_id and pm.decision = 'accepted'
+           join product_documents pd on pd.tenant_id = pm.tenant_id and pd.product_id = pm.product_id
+           join documents d on d.tenant_id = pd.tenant_id and d.id = pd.document_id and (d.project_id is null or d.project_id = $3)
+          where pi.tenant_id = $1 and pi.package_id = $2 and ($4::uuid is null or pi.id = $4)
+         union
+         select pi.id, p.datasheet_document_id, 'datasheet'
+           from package_items pi
+           join product_matches pm on pm.tenant_id = pi.tenant_id and pm.register_item_id = pi.register_item_id and pm.decision = 'accepted'
+           join products p on p.tenant_id = pm.tenant_id and p.id = pm.product_id
+           join documents d on d.tenant_id = p.tenant_id and d.id = p.datasheet_document_id and (d.project_id is null or d.project_id = $3)
+          where pi.tenant_id = $1 and pi.package_id = $2 and p.datasheet_document_id is not null and ($4::uuid is null or pi.id = $4)
+         union
+         select pi.id, pd.attachment_document_id, case when pd.kind = 'stamped_shop_drawing' then 'stamped_drawing_reference' else 'physical_deliverable_attachment' end
+           from package_items pi
+           join physical_deliverables pd on pd.tenant_id = pi.tenant_id and pd.register_item_id = pi.register_item_id
+           join documents d on d.tenant_id = pd.tenant_id and d.id = pd.attachment_document_id and (d.project_id is null or d.project_id = $3)
+          where pi.tenant_id = $1 and pi.package_id = $2 and pd.attachment_document_id is not null and ($4::uuid is null or pi.id = $4)
+       )
+       insert into package_item_documents (tenant_id, package_item_id, document_id, doc_role, sequence)
+       select $1, package_item_id, document_id, doc_role,
+              row_number() over (partition by package_item_id order by doc_role, document_id)::int
+         from candidates
+       on conflict (package_item_id, document_id) do nothing
+       returning package_item_id, document_id`,
+      [tenantId, packageId, projectId, onlyPackageItemId],
+    );
+    return result.rows;
+  }
+
   private async requireProject(client: PoolClient, projectId: string, allowArchived: boolean) {
     const result = await client.query(`select id from projects where id = $1 and ($2::boolean or is_archived = false)`, [projectId, allowArchived]);
     if (!result.rows[0]) throw new ForbiddenException("Forbidden");
@@ -1461,6 +1871,12 @@ export class ApiService {
   private async requireRegisterItem(client: PoolClient, projectId: string, itemId: string) {
     const result = await client.query(`select id from register_items where project_id = $1 and id = $2`, [projectId, itemId]);
     if (!result.rows[0]) throw new NotFoundException("register item not found");
+  }
+
+  private async requireActiveTenantMember(client: PoolClient, userId: string | null) {
+    if (!userId) return;
+    const result = await client.query(`select 1 from tenant_memberships where user_id = $1 and status = 'active'`, [userId]);
+    if (!result.rows[0]) throw new BadRequestException("assigned user must be an active tenant member");
   }
 
   private async requireRiskFlag(client: PoolClient, projectId: string, flagId: string) {
@@ -1474,14 +1890,22 @@ export class ApiService {
     if (!result.rows[0]) throw new NotFoundException("document not found");
   }
 
+  private async requireUsableDocument(client: PoolClient, projectId: string, documentId: string, allowedMimeTypes?: string[]): Promise<string> {
+    const result = await client.query<{ id: string; mime_type: string | null }>(`select id, mime_type from documents where id = $1 and archived_at is null and (project_id is null or project_id = $2)`, [documentId, projectId]);
+    if (!result.rows[0]) throw new NotFoundException("document not found");
+    if (allowedMimeTypes && !allowedMimeTypes.includes(result.rows[0].mime_type ?? "")) throw new BadRequestException("document type is not allowed here");
+    return result.rows[0].id;
+  }
+
   private async requirePackage(client: PoolClient, projectId: string, packageId: string) {
     const result = await client.query(`select id from packages where project_id = $1 and id = $2`, [projectId, packageId]);
     if (!result.rows[0]) throw new NotFoundException("package not found");
   }
 
   private async requireRfi(client: PoolClient, projectId: string, rfiId: string) {
-    const result = await client.query(`select id from rfi_drafts where project_id = $1 and id = $2`, [projectId, rfiId]);
+    const result = await client.query<{ id: string; review_status: string }>(`select id, review_status from rfi_drafts where project_id = $1 and id = $2`, [projectId, rfiId]);
     if (!result.rows[0]) throw new NotFoundException("RFI draft not found");
+    return result.rows[0];
   }
 
   private async recordAudit(

@@ -26,7 +26,10 @@ for f in $(ls db/migrations/0*.sql | grep -v '\.down\.'); do
 done
 ```
 
-`0001`–`0016` build the schema (`0016` adds the `app.claim_next_job()` worker-queue claimer),
+`0001`-`0018` build the schema (`0016` adds the `app.claim_next_job()` worker-queue claimer;
+`0017` adds package versions, package document selection, branding, register auto-population, and
+physical-deliverable tracking fields; `0018` adds versioned risk scoring, rule provenance,
+structured RFI drafts, source-risk links, and generated-checklist idempotency),
 `0099_seed.sql` seeds roles/permissions/plans + a test fixture.
 Run migrations as the **owner/superuser** role (it owns the tables and therefore bypasses RLS, which
 is why seeding works). The runtime application connects as a different role — see below.
@@ -55,14 +58,18 @@ the `submitsense_auditor` role.
 
 ```bash
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/test/test_guardrails.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/test/test_package_assembly.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/test/test_risk_rfi_agent.sql
 ```
 
-Proves the eight compliance guardrails fire (human-approval guard, cross-tenant match block,
+The first script proves the eight compliance guardrails fire (human-approval guard, cross-tenant match block,
 append-only audit, RLS isolation, NATSPEC-copyright publish block). Prints `PASS n` lines; aborts on
-any `FAIL`. The script rolls back, leaving the DB as seeded.
-
-> Not executed in this environment (no local PostgreSQL). Run the two commands above against a live
-> PG17 + pgvector instance to confirm end-to-end.
+any `FAIL`. The package script adds nine checks for register auto-population, ready-version
+integrity, cross-tenant attachment rejection, package-version RLS, nullable composite-reference
+cleanup, retryable/exhausted/committed worker recovery, and Australian deadline boundaries. The
+risk/RFI script adds six scoring, evidence, idempotency, and draft-structure checks. All scripts roll
+back. All 23 checks were executed
+successfully on PostgreSQL 17 with pgvector 0.8.4.
 
 ## Rollback strategy (req f30)
 
@@ -78,8 +85,8 @@ any `FAIL`. The script rolls back, leaving the DB as seeded.
 
 ```
 db/
-  migrations/   0001..0016 schema, 0099 seed, 9999 teardown
-  test/         test_guardrails.sql — runnable compliance self-check
+  migrations/   0001..0018 schema, 0099 seed, 9999 teardown
+  test/         runnable compliance and package-assembly checks
   docs/         ERD, table/enum docs, RLS, indexing, retention, queries, HANDOFF contract
 ```
 

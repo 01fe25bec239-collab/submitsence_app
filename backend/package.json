@@ -6,13 +6,19 @@
     "start:dev": "tsx src/main.ts",
     "typecheck": "tsc --noEmit",
     "worker": "tsx src/worker/worker.ts",
+    "render:package-fixture": "node --import tsx scripts/render-package-fixture.ts",
+    "verify:package-worker": "node --import tsx scripts/verify-package-worker.ts",
+    "verify:risk-rfi-worker": "node --import tsx scripts/verify-risk-rfi-worker.ts",
     "test": "node --import tsx --test test/*.test.mjs test/*.test.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1086.0",
     "@nestjs/common": "^11.0.0",
     "@nestjs/core": "^11.0.0",
     "@nestjs/platform-express": "^11.0.0",
     "aws-jwt-verify": "^4.0.0",
+    "jszip": "^3.10.1",
+    "pdf-lib": "^1.17.1",
     "pg": "^8.13.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.0"

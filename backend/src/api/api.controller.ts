@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Post, Query, Req, UseGuards } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query, Req, UseGuards } from "@nestjs/common";
 import { CognitoAuthGuard, PermissionGuard, RequirePermission, TenantGuard } from "../auth/auth.guards";
 import type { AuthedRequest } from "../auth/auth.types";
 import { ApiService } from "./api.service";
@@ -115,8 +115,10 @@ export class ApiController {
 
   @RequirePermission("export", "projectId")
   @Post("projects/:projectId/register-items/export")
+  @HttpCode(202)
   exportRegister(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Body() body: unknown) {
-    return this.service.requestRegisterExport(req.auth!, projectId, api.idempotencyKey(req.headers, api.object(body)), req);
+    const input = api.object(body);
+    return this.service.requestRegisterExport(req.auth!, projectId, input, api.idempotencyKey(req.headers, input), req);
   }
 
   @RequirePermission("read", "projectId")
@@ -222,8 +224,10 @@ export class ApiController {
 
   @RequirePermission("review", "projectId")
   @Post("projects/:projectId/risk-flags/generate")
+  @HttpCode(202)
   generateRisks(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Body() body: unknown) {
-    return this.service.generateRiskFlags(req.auth!, projectId, api.idempotencyKey(req.headers, api.object(body)), req);
+    const input = api.object(body);
+    return this.service.generateRiskFlags(req.auth!, projectId, input, api.idempotencyKey(req.headers, input), req);
   }
 
   @RequirePermission("read", "projectId")
@@ -262,8 +266,17 @@ export class ApiController {
     return this.service.createRiskTask(req.auth!, projectId, flagId, api.object(body), req);
   }
 
+  @RequirePermission("review", "projectId")
+  @Post("projects/:projectId/risk-flags/:flagId/rfi")
+  @HttpCode(202)
+  riskRfi(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Param("flagId") flagId: string, @Body() body: unknown) {
+    const input = api.object(body);
+    return this.service.createRiskRfi(req.auth!, projectId, flagId, input, api.idempotencyKey(req.headers, input), req);
+  }
+
   @RequirePermission("read", "projectId")
   @Post("projects/:projectId/rfis/generate")
+  @HttpCode(202)
   generateRfi(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Body() body: unknown) {
     const input = api.object(body);
     return this.service.generateRfi(req.auth!, projectId, input, api.idempotencyKey(req.headers, input), req);
@@ -314,19 +327,53 @@ export class ApiController {
   }
 
   @RequirePermission("generate", "projectId")
+  @Post("projects/:projectId/packages/:packageId/items")
+  addPackageItem(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Param("packageId") packageId: string, @Body() body: unknown) {
+    return this.service.addPackageItem(req.auth!, projectId, packageId, api.object(body), req);
+  }
+
+  @RequirePermission("generate", "projectId")
+  @Patch("projects/:projectId/packages/:packageId/items/:packageItemId")
+  updatePackageItem(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Param("packageId") packageId: string, @Param("packageItemId") packageItemId: string, @Body() body: unknown) {
+    return this.service.updatePackageItem(req.auth!, projectId, packageId, packageItemId, api.object(body), req);
+  }
+
+  @RequirePermission("generate", "projectId")
+  @Post("projects/:projectId/packages/:packageId/items/:packageItemId/remove")
+  @HttpCode(200)
+  removePackageItem(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Param("packageId") packageId: string, @Param("packageItemId") packageItemId: string) {
+    return this.service.removePackageItem(req.auth!, projectId, packageId, packageItemId, req);
+  }
+
+  @RequirePermission("generate", "projectId")
+  @Post("projects/:projectId/packages/:packageId/items/:packageItemId/documents")
+  attachPackageDocument(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Param("packageId") packageId: string, @Param("packageItemId") packageItemId: string, @Body() body: unknown) {
+    return this.service.attachPackageDocument(req.auth!, projectId, packageId, packageItemId, api.object(body), req);
+  }
+
+  @RequirePermission("read", "projectId")
+  @Get("projects/:projectId/packages/:packageId/versions")
+  packageVersions(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Param("packageId") packageId: string) {
+    return this.service.packageVersions(req.auth!, projectId, packageId);
+  }
+
+  @RequirePermission("generate", "projectId")
   @Post("projects/:projectId/packages/:packageId/regenerate")
+  @HttpCode(202)
   regeneratePackage(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Param("packageId") packageId: string, @Body() body: unknown) {
     return this.service.regeneratePackage(req.auth!, projectId, packageId, api.idempotencyKey(req.headers, api.object(body)), req);
   }
 
   @RequirePermission("export", "projectId")
   @Post("projects/:projectId/packages/:packageId/export-pdf")
+  @HttpCode(202)
   exportPdf(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Param("packageId") packageId: string, @Body() body: unknown) {
     return this.service.exportPackage(req.auth!, projectId, packageId, "consultant_pdf", api.idempotencyKey(req.headers, api.object(body)), req);
   }
 
   @RequirePermission("export", "projectId")
   @Post("projects/:projectId/packages/:packageId/export-aconex")
+  @HttpCode(202)
   exportAconex(@Req() req: AuthedRequest, @Param("projectId") projectId: string, @Param("packageId") packageId: string, @Body() body: unknown) {
     return this.service.exportPackage(req.auth!, projectId, packageId, "aconex_bundle", api.idempotencyKey(req.headers, api.object(body)), req);
   }
@@ -357,6 +404,16 @@ export class ApiController {
   @Get("learning-consent")
   getLearningConsent(@Req() req: AuthedRequest) {
     return this.service.getLearningConsent(req.auth!);
+  }
+
+  @Get("branding")
+  getBranding(@Req() req: AuthedRequest) {
+    return this.service.getBranding(req.auth!);
+  }
+
+  @Patch("branding")
+  updateBranding(@Req() req: AuthedRequest, @Body() body: unknown) {
+    return this.service.updateBranding(req.auth!, api.object(body), req);
   }
 
   @Post("learning-consent")

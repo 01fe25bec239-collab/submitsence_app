@@ -34,11 +34,17 @@ erDiagram
   register_items ||--o{ risk_flags : flagged
   register_items ||--o{ rfi_drafts : raises
   risk_flags ||--o{ checklist_items : generates
+  risk_flags ||--o{ rfi_drafts : may-draft
   risk_flags ||--o{ rejection_learning_events : feeds
 
   packages ||--o{ package_items : includes
   register_items ||--o{ package_items : included_as
+  package_items ||--o{ package_item_documents : selects
+  documents ||--o{ package_item_documents : attached_as
+  packages ||--o{ package_versions : preserves
+  documents ||--o{ package_versions : generated_as
   packages ||--o{ exports : exported_as
+  package_versions ||--o{ exports : source_version
 
   vendors ||--o{ vendor_catalogues : publishes
   vendors ||--o{ products : supplies
@@ -65,7 +71,7 @@ erDiagram
 - **Tenancy / IAM** — tenants, users, roles, permissions, role_permissions, tenant_memberships, project_memberships
 - **Documents** — documents, processing_jobs
 - **Specs** — worksections, clauses, clause_references, extracted_fragments, addenda_reconciliations, submittal_requirements
-- **Register / workflow** — register_items, physical_deliverables, packages, package_items, exports
+- **Register / workflow** — register_items, physical_deliverables, packages, package_items, package_item_documents, package_versions, exports
 - **Vendors / matching** — vendors, vendor_catalogues, products, product_documents, product_attributes, extracted_product_data, product_embeddings, product_matches
 - **Risk / RFI / learning** — risk_flags, checklist_items, rfi_drafts, rfi_cited_clauses, rfi_cited_documents, rejection_learning_events, tenant_consents
 - **Audit** — audit_events (append-only)

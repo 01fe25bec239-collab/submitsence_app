@@ -1,7 +1,7 @@
 import { BadRequestException } from "@nestjs/common";
 import type { ProjectRoleKey, TenantRoleKey } from "./auth.types";
 
-const uuidRx = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const uuidRx = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const tenantRoles = new Set<TenantRoleKey>([
   "owner",
   "admin",

@@ -1,9 +1,9 @@
 # Handoff contract — SubmitSense database layer
 
 For the backend, auth, frontend, QA, and infra agents. This is the stable surface the persistence
-layer exposes. Migrations: `db/migrations/0001–0015`, seed `0099`, teardown `9999`.
-Database guardrails were validated on PostgreSQL 17.10 + pgvector 0.8.4 for `0001`-`0013`
-(all 8 guardrails pass; see `db/test/`). Re-run the same check after applying `0014`.
+layer exposes. Migrations: `db/migrations/0001-0018`, seed `0099`, teardown `9999`.
+Database guardrails were validated on PostgreSQL 17 + pgvector 0.8.4 through `0018`
+(all 8 baseline, 9 package-assembly, and 6 risk/RFI checks pass; see `db/test/`).
 
 ## 1. Connection & request context (backend + auth)
 
@@ -49,15 +49,19 @@ Database guardrails were validated on PostgreSQL 17.10 + pgvector 0.8.4 for `000
 `clause_references(reference_label)`, `extracted_fragments(content)`, `addenda_reconciliations(action)`,
 `submittal_requirements(category,worksection_id,clause_id,confidence)`.
 
-**Register:** `register_items(status,due_date,responsible_user_id,human_approved_by,human_approved_at,consultant_platform_ref)`,
-`physical_deliverables(kind,status)`, `packages(status,output_document_id)`, `package_items`, `exports(export_type,status)`.
+**Register:** `register_items(status,due_date,responsible_user_id,human_approved_by,human_approved_at,consultant_platform_ref,consultant_response_ref,consultant_response_at)`,
+`physical_deliverables(kind,status,due_date,notes,attachment_document_id)`,
+`packages(status,cover_sheet,current_version,output_document_id)`,
+`package_items(sequence,included,manual_notes)`, `package_item_documents`,
+`package_versions(version_number,status,output_document_id,manifest,checksum_sha256)`,
+`exports(export_type,status,package_version_id,metadata,error_message)`.
 
 **Vendors/match:** `vendors`, `vendor_catalogues`, `products(model_number,category)`, `product_documents`,
 `product_attributes`, `extracted_product_data`, `product_embeddings(embedding vector(1536))`,
 `product_matches(confidence,rationale_summary,evidence,decision,decided_by)`.
 
-**Risk/RFI:** `risk_flags(risk_type,severity,state,reviewed_by)`, `checklist_items`,
-`rfi_drafts(conflict_type,review_status,send_status)`, `rfi_cited_clauses`, `rfi_cited_documents`,
+**Risk/RFI:** `risk_flags(risk_type,severity,rule_key,risk_score,scoring_version,state,reviewed_by)`,
+`checklist_items`, `rfi_drafts(issue_summary,question,suggested_attachments,source_risk_flag_id,conflict_type,review_status,send_status)`, `rfi_cited_clauses`, `rfi_cited_documents`,
 `rejection_learning_events(consultant_outcome,anonymised_eligible,consent_state,opted_out)`, `tenant_consents(learning_loop)`.
 
 **Audit:** `audit_events(event_type,actor_user_id,actor_type,entity_type,entity_id,payload,occurred_at,checksum)`.
@@ -108,8 +112,8 @@ Full permission list is seeded in `0099_seed.sql`.
   concrete periods when contracts specify (retention.md).
 - **User provisioning** is an elevated/auth-service operation (RLS blocks the app role from
   inserting arbitrary `users`). Auth agent owns signup/invite flows.
-- **Not in scope here:** APIs, OCR, LLM prompts, PDF generation, billing-provider integration, auth
-  provider setup, deployment, external Aconex/Procore calls.
+- **External integration boundary:** the schema stores Aconex/Procore references and sync jobs, but
+  provider SDK calls and credentials remain deployment/integration work.
 
 ## 8. Infra / RDS requirements (for the infra agent)
 

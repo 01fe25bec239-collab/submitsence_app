@@ -3,29 +3,74 @@ import { createPool } from "../db.module";
 import { withTenantClient } from "../db/tenant-db";
 import { ingestCatalogue } from "../ingestion/ingestion.service";
 import { computeAndStoreMatches } from "../matching/matching.service";
+import { markPackageJobFailed, processPackageJob } from "../package/package.service";
+import { generateRfiDraft, runRiskPrecheck } from "../risk/risk.service";
 
 // B6-B7 background worker. Reuses the existing DB job ledger (processing_jobs) — no broker, per the
 // API handoff which keeps broker/runtime deferred. Loop: claim one job cross-tenant via the
-// SECURITY DEFINER claimer (0016), then process + mark it INSIDE a tenant transaction as actor
+// SECURITY DEFINER claimer (0017), then process + mark it INSIDE a tenant transaction as actor
 // 'system' (withTenantClient), so RLS + the human-approval guard apply and a job can never sign off.
 //
-// ponytail: a job stuck in 'running' (worker crash mid-process) is left for a future reaper
-// (requeue 'running' older than N minutes). Fine at MVP; add the reaper when it actually bites.
-
 type ClaimedJob = { id: string; tenant_id: string; job_type: string; document_id: string | null; worker_output: Record<string, unknown> | null };
 
-const HANDLED = ["product_rematch", "ingest_vendor_catalogue", "ingest_past_submittal"];
+const HANDLED = [
+  "product_rematch", "ingest_vendor_catalogue", "ingest_past_submittal", "package_generation",
+  "risk_flag_generation", "rfi_generation",
+  "export_consultant_pdf", "export_aconex_bundle", "export_register_csv", "export_register_xlsx", "export_register_pdf",
+];
 
-type Handler = (client: PoolClient, job: ClaimedJob) => Promise<Record<string, unknown>>;
+type Handler = (pool: Pool, job: ClaimedJob) => Promise<Record<string, unknown>>;
+
+const tenantHandler = (handler: (client: PoolClient, job: ClaimedJob) => Promise<Record<string, unknown>>): Handler =>
+  (pool, job) => withTenantClient(pool, { tenantId: job.tenant_id, actorType: "system", userId: null }, (client) => handler(client, job));
 
 const handlers: Record<string, Handler> = {
-  product_rematch: async (client, job) => {
+  product_rematch: tenantHandler(async (client, job) => {
     const registerItemId = String(job.worker_output?.registerItemId ?? "");
     if (!registerItemId) throw new Error("product_rematch job missing registerItemId");
     return { ...(await computeAndStoreMatches(client, { tenantId: job.tenant_id, registerItemId })) };
-  },
-  ingest_vendor_catalogue: ingestHandler,
-  ingest_past_submittal: ingestHandler,
+  }),
+  ingest_vendor_catalogue: tenantHandler(ingestHandler),
+  ingest_past_submittal: tenantHandler(ingestHandler),
+  risk_flag_generation: tenantHandler(async (client, job) => {
+    const out = job.worker_output ?? {};
+    const projectId = String(out.projectId ?? "");
+    if (!projectId) throw new Error("risk_flag_generation job missing projectId");
+    return runRiskPrecheck(client, {
+      tenantId: job.tenant_id,
+      projectId,
+      jobId: job.id,
+      packageId: typeof out.packageId === "string" ? out.packageId : null,
+      registerItemId: typeof out.registerItemId === "string" ? out.registerItemId : null,
+    });
+  }),
+  rfi_generation: tenantHandler(async (client, job) => {
+    const out = job.worker_output ?? {};
+    const projectId = String(out.projectId ?? "");
+    if (!projectId) throw new Error("rfi_generation job missing projectId");
+    const ids = (value: unknown) => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+    return generateRfiDraft(client, {
+      tenantId: job.tenant_id,
+      projectId,
+      jobId: job.id,
+      requestedBy: typeof out.requestedBy === "string" ? out.requestedBy : null,
+      riskFlagId: typeof out.riskFlagId === "string" ? out.riskFlagId : null,
+      registerItemId: typeof out.registerItemId === "string" ? out.registerItemId : null,
+      title: typeof out.title === "string" ? out.title : null,
+      issueSummary: typeof out.issueSummary === "string" ? out.issueSummary : null,
+      question: typeof out.question === "string" ? out.question : null,
+      conflictType: typeof out.conflictType === "string" ? out.conflictType : null,
+      clauseReferenceIds: ids(out.clauseReferenceIds),
+      drawingDocumentIds: ids(out.drawingDocumentIds),
+      suggestedAttachmentIds: ids(out.suggestedAttachmentIds),
+    });
+  }),
+  package_generation: processPackageJob,
+  export_consultant_pdf: processPackageJob,
+  export_aconex_bundle: processPackageJob,
+  export_register_csv: processPackageJob,
+  export_register_xlsx: processPackageJob,
+  export_register_pdf: processPackageJob,
 };
 
 async function ingestHandler(client: PoolClient, job: ClaimedJob): Promise<Record<string, unknown>> {
@@ -58,25 +103,26 @@ async function ingestHandler(client: PoolClient, job: ClaimedJob): Promise<Recor
 async function processJob(pool: Pool, job: ClaimedJob): Promise<void> {
   const handler = handlers[job.job_type];
   try {
-    const output = await withTenantClient(pool, { tenantId: job.tenant_id, actorType: "system", userId: null }, async (client) => {
-      if (!handler) throw new Error(`no handler for job_type ${job.job_type}`);
-      const result = await handler(client, job);
+    if (!handler) throw new Error(`no handler for job_type ${job.job_type}`);
+    const result = await handler(pool, job);
+    await withTenantClient(pool, { tenantId: job.tenant_id, actorType: "system", userId: null }, async (client) => {
       await client.query(
-        `update processing_jobs set status = 'succeeded', finished_at = now(), worker_output = coalesce(worker_output, '{}'::jsonb) || $2::jsonb
+        `update processing_jobs set status = 'succeeded', finished_at = now(), last_error = null, error_details = null,
+                                    updated_at = now(), worker_output = coalesce(worker_output, '{}'::jsonb) || $2::jsonb
           where id = $1`,
         [job.id, JSON.stringify(result)],
       );
-      return result;
     });
-    return void output;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    await markPackageJobFailed(pool, job, message).catch(() => undefined);
     // Mark retrying (if attempts remain) or failed. attempts was already incremented by the claimer.
     await withTenantClient(pool, { tenantId: job.tenant_id, actorType: "system", userId: null }, async (client) => {
       await client.query(
         `update processing_jobs
             set status = case when attempts < max_attempts then 'retrying' else 'failed' end,
-                last_error = $2, finished_at = case when attempts < max_attempts then finished_at else now() end
+                last_error = $2, finished_at = case when attempts < max_attempts then finished_at else now() end,
+                updated_at = now()
           where id = $1`,
         [job.id, message.slice(0, 500)],
       );

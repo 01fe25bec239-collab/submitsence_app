@@ -40,10 +40,12 @@ trigger). Composite FKs `(tenant_id, parent_id)` enforce same-tenant linkage. "S
 
 | Table | Purpose | Key columns / constraints |
 |---|---|---|
-| `register_items` | Submittal register line | `status` (submittal_status, default `draft`), `due_date`, `responsible_user_id`, `consultant_platform_ref`, `revision`, **`human_approved_by`/`human_approved_at`**. CHECK + trigger guard on `human_approved` (req f12) |
-| `physical_deliverables` | Samples / stamped drawings | `kind`, `status`, `tracking_ref` — tracked line items, not generated files (req f13) |
-| `packages` | Consultant-ready package | `status` (package_status), `output_document_id`, `consultant_platform_ref` |
-| `package_items` | Register items in a package | unique `(package_id, register_item_id)` |
+| `register_items` | Submittal register line | `status` (submittal_status, default `draft`), `due_date`, `responsible_user_id`, consultant platform/response refs, `revision`, **`human_approved_by`/`human_approved_at`**. Auto-populated from requirements; CHECK + trigger guard on `human_approved` (req f12) |
+| `physical_deliverables` | Samples / stamped drawings | `kind`, `status`, `tracking_ref`, `due_date`, `notes`, optional `attachment_document_id` - tracked line items, not generated stamped/certified files (req f13) |
+| `packages` | Consultant-ready package draft | `status`, immutable cover snapshot, `current_version`, latest `output_document_id`, consultant reference |
+| `package_items` | Editable package register lines | unique `(package_id, register_item_id)`, explicit `sequence`, `included`, manual notes |
+| `package_item_documents` | Selected package files | per-item document role, order, and inclusion; composite FKs enforce tenant identity |
+| `package_versions` | Preserved generated outputs | monotonically increasing version, generation-job idempotency, output document, manifest, checksum, failure detail |
 | `exports` | Generated exports | `export_type`, `status` (export_status), `output_document_id` |
 
 ## Vendors & matching (0007)
@@ -63,9 +65,9 @@ trigger). Composite FKs `(tenant_id, parent_id)` enforce same-tenant linkage. "S
 
 | Table | Purpose | Key columns / constraints |
 |---|---|---|
-| `risk_flags` | Rejection-risk flags | `risk_type`, `severity`, `state` (risk_state), `clause_reference_id`, `evidence`, `reviewed_by`. CHECK: non-`open` state needs a reviewer |
+| `risk_flags` | Rejection-risk flags | `risk_type`, `severity`, `rule_key`, explainable `risk_score`, `scoring_version`, `state`, source-reference `evidence`, `reviewed_by`. CHECK: score 0-100; evidence array; non-`open` state needs a reviewer |
 | `checklist_items` | Generated checklist | `label`, `is_done`, `done_by`/`done_at`; may link a `risk_flag_id` |
-| `rfi_drafts` | RFI drafts | `title`, `body`, `conflict_type`, `review_status`, `send_status`, `reviewed_by` |
+| `rfi_drafts` | RFI drafts | `title`, `issue_summary`, `question`, `suggested_attachments`, `source_risk_flag_id`, `conflict_type`, `review_status`, `send_status`, `reviewed_by` |
 | `rfi_cited_clauses` | RFI→clause citations | PK `(rfi_id, clause_reference_id)` |
 | `rfi_cited_documents` | RFI→drawing citations | PK `(rfi_id, document_id)` |
 | `rejection_learning_events` | Pattern-learning events | `human_decision`, `consultant_outcome`, `anonymised_eligible`, `consent_state`, `opted_out` |
