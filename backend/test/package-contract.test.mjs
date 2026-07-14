@@ -53,7 +53,8 @@ test("consultant updates are mapped, replay-safe, and cannot perform human sign-
   assert.match(apiService, /externalProjectMappings|external_project_mappings/);
   assert.match(apiService, /integration_connections[\s\S]*status = 'connected'/);
   assert.match(apiService, /!result\.rows\[0\]\.inserted[\s\S]*status === "processed"/);
-  assert.match(apiService, /externalConsultantStatuses\.has\(next\)/);
+  assert.match(apiService, /mapExternalConsultantStatus\(payload\.status\)/);
+  assert.match(apiService, /consultant_status = \$5/);
   assert.match(apiService, /status: "processed"/);
   assert.doesNotMatch(apiService.slice(apiService.indexOf('if (eventType === "consultant_status")'), apiService.indexOf("private async createExportJob")), /set status = 'human_approved'/);
 });

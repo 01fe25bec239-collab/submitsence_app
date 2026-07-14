@@ -130,6 +130,7 @@ export const openApiDocument = {
     "/tenants/{tenantId}/subscription/trial": op("post", "Start tenant trial", true, created),
     "/tenants/{tenantId}/help": op("get", "Authenticated contextual help"),
     "/tenants/{tenantId}/integrations/connections": op("get", "Integration connection status"),
+    "/tenants/{tenantId}/integrations/providers": op("get", "Integration provider capabilities and approval status"),
     "/tenants/{tenantId}/integrations/connections/{connectionId}/mappings": { ...op("get", "Integration project mappings"), ...op("post", "Create integration project mapping", true, created) },
     "/tenants/{tenantId}/integrations/connections/{connectionId}/sync-jobs": op("post", "Create integration sync job", true, accepted),
     "/tenants/{tenantId}/integrations/sync-jobs/{jobId}": op("get", "Integration sync job status"),

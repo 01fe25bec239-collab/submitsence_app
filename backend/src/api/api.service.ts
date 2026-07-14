@@ -14,6 +14,7 @@ import * as v from "../auth/validation";
 import { assertSafeStatusLanguage } from "../compliance/language";
 import { getEmbedder, toVectorLiteral } from "../ingestion/embedder";
 import { extractStandards } from "../ingestion/extraction";
+import { assertAustralianSecretReference, listProviderCapabilities, mapExternalConsultantStatus, providerCapabilities } from "../integrations/provider";
 import { resolveCoverSheet } from "../package/package.service";
 import { withTenantClient } from "../db/tenant-db";
 import { PG_POOL } from "../db.module";
@@ -53,7 +54,6 @@ const ingestJobType: Record<string, string> = {
   attachment: "ingest_attachment",
   other: "ingest_document",
 };
-const externalConsultantStatuses = new Set(["submitted", "revise_and_resubmit", "rejected"]);
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 
 @Injectable()
@@ -1580,6 +1580,11 @@ export class ApiService {
     });
   }
 
+  async integrationProviderCapabilities(ctx: AuthContext) {
+    await this.auth.requireTenantPermission(ctx, "integration.manage");
+    return listProviderCapabilities();
+  }
+
   async listMappings(ctx: AuthContext, connectionId: string) {
     await this.auth.requireTenantPermission(ctx, "integration.manage");
     const id = v.uuid(connectionId, "connectionId");
@@ -1618,6 +1623,15 @@ export class ApiService {
     const packageId = api.optionalUuid(body.packageId, "packageId");
     const jobType = api.enumValue(body.jobType ?? "package_push", "jobType", api.syncJobTypes);
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      const connection = await client.query<{ provider: string; status: string; token_reference: string | null }>(
+        `select provider::text, status::text, token_reference from integration_connections where id = $1`,
+        [id],
+      );
+      const row = connection.rows[0] ?? this.notFound("integration connection");
+      const capabilities = providerCapabilities(row.provider);
+      if (!capabilities?.enabled) throw new ForbiddenException(capabilities?.reason ?? "Integration provider is not approved");
+      if (row.status !== "connected") throw new ForbiddenException("Integration connection is not connected");
+      assertAustralianSecretReference(row.token_reference);
       const job = await this.enqueueSyncJob(client, ctx, id, projectId, packageId, jobType, `integration_sync:${id}:${idempotencyKey}`, api.object(body.payload));
       await this.recordAudit(client, ctx, "integration_sync", "sync_job", job.id, "sync_job_create", "Integration sync job created", { project_id: projectId, connectionId: id }, req);
       return job;
@@ -1689,8 +1703,13 @@ export class ApiService {
       if (eventType === "consultant_status") {
         const projectId = v.uuid(payload.projectId, "payload.projectId");
         const registerItemId = v.uuid(payload.registerItemId, "payload.registerItemId");
-        const next = v.string(payload.status, "payload.status");
-        if (!externalConsultantStatuses.has(next)) throw new BadRequestException("external consultant status must be submitted, revise_and_resubmit, or rejected");
+        let mapped: ReturnType<typeof mapExternalConsultantStatus>;
+        try {
+          mapped = mapExternalConsultantStatus(payload.status);
+        } catch {
+          throw new BadRequestException("external consultant status must be submitted, approved, returned, revise_and_resubmit, or rejected");
+        }
+        const next = mapped.registerStatus;
         const mapping = await client.query(
           `select 1 from external_project_mappings where tenant_id = $1 and connection_id = $2 and project_id = $3`,
           [tenantId, connectionId, projectId],
@@ -1698,23 +1717,24 @@ export class ApiService {
         if (!mapping.rows[0]) throw new BadRequestException("consultant status project is not mapped to this integration connection");
         const current = await client.query<{ status: keyof typeof transitions }>(`select status from register_items where tenant_id = $1 and project_id = $2 and id = $3`, [tenantId, projectId, registerItemId]);
         const from = current.rows[0]?.status ?? this.notFound("register item");
-        if (from !== next && !(transitions[from] as string[]).includes(next)) throw new BadRequestException(`invalid status transition ${from} -> ${next}`);
+        if (next && from !== next && !(transitions[from] as string[]).includes(next)) throw new BadRequestException(`invalid status transition ${from} -> ${next}`);
         await client.query(
           `update register_items
-              set status = $4::submittal_status,
-                  consultant_platform_ref = coalesce($5, consultant_platform_ref),
-                  consultant_response_ref = $6,
+              set status = coalesce($4::submittal_status, status),
+                  consultant_status = $5,
+                  consultant_platform_ref = coalesce($6, consultant_platform_ref),
+                  consultant_response_ref = $7,
                   consultant_response_at = now(),
                   submitted_at = case when $4 = 'submitted' then coalesce(submitted_at, now()) else submitted_at end
             where tenant_id = $1 and project_id = $2 and id = $3`,
-          [tenantId, projectId, registerItemId, next, api.optionalString(payload.consultantPlatformRef), api.optionalString(payload.responseRef) ?? externalEventId],
+          [tenantId, projectId, registerItemId, next, mapped.consultantStatus, api.optionalString(payload.consultantPlatformRef), api.optionalString(payload.responseRef) ?? externalEventId],
         );
         await client.query(
           `insert into audit_events (tenant_id, event_type, actor_type, entity_type, entity_id, action, summary, payload)
            values ($1, 'integration_sync', 'system', 'register_item', $2, 'consultant_response_update', 'Consultant response reference and status recorded', $3::jsonb)`,
-          [tenantId, registerItemId, JSON.stringify({ project_id: projectId, provider: checkedProvider, status: next, responseRef: api.optionalString(payload.responseRef) ?? externalEventId })],
+          [tenantId, registerItemId, JSON.stringify({ project_id: projectId, provider: checkedProvider, consultantStatus: mapped.consultantStatus, registerStatus: next, responseRef: api.optionalString(payload.responseRef) ?? externalEventId })],
         );
-        const consultantOutcome = next === "rejected" ? "rejected" : next === "revise_and_resubmit" ? "revise_and_resubmit" : null;
+        const consultantOutcome = mapped.consultantStatus === "rejected" ? "rejected" : mapped.consultantStatus === "revise_and_resubmit" ? "revise_and_resubmit" : null;
         if (consultantOutcome) {
           const consent = await client.query<{ learning_loop: string }>(`select learning_loop from tenant_consents where tenant_id = $1`, [tenantId]);
           if (consent.rows[0]?.learning_loop === "opted_in") {

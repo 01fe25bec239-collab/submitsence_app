@@ -448,6 +448,11 @@ export class ApiController {
     return this.service.listConnections(req.auth!);
   }
 
+  @Get("integrations/providers")
+  integrationProviders(@Req() req: AuthedRequest) {
+    return this.service.integrationProviderCapabilities(req.auth!);
+  }
+
   @Get("integrations/connections/:connectionId/mappings")
   mappings(@Req() req: AuthedRequest, @Param("connectionId") connectionId: string) {
     return this.service.listMappings(req.auth!, connectionId);
