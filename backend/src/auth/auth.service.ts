@@ -8,7 +8,7 @@ import {
 } from "@nestjs/common";
 import { createHash, randomBytes } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
-import { withTenantClient } from "../db/tenant-db";
+import { withTenantClient, withUserClient } from "../db/tenant-db";
 import { PG_POOL } from "../db.module";
 import type {
   ActorType,
@@ -84,7 +84,7 @@ export class AuthService {
   }
 
   async listMemberships(userId: string): Promise<TenantMembership[]> {
-    return this.withUserContext(userId, async (client) => {
+    return withUserClient(this.pool, userId, async (client) => {
       const result = await client.query<MembershipRow>(
         `select m.id as "membershipId",
                 m.tenant_id as "tenantId",
@@ -108,7 +108,7 @@ export class AuthService {
 
   async resolveTenantContext(principal: Principal, tenantId: string, claims: Record<string, unknown> = {}): Promise<AuthContext> {
     const activeTenantId = v.uuid(tenantId, "tenantId");
-    const row = await this.withUserContext(principal.id, async (client) => {
+    const row = await withUserClient(this.pool, principal.id, async (client) => {
       const result = await client.query<MembershipRow>(
         `select m.id as "membershipId",
                 m.tenant_id as "tenantId",
@@ -474,23 +474,6 @@ export class AuthService {
       );
       return result.rows[0] ?? null;
     });
-  }
-
-  private async withUserContext<T>(userId: string, fn: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query("begin");
-      await client.query("select set_config('app.user_id', $1, true)", [userId]);
-      await client.query("select set_config('app.actor_type', $1, true)", ["human"]);
-      const out = await fn(client);
-      await client.query("commit");
-      return out;
-    } catch (e) {
-      await client.query("rollback");
-      throw e;
-    } finally {
-      client.release();
-    }
   }
 
   private dbContext(ctx: AuthContext) {

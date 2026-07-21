@@ -428,21 +428,6 @@ export class ApiController {
     return this.service.learningAggregate(req.auth!, query);
   }
 
-  @Get("subscription")
-  subscription(@Req() req: AuthedRequest) {
-    return this.service.subscription(req.auth!);
-  }
-
-  @Post("subscription/trial")
-  startTrial(@Req() req: AuthedRequest, @Body() body: unknown) {
-    return this.service.startTrial(req.auth!, api.object(body), req);
-  }
-
-  @Get("help")
-  contextualHelp(@Query() query: Record<string, unknown>) {
-    return this.service.contextualHelp(query);
-  }
-
   @Get("integrations/connections")
   connections(@Req() req: AuthedRequest) {
     return this.service.listConnections(req.auth!);

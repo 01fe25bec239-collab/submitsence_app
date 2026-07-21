@@ -5,6 +5,7 @@ import { test } from "node:test";
 const transitions = JSON.parse(readFileSync(new URL("../src/api/status-transitions.json", import.meta.url), "utf8"));
 const openapiSource = readFileSync(new URL("../src/api/openapi.ts", import.meta.url), "utf8");
 const serviceSource = readFileSync(new URL("../src/api/api.service.ts", import.meta.url), "utf8");
+const commercialSource = readFileSync(new URL("../src/commercial/commercial.service.ts", import.meta.url), "utf8");
 const handoff = readFileSync(new URL("../docs/api-handoff.md", import.meta.url), "utf8");
 
 test("register status policy keeps human approval on the sign-off path", () => {
@@ -34,8 +35,9 @@ test("service enforces assistive language and blocks direct human_approved trans
 
 test("webhooks resolve tenant from a trusted server-side mapping, never the request body", () => {
   assert.match(serviceSource, /resolve_integration_tenant/);
-  assert.match(serviceSource, /resolve_billing_tenant/);
+  assert.match(commercialSource, /resolve_billing_tenant/);
   assert.doesNotMatch(serviceSource, /v\.uuid\(body\.tenantId/);
+  assert.doesNotMatch(commercialSource, /body\.tenantId/);
 });
 
 test("queue handoff keeps broker/runtime open and DB ledgers binding", () => {

@@ -88,7 +88,7 @@ begin
 
   insert into tenant_memberships (tenant_id, user_id, role_id, invited_by, status)
   values (v_inv.tenant_id, p_user_id, v_inv.role_id, v_inv.invited_by, 'active')
-  on conflict (tenant_id, user_id) do update
+  on conflict on constraint tenant_memberships_tenant_id_user_id_key do update
     set role_id = excluded.role_id,
         status = 'active',
         updated_at = now()

@@ -1500,74 +1500,6 @@ export class ApiService {
     });
   }
 
-  async publicPlans() {
-    const result = await this.pool.query(
-      `select key, name, tier, price_cents as "priceCents", currency, billing_interval as "billingInterval", features
-         from plans where is_active = true order by price_cents`,
-    );
-    return result.rows;
-  }
-
-  async subscription(ctx: AuthContext) {
-    await this.auth.requireTenantPermission(ctx, "billing.manage");
-    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
-      const result = await client.query(
-        `select ts.id, ts.status, ts.trial_ends_at as "trialEndsAt", ts.current_period_end as "currentPeriodEnd",
-                p.key as "planKey", p.name as "planName", p.tier
-           from tenant_subscriptions ts join plans p on p.id = ts.plan_id
-          where ts.status in ('trialing', 'active', 'past_due')
-          order by ts.created_at desc limit 1`,
-      );
-      return result.rows[0] ?? null;
-    });
-  }
-
-  async startTrial(ctx: AuthContext, body: Record<string, unknown>, req?: AuthedRequest) {
-    await this.auth.requireTenantPermission(ctx, "billing.manage", req);
-    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
-      const existing = await client.query(`select id, status from tenant_subscriptions where status in ('trialing', 'active', 'past_due') limit 1`);
-      if (existing.rows[0]) return existing.rows[0];
-      const result = await client.query(
-        `insert into tenant_subscriptions (tenant_id, plan_id, status, trial_ends_at)
-         select $1, id, 'trialing', now() + interval '14 days'
-           from plans where key = $2 and is_active = true
-         returning id, status, trial_ends_at as "trialEndsAt"`,
-        [ctx.tenantId, api.optionalString(body.planKey) ?? "starter"],
-      );
-      const row = result.rows[0] ?? this.notFound("plan");
-      await this.recordAudit(client, ctx, "billing_event", "tenant_subscription", row.id, "trial_start", "Tenant trial started", {}, req);
-      return row;
-    });
-  }
-
-  async publicArticles(query: Record<string, unknown>) {
-    const q = api.optionalString(query.q);
-    const result = await this.pool.query(
-      `select slug, title, excerpt, seo_title as "seoTitle", seo_description as "seoDescription", published_at as "publishedAt"
-         from knowledge_base_articles
-        where publication_state = 'published'
-          and ($1::text is null or title ilike '%' || $1 || '%' or coalesce(excerpt, '') ilike '%' || $1 || '%')
-        order by published_at desc nulls last`,
-      [q],
-    );
-    return result.rows;
-  }
-
-  async publicArticle(slug: string) {
-    const result = await this.pool.query(
-      `select slug, title, body, excerpt, seo_title as "seoTitle", seo_description as "seoDescription", published_at as "publishedAt"
-         from knowledge_base_articles
-        where slug = $1 and publication_state = 'published'`,
-      [v.string(slug, "slug")],
-    );
-    return result.rows[0] ?? this.notFound("article");
-  }
-
-  async contextualHelp(query: Record<string, unknown>) {
-    const terms = [query.screen, query.worksection, query.feature, query.riskType].map(api.optionalString).filter(Boolean).join(" ");
-    return this.publicArticles({ q: terms || undefined });
-  }
-
   async listConnections(ctx: AuthContext) {
     await this.auth.requireTenantPermission(ctx, "integration.manage");
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
@@ -1658,23 +1590,6 @@ export class ApiService {
         [api.optionalUuid(query.connectionId, "connectionId")],
       );
       return result.rows;
-    });
-  }
-
-  async billingWebhook(body: Record<string, unknown>, idempotencyKey: string, secret: string | undefined, req?: AuthedRequest) {
-    this.requireWebhookSecret("BILLING_WEBHOOK_SECRET", secret);
-    // Tenant comes from a verified provider identifier, NEVER body.tenantId (compliance: trusted
-    // context only). ponytail: shared-secret gate kept; per-provider HMAC signature verification over
-    // the raw body is the production hardening (needs raw-body middleware — DevOps/backend).
-    const tenantId = await this.resolveBillingTenant(v.string(body.customerId, "customerId"));
-    return withTenantClient(this.pool, { tenantId, actorType: "system", userId: null }, async (client) => {
-      const job = await this.enqueueProjectJob(client, { tenantId }, null, "billing_webhook", `billing_webhook:${idempotencyKey}`, api.object(body));
-      await client.query(
-        `insert into audit_events (tenant_id, event_type, actor_type, entity_type, entity_id, action, summary, payload, ip_address, user_agent)
-         values ($1, 'billing_event', 'system', 'billing_webhook', $2, 'billing_webhook_received', 'Billing webhook received', $3::jsonb, nullif($4::text, '')::inet, $5)`,
-        [tenantId, job.id, JSON.stringify({ request_id: req?.requestId, providerEventId: api.optionalString(body.eventId) }), this.ip(req) ?? "", this.userAgent(req)],
-      );
-      return job;
     });
   }
 
@@ -2040,16 +1955,6 @@ export class ApiService {
     const result = await this.pool.query<{ tenant_id: string | null }>(
       `select app.resolve_integration_tenant($1, $2::integration_provider) as tenant_id`,
       [connectionId, provider],
-    );
-    const tenantId = result.rows[0]?.tenant_id;
-    if (!tenantId) throw new ForbiddenException("Forbidden");
-    return tenantId;
-  }
-
-  private async resolveBillingTenant(customerId: string): Promise<string> {
-    const result = await this.pool.query<{ tenant_id: string | null }>(
-      `select app.resolve_billing_tenant('stripe', $1) as tenant_id`,
-      [customerId],
     );
     const tenantId = result.rows[0]?.tenant_id;
     if (!tenantId) throw new ForbiddenException("Forbidden");

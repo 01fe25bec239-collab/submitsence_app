@@ -6,7 +6,7 @@ import { requestContextMiddleware } from "./api/request-context";
 import { AppModule } from "./app.module";
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create(AppModule, { rawBody: true });
   app.setGlobalPrefix("api/v1");
   app.use(requestContextMiddleware);
   app.use(rateLimitMiddleware);

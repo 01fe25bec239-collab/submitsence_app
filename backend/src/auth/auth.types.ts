@@ -68,6 +68,7 @@ export interface AuthedRequest {
   params: Record<string, string | undefined>;
   query?: Record<string, unknown>;
   body: unknown;
+  rawBody?: Buffer;
   method?: string;
   path?: string;
   originalUrl?: string;

@@ -26,10 +26,11 @@ for f in $(ls db/migrations/0*.sql | grep -v '\.down\.'); do
 done
 ```
 
-`0001`-`0018` build the schema (`0016` adds the `app.claim_next_job()` worker-queue claimer;
+`0001`-`0021` build the schema (`0016` adds the `app.claim_next_job()` worker-queue claimer;
 `0017` adds package versions, package document selection, branding, register auto-population, and
 physical-deliverable tracking fields; `0018` adds versioned risk scoring, rule provenance,
-structured RFI drafts, source-risk links, and generated-checklist idempotency),
+structured RFI drafts, source-risk links, and generated-checklist idempotency; `0021` adds self-serve
+onboarding, trial enforcement, Stripe/GST billing records, and reviewed public content),
 `0099_seed.sql` seeds roles/permissions/plans + a test fixture.
 Run migrations as the **owner/superuser** role (it owns the tables and therefore bypasses RLS, which
 is why seeding works). The runtime application connects as a different role — see below.
@@ -61,6 +62,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/test/test_guardrails.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/test/test_package_assembly.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/test/test_risk_rfi_agent.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/test/test_security_hardening.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/test/test_commercial_content.sql
 ```
 
 The first script proves the eight compliance guardrails fire (human-approval guard, cross-tenant match block,
@@ -86,7 +88,7 @@ successfully on PostgreSQL 17 with pgvector 0.8.4.
 
 ```
 db/
-  migrations/   0001..0018 schema, 0099 seed, 9999 teardown
+  migrations/   0001..0021 schema, 0099 seed, 9999 teardown
   test/         runnable compliance and package-assembly checks
   docs/         ERD, table/enum docs, RLS, indexing, retention, queries, HANDOFF contract
 ```

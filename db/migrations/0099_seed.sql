@@ -79,11 +79,30 @@ select r.id, p.id from roles r join permissions p on p.key in ('integration.mana
 where r.key = 'integration_admin';
 
 -- --- Plans ------------------------------------------------------------------
-insert into plans (key, name, tier, price_cents, currency, billing_interval, features) values
-  ('trial',        'Free Trial',   'trial',         0, 'AUD', 'month', '{"projects": 1}'),
-  ('starter',      'Starter',      'starter',    9900, 'AUD', 'month', '{"projects": 3}'),
-  ('professional', 'Professional', 'professional', 29900, 'AUD', 'month', '{"projects": 25}'),
-  ('enterprise',   'Enterprise',   'enterprise',    0, 'AUD', 'month', '{"projects": null}');
+insert into plans (
+  key, name, tier, price_cents, currency, billing_interval, description, features,
+  included_usage, overage_policy, feature_limits, tax_inclusive, sort_order
+) values
+  ('trial', 'Free Trial', 'trial', 0, 'AUD', 'month',
+   'Run your 3 hardest worksections for 14 days. No card required.',
+   '{"selfServe": true, "exports": true}', '{"worksections": 3, "days": 14}',
+   'Processing stops at 3 worksections; choose a paid plan to continue.',
+   '{"projects": 1, "worksections": 3, "users": 1}', true, 10),
+  ('starter', 'Starter', 'starter', 14900, 'AUD', 'month',
+   'For small subcontractors preparing a few live packages at a time.',
+   '{"selfServe": true, "exports": true, "vendorMatching": true}', '{"worksectionsPerMonth": 50}',
+   'No automatic overage charges; upgrade before exceeding included usage.',
+   '{"projects": 3, "worksectionsPerMonth": 50, "users": 3}', true, 20),
+  ('professional', 'Professional', 'professional', 39900, 'AUD', 'month',
+   'For estimating and delivery teams managing concurrent projects.',
+   '{"selfServe": true, "exports": true, "vendorMatching": true, "auditExports": true}', '{"worksectionsPerMonth": 250}',
+   'No automatic overage charges; contact us for additional volume.',
+   '{"projects": 15, "worksectionsPerMonth": 250, "users": 10}', true, 30),
+  ('enterprise', 'Enterprise', 'enterprise', 0, 'AUD', 'month',
+   'For larger teams needing negotiated usage, SSO, and onboarding support.',
+   '{"salesAssisted": true, "sso": true, "auditExports": true}', '{}',
+   'Usage and overages are agreed in the order form.',
+   '{"projects": null, "worksectionsPerMonth": null, "users": null}', true, 40);
 
 -- --- Test fixture (fixed UUIDs; used by test_guardrails.sql) ----------------
 insert into tenants (id, slug, name, legal_name, abn) values

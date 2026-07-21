@@ -14,8 +14,8 @@ TypeScript-first on AWS Australia (`ap-southeast-2`): Next.js + NestJS, PostgreS
 
 | Path | What | Status |
 |---|---|---|
-| [`db/`](db/) | PostgreSQL data model — migrations through `0018`, RLS, guardrails, seed, docs | Built and validated on PG 17.10 (23/23 database checks pass) |
-| [`backend/`](backend/) | NestJS API + worker — auth, tenant scoping, matching, package assembly/versioning, PDF/XLSX/CSV/ZIP exports | In progress |
+| [`db/`](db/) | PostgreSQL data model — migrations through `0021`, RLS, guardrails, seed, docs | Built; commercial migration requires PG verification |
+| [`backend/`](backend/) | NestJS API + worker — auth, tenant scoping, matching, packages, onboarding, billing, and content | In progress |
 | `terraform/` | AWS infrastructure (RDS, KMS, VPC, ECS) | ⏳ pending infra agent |
 
 ## Getting started
@@ -26,3 +26,5 @@ builds against.
 
 Package assembly and register-export operations are documented in
 [`backend/docs/package-assembly-handoff.md`](backend/docs/package-assembly-handoff.md).
+Onboarding, pricing, Stripe setup, GST metadata, and content moderation are documented in
+[`backend/docs/commercial-content-handoff.md`](backend/docs/commercial-content-handoff.md).
