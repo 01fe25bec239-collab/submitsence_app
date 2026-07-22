@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  application:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            web/package-lock.json
+      - run: npm ci --prefix backend
+      - run: npm run typecheck --prefix backend
+      - run: npm test --prefix backend
+      - run: npm run build --prefix backend
+      - run: npm audit --prefix backend --omit=dev --audit-level=high
+      - run: npm ci --prefix web
+      - run: npm run lint --prefix web
+      - run: npm run typecheck --prefix web
+      - run: npm run build --prefix web
+      - run: npm audit --prefix web --omit=dev --audit-level=high
+
+  database:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_DB: submitsense
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d submitsense"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/submitsense
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/submitsense
+      PGSSLMODE: disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Apply every forward migration
+        run: |
+          for migration in db/migrations/0*.sql; do
+            [[ "$migration" == *.down.sql ]] && continue
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration"
+          done
+      - name: Run database guardrails
+        run: |
+          for test_file in db/test/test*.sql; do
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$test_file"
+          done
+      - run: npm ci --prefix backend
+      - run: node --import tsx --test test/commercial-webhook.integration.test.ts
+        working-directory: backend
+
+  infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.7
+      - run: terraform fmt -check -recursive
+      - run: terraform -chdir=terraform init -backend=false
+      - run: terraform -chdir=terraform validate
+      - run: terraform -chdir=terraform/bootstrap init -backend=false
+      - run: terraform -chdir=terraform/bootstrap validate
+      - run: bash -n infra/scripts/*.sh
+      - run: infra/scripts/static-infra-check.sh
+      - run: docker build -f backend/Dockerfile -t submitsense-backend:ci .
+      - run: docker run --rm submitsense-backend:ci sh -c 'test -f dist/main.js && test -f dist/worker/worker.js && ! test -e node_modules/typescript && ! test -e node_modules/.bin/tsx'
+      - run: docker build -f backend/Dockerfile.migrations -t submitsense-migrations:ci .
+      - run: docker build -f web/Dockerfile -t submitsense-frontend:ci .

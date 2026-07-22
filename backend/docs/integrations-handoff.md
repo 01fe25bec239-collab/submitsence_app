@@ -3,7 +3,7 @@
 ## System contract
 
 - Confirmed Section 0 stack: TypeScript-first modular monolith; Next.js 15+/React frontend; NestJS REST API; PostgreSQL 17+ with RLS and pgvector; S3/SSE-KMS document storage; Textract plus layout-aware NATSPEC parsing; BullMQ/ElastiCache Redis as the target long-running-job platform; Cognito plus application RBAC/ABAC; AWS Sydney production with Australian-only Melbourne disaster recovery; ECS/Fargate workers; CloudWatch/WAF/GuardDuty; all customer data and processing kept in Australian regions.
-- Current backend convention: tenant context is applied with `withTenantClient`; integration records use `integration_connections`, `external_project_mappings`, `sync_jobs`, `webhook_events`, and `sync_errors`; the currently implemented worker uses the PostgreSQL job ledger pending BullMQ infrastructure.
+- Current backend convention: tenant context is applied with `withTenantClient`; integration records use `integration_connections`, `external_project_mappings`, `sync_jobs`, `webhook_events`, and `sync_errors`; PostgreSQL `processing_jobs` is the sole active asynchronous queue.
 - Auth contract: `integration.manage` is required for connection, mapping, sync-job, and capability operations. Tokens are referenced by Australian AWS Secrets Manager ARN only and are never returned by the API.
 - Package contract: package generation and Aconex-ready bundle generation remain owned by the package module. A future approved adapter consumes the ready export; it does not assemble packages.
 - Status contract: an external consultant outcome is stored separately from SubmitSense human sign-off. Only an explicit human action may set `human_approved`.
@@ -15,7 +15,7 @@
 - `IntegrationAdapter` is the provider boundary. `AconexAdapter` and `ProcoreAdapter` fail closed with a non-retryable `partner_approval_required` error.
 - `MockIntegrationAdapter` supports tenant-scoped, idempotent package pushes and response pulls for QA without live access.
 - `GET /tenants/:tenantId/integrations/providers` returns capability and approval state for UI feature gating.
-- Existing connection/mapping/sync/error endpoints remain the persistence boundary. Sync-job creation now also checks provider availability, connection state, and an Australian Secrets Manager token reference.
+- Existing connection/mapping/error endpoints remain available. `package_push` and `response_pull` sync-job creation fails closed without inserting a `sync_jobs` row until a production consumer exists.
 - Existing integration webhooks remain tenant-resolved from the server-side connection mapping and idempotent by external event ID. Their shared-secret route is not advertised as a live provider webhook until official signature rules are implemented.
 
 ## Status mapping

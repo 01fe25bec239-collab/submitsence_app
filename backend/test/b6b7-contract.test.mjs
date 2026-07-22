@@ -5,7 +5,7 @@ import { test } from "node:test";
 const matching = readFileSync(new URL("../src/matching/matching.service.ts", import.meta.url), "utf8");
 const worker = readFileSync(new URL("../src/worker/worker.ts", import.meta.url), "utf8");
 const service = readFileSync(new URL("../src/api/api.service.ts", import.meta.url), "utf8");
-const claim = readFileSync(new URL("../../db/migrations/0016_job_claim.sql", import.meta.url), "utf8");
+const claim = readFileSync(new URL("../../db/migrations/0022_queue_ledger_hardening.sql", import.meta.url), "utf8");
 
 test("matching only ever considers the caller's own tenant (explicit filter + RLS + pending default)", () => {
   // Candidate load carries an explicit tenant filter (defence-in-depth on top of RLS).
@@ -29,7 +29,8 @@ test("job claimer bypasses RLS only for the narrow cross-tenant pick, returns th
   assert.match(claim, /security definer/i);
   assert.match(claim, /for update skip locked/i);
   assert.match(claim, /returning j\.id, j\.tenant_id/);
-  assert.match(claim, /grant execute on function app\.claim_next_job/i);
+  assert.match(claim, /grant execute on function app\.claim_next_job\(text\[\], integer\)/i);
+  assert.match(claim, /lease_token = gen_random_uuid\(\)/i);
 });
 
 test("learning aggregate is consent-gated and reads only eligible, non-opted-out, opted-in rows", () => {

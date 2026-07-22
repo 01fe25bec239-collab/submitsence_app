@@ -1,0 +1,9 @@
+FROM postgres:17-alpine
+
+RUN apk add --no-cache bash
+WORKDIR /workspace
+COPY db ./db
+COPY infra/scripts/migrate.sh /usr/local/bin/migrate
+RUN chmod 0555 /usr/local/bin/migrate
+
+ENTRYPOINT ["/usr/local/bin/migrate"]

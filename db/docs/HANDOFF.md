@@ -1,9 +1,9 @@
 # Handoff contract — SubmitSense database layer
 
 For the backend, auth, frontend, QA, and infra agents. This is the stable surface the persistence
-layer exposes. Migrations: `db/migrations/0001-0018`, seed `0099`, teardown `9999`.
-Database guardrails were validated on PostgreSQL 17 + pgvector 0.8.4 through `0018`
-(all 8 baseline, 9 package-assembly, and 6 risk/RFI checks pass; see `db/test/`).
+layer exposes. Migrations: `db/migrations/0001-0022`, seed `0099`, teardown `9999`.
+Database guardrails were validated on PostgreSQL 17 + pgvector 0.8.4 through `0022`
+(baseline, package-assembly, risk/RFI, and PB-05B queue-ledger checks pass; see `db/test/`).
 
 ## 1. Connection & request context (backend + auth)
 
@@ -43,7 +43,7 @@ Database guardrails were validated on PostgreSQL 17 + pgvector 0.8.4 through `00
 
 **Projects/docs:** `projects(name,client_name,trade,status,submission_deadline,is_archived)`,
 `documents(doc_type,storage_bucket,object_key,checksum_sha256,mime_type,size_bytes,s3_version_id,kms_key_arn,version)`,
-`processing_jobs(job_type,status,attempts,idempotency_key,worker_output)`.
+`processing_jobs(job_type,status,attempts,idempotency_key,worker_output,lease_token,lease_expires_at,next_attempt_at)`.
 
 **Specs:** `worksections(code,is_superseded)`, `clauses(clause_number,is_hold_point,is_superseded)`,
 `clause_references(reference_label)`, `extracted_fragments(content)`, `addenda_reconciliations(action)`,
@@ -86,6 +86,19 @@ Database guardrails were validated on PostgreSQL 17 + pgvector 0.8.4 through `00
 - **Publication**: `draft → in_review → published → archived`.
 
 Full value lists: [enums.md](enums.md).
+
+### Processing-job lease contract
+
+- Workers claim with `app.claim_next_job(job_types, lease_seconds)`. Production defaults are a
+  900-second lease and a 60-second heartbeat; accepted lease durations are 30–3600 seconds.
+- Heartbeat, success, and failure use `app.heartbeat_processing_job`,
+  `app.complete_processing_job`, and `app.fail_processing_job`. Each requires the current UUID
+  token; stale or missing tokens change no row.
+- Failed attempts retry after 30, 60, 120, 240, and 480 seconds, then at the 900-second cap.
+  Exhausted jobs become `failed`; queued/retrying rows already at their maximum are normalized.
+- Deploy `0022` before the new worker. Its legacy one-argument claim overload intentionally returns
+  no work, so old workers drain/idle without receiving unfenced leases. Roll back workers before
+  applying `0022_queue_ledger_hardening.down.sql`.
 
 ## 5. Audit event types (emit one per action — req f21)
 

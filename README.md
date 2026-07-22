@@ -16,7 +16,8 @@ TypeScript-first on AWS Australia (`ap-southeast-2`): Next.js + NestJS, PostgreS
 |---|---|---|
 | [`db/`](db/) | PostgreSQL data model — migrations through `0021`, RLS, guardrails, seed, docs | Built; commercial migration requires PG verification |
 | [`backend/`](backend/) | NestJS API + worker — auth, tenant scoping, matching, packages, onboarding, billing, and content | In progress |
-| `terraform/` | AWS infrastructure (RDS, KMS, VPC, ECS) | ⏳ pending infra agent |
+| [`terraform/`](terraform/) | AWS infrastructure (VPC, ECS, RDS, Redis, S3, Cognito, KMS, WAF, backups, monitoring) | Built; AWS apply pending account/domain inputs |
+| [`infra/`](infra/) | Deployment, recovery, incident, residency, IAM, monitoring, and cost runbooks | Built |
 
 ## Getting started
 

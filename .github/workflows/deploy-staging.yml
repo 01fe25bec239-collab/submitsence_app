@@ -1,0 +1,16 @@
+name: Deploy staging
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: staging
+      git_sha: ${{ github.event.workflow_run.head_sha }}
+    secrets: inherit

@@ -1,0 +1,20 @@
+environment              = "production"
+vpc_cidr                 = "10.40.0.0/16"
+single_nat_gateway       = false
+enable_dr                = true
+force_destroy_buckets    = false
+allow_insecure_http      = false
+db_instance_class        = "db.r7g.large"
+db_allocated_storage     = 100
+db_max_allocated_storage = 1000
+db_backup_retention_days = 35
+redis_node_type          = "cache.r7g.large"
+redis_replicas           = 1
+api_desired_count        = 2
+frontend_desired_count   = 2
+worker_desired_count     = 2
+monthly_budget_usd       = 2500
+
+# Public launch intentionally remains blocked until these are set.
+root_domain     = ""
+route53_zone_id = ""
