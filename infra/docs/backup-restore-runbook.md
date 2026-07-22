@@ -7,7 +7,6 @@
 - Production monthly AWS Backup restore testing selects the latest snapshot and removes the temporary
   restored resource after the validation window.
 - S3 versioning on every bucket; production object replication to KMS-encrypted Melbourne buckets.
-- Redis encrypted snapshots: one day outside production, seven days in production.
 
 Recovery objectives remain uncommitted until product/compliance approve them. Measure actual RPO/RTO
 from the first restore test; do not promise targets from configuration alone.

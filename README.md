@@ -8,7 +8,9 @@ packages, and tracks submittal status — with a licensed human always the final
 ## Stack
 
 TypeScript-first on AWS Australia (`ap-southeast-2`): Next.js + NestJS, PostgreSQL 17 + pgvector
-(RDS), S3, Cognito, BullMQ/Redis. Modular monolith.
+(RDS), S3, and Cognito. PostgreSQL `processing_jobs` is the authoritative asynchronous queue;
+SubmitSense does not currently depend on Redis or BullMQ. Reconsider them only for a measured future
+requirement. Queue metrics are deferred to PB-07 and worker autoscaling to PB-08. Modular monolith.
 
 ## Repo layout
 
@@ -16,7 +18,7 @@ TypeScript-first on AWS Australia (`ap-southeast-2`): Next.js + NestJS, PostgreS
 |---|---|---|
 | [`db/`](db/) | PostgreSQL data model — migrations through `0021`, RLS, guardrails, seed, docs | Built; commercial migration requires PG verification |
 | [`backend/`](backend/) | NestJS API + worker — auth, tenant scoping, matching, packages, onboarding, billing, and content | In progress |
-| [`terraform/`](terraform/) | AWS infrastructure (VPC, ECS, RDS, Redis, S3, Cognito, KMS, WAF, backups, monitoring) | Built; AWS apply pending account/domain inputs |
+| [`terraform/`](terraform/) | AWS infrastructure (VPC, ECS, RDS, S3, Cognito, KMS, WAF, backups, monitoring) | Built; AWS apply pending account/domain inputs |
 | [`infra/`](infra/) | Deployment, recovery, incident, residency, IAM, monitoring, and cost runbooks | Built |
 
 ## Getting started
