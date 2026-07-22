@@ -5,6 +5,7 @@ import { test } from "node:test";
 const service = readFileSync(new URL("../src/package/package.service.ts", import.meta.url), "utf8");
 const renderer = readFileSync(new URL("../src/package/render.ts", import.meta.url), "utf8");
 const worker = readFileSync(new URL("../src/worker/worker.ts", import.meta.url), "utf8");
+const jobTypes = readFileSync(new URL("../src/job-types.ts", import.meta.url), "utf8");
 const apiService = readFileSync(new URL("../src/api/api.service.ts", import.meta.url), "utf8");
 const storage = readFileSync(new URL("../src/package/storage.ts", import.meta.url), "utf8");
 const controller = readFileSync(new URL("../src/api/api.controller.ts", import.meta.url), "utf8");
@@ -30,7 +31,8 @@ test("every included file is explicitly tenant and project scoped", () => {
 
 test("large PDF and export generation runs through the background worker", () => {
   for (const type of ["package_generation", "export_consultant_pdf", "export_aconex_bundle", "export_register_csv", "export_register_xlsx", "export_register_pdf"]) {
-    assert.match(worker, new RegExp(`"${type}"`));
+    assert.match(jobTypes, new RegExp(`"${type}"`));
+    assert.match(worker, new RegExp(`\\b${type}: processPackageJob`));
   }
   assert.match(worker, /processPackageJob/);
   assert.match(controller, /register-items\/export"\)[\s\S]{0,80}@HttpCode\(202\)/);

@@ -18,8 +18,8 @@
   provider/presigner before production uploads work.
 - Redis is provisioned, but BullMQ dispatch and queue-depth metric emission are not implemented. Workers
   continue using the durable PostgreSQL ledger.
-- Textract permissions/endpoints exist, but PDF/OCR download and parsing remain an application gap.
-- Aconex/Procore integration jobs remain disabled pending partner approval and official adapters.
+- Textract permissions/endpoints exist, but unsupported OCR ingestion and RFI-PDF export jobs remain disabled until production consumers exist.
+- Aconex/Procore `package_push` and `response_pull` jobs remain disabled pending production consumers, partner approval, and official adapters.
 - Real frontend Cognito sign-in/cookie handling, token revocation, and post-confirmation user-link trigger
   remain application gaps.
 - Stripe secret values, price IDs, legal terms/privacy versions, retention periods, production alarm
