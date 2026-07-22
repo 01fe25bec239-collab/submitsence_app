@@ -70,7 +70,8 @@ jobs:
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$test_file"
           done
       - run: npm ci --prefix backend
-      - run: node --import tsx --test backend/test/commercial-webhook.integration.test.ts
+      - run: node --import tsx --test test/commercial-webhook.integration.test.ts
+        working-directory: backend
 
   infrastructure:
     runs-on: ubuntu-latest
