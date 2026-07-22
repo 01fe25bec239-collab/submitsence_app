@@ -392,6 +392,7 @@ resource "aws_iam_role" "frontend_task" {
 locals {
   common_environment = [
     { name = "AWS_REGION", value = var.primary_region },
+    { name = "ENVIRONMENT", value = var.environment },
     { name = "PGSSLMODE", value = "require" },
     { name = "NODE_ENV", value = "production" },
     { name = "S3_UPLOAD_BUCKET", value = module.storage.bucket_names.uploads },
