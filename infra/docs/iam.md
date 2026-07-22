@@ -10,8 +10,8 @@
 | Integration worker | Application storage plus the approved integration secret container |
 | GitHub staging/production | OIDC-bound to the exact repository environment; Terraform service actions and `submitsense-*` roles |
 
-No application task receives static AWS access keys. Database and Redis allow traffic only from ECS
-security groups; neither is public. Production ECS Exec is disabled.
+No application task receives static AWS access keys. The database allows traffic only from ECS
+security groups and is not public. Production ECS Exec is disabled.
 
 Human access should use AWS IAM Identity Center with separate read-only, incident-response, deploy
 approval, and break-glass permission sets. Terraform intentionally creates no IAM users or permanent

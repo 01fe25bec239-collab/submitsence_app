@@ -130,15 +130,6 @@ variable "db_backup_retention_days" {
   type    = number
   default = 14
 }
-variable "redis_node_type" {
-  type    = string
-  default = "cache.t4g.small"
-}
-variable "redis_replicas" {
-  type    = number
-  default = 1
-}
-
 variable "alarm_email" {
   description = "Optional operational email. Subscription must be confirmed by the recipient."
   type        = string

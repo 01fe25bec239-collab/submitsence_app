@@ -23,7 +23,6 @@ data "aws_iam_policy_document" "ecs_execution_secrets" {
     actions = ["secretsmanager:GetSecretValue"]
     resources = [
       aws_secretsmanager_secret.app_database.arn,
-      aws_secretsmanager_secret.redis.arn,
       aws_secretsmanager_secret.auth.arn,
       aws_secretsmanager_secret.billing.arn,
     ]

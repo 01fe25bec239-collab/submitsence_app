@@ -103,7 +103,7 @@ data "aws_iam_policy_document" "github_deploy" {
     sid = "SubmitSenseInfrastructure"
     actions = [
       "acm:*", "application-autoscaling:*", "backup:*", "budgets:*", "cloudtrail:*", "cloudwatch:*",
-      "cognito-idp:*", "ec2:*", "ecr:*", "ecs:*", "elasticache:*", "elasticloadbalancing:*",
+      "cognito-idp:*", "ec2:*", "ecr:*", "ecs:*", "elasticloadbalancing:*",
       "events:*", "kms:*", "logs:*", "rds:*", "route53:*", "s3:*",
       "secretsmanager:*", "servicediscovery:*", "sns:*", "wafv2:*"
     ]

@@ -130,7 +130,7 @@ Full permission list is seeded in `0099_seed.sql`.
 
 ## 8. Infra / RDS requirements (for the infra agent)
 
-What this schema needs from Amazon RDS. Provisioning (VPC, KMS, DR, ECS/Redis) is the infra agent's;
+What this schema needs from Amazon RDS. Provisioning (VPC, KMS, DR, ECS) is the infra agent's;
 these are the persistence-layer constraints it must satisfy.
 
 - **Engine:** RDS for PostgreSQL **17** (validated on 17.10). Region `ap-southeast-2` (Sydney);

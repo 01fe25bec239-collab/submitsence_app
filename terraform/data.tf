@@ -5,13 +5,6 @@ resource "aws_security_group" "database" {
   tags        = { Name = "${local.name}-database" }
 }
 
-resource "aws_security_group" "redis" {
-  name_prefix = "${local.name}-redis-"
-  description = "Redis TLS only from ECS tasks"
-  vpc_id      = module.network.vpc_id
-  tags        = { Name = "${local.name}-redis" }
-}
-
 resource "aws_db_subnet_group" "this" {
   name       = local.name
   subnet_ids = module.network.data_subnet_ids
@@ -93,40 +86,6 @@ resource "aws_db_instance" "postgres" {
   tags                            = { Name = local.name, DataClass = "confidential" }
 }
 
-resource "aws_elasticache_subnet_group" "this" {
-  name       = local.name
-  subnet_ids = module.network.data_subnet_ids
-}
-
-resource "random_password" "redis" {
-  length  = 48
-  special = false
-}
-
-resource "aws_elasticache_replication_group" "redis" {
-  replication_group_id       = local.name
-  description                = "SubmitSense BullMQ Redis"
-  engine                     = "redis"
-  engine_version             = "7.1"
-  node_type                  = var.redis_node_type
-  port                       = 6379
-  num_cache_clusters         = 1 + var.redis_replicas
-  automatic_failover_enabled = var.redis_replicas > 0
-  multi_az_enabled           = var.redis_replicas > 0
-  at_rest_encryption_enabled = true
-  transit_encryption_enabled = true
-  auth_token                 = random_password.redis.result
-  kms_key_id                 = aws_kms_key.app.arn
-  subnet_group_name          = aws_elasticache_subnet_group.this.name
-  security_group_ids         = [aws_security_group.redis.id]
-  snapshot_retention_limit   = var.environment == "production" ? 7 : 1
-  snapshot_window            = "14:00-15:00"
-  maintenance_window         = "sun:17:30-sun:18:30"
-  apply_immediately          = var.environment != "production"
-  auto_minor_version_upgrade = true
-  tags                       = { Name = local.name, DataClass = "confidential" }
-}
-
 resource "random_password" "app_database" {
   length  = 40
   special = false
@@ -152,20 +111,6 @@ resource "aws_secretsmanager_secret_version" "app_database" {
     port         = aws_db_instance.postgres.port
     dbname       = aws_db_instance.postgres.db_name
     DATABASE_URL = "postgresql://submitsense_runtime:${random_password.app_database.result}@${aws_db_instance.postgres.address}:${aws_db_instance.postgres.port}/${aws_db_instance.postgres.db_name}?sslmode=require"
-  })
-}
-
-resource "aws_secretsmanager_secret" "redis" {
-  name                    = "${local.name}/redis"
-  kms_key_id              = aws_kms_key.app.arn
-  recovery_window_in_days = var.environment == "production" ? 30 : 7
-}
-
-resource "aws_secretsmanager_secret_version" "redis" {
-  secret_id = aws_secretsmanager_secret.redis.id
-  secret_string = jsonencode({
-    auth_token = random_password.redis.result
-    REDIS_URL  = "rediss://default:${random_password.redis.result}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379"
   })
 }
 

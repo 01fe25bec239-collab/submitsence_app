@@ -33,7 +33,7 @@ resource "aws_cloudwatch_metric_alarm" "custom_failures" {
 
 resource "aws_cloudwatch_metric_alarm" "queue_depth" {
   alarm_name          = "${local.name}-queue-depth"
-  alarm_description   = "BullMQ/DB-ledger queue depth is above the operating threshold."
+  alarm_description   = "PostgreSQL processing_jobs queue depth is above the operating threshold."
   namespace           = "SubmitSense/Jobs"
   metric_name         = "QueueDepth"
   statistic           = "Maximum"
@@ -108,34 +108,6 @@ resource "aws_cloudwatch_metric_alarm" "rds_storage" {
   ok_actions          = [aws_sns_topic.alarms.arn]
 }
 
-resource "aws_cloudwatch_metric_alarm" "redis_cpu" {
-  alarm_name          = "${local.name}-redis-cpu"
-  namespace           = "AWS/ElastiCache"
-  metric_name         = "EngineCPUUtilization"
-  statistic           = "Average"
-  period              = 300
-  evaluation_periods  = 3
-  threshold           = 80
-  comparison_operator = "GreaterThanThreshold"
-  dimensions          = { ReplicationGroupId = aws_elasticache_replication_group.redis.id }
-  alarm_actions       = [aws_sns_topic.alarms.arn]
-  ok_actions          = [aws_sns_topic.alarms.arn]
-}
-
-resource "aws_cloudwatch_metric_alarm" "redis_memory" {
-  alarm_name          = "${local.name}-redis-memory"
-  namespace           = "AWS/ElastiCache"
-  metric_name         = "DatabaseMemoryUsagePercentage"
-  statistic           = "Maximum"
-  period              = 300
-  evaluation_periods  = 3
-  threshold           = 80
-  comparison_operator = "GreaterThanThreshold"
-  dimensions          = { ReplicationGroupId = aws_elasticache_replication_group.redis.id }
-  alarm_actions       = [aws_sns_topic.alarms.arn]
-  ok_actions          = [aws_sns_topic.alarms.arn]
-}
-
 resource "aws_cloudwatch_metric_alarm" "s3_storage" {
   for_each            = toset(["uploads", "processed", "packages", "exports"])
   alarm_name          = "${local.name}-${each.key}-storage"
@@ -171,12 +143,10 @@ resource "aws_cloudwatch_dashboard" "this" {
       {
         type = "metric", x = 12, y = 0, width = 12, height = 6,
         properties = {
-          title = "Database and Redis", region = var.primary_region, period = 300,
+          title = "Database", region = var.primary_region, period = 300,
           metrics = [
             ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", aws_db_instance.postgres.identifier],
             [".", "DatabaseConnections", ".", "."],
-            ["AWS/ElastiCache", "EngineCPUUtilization", "ReplicationGroupId", aws_elasticache_replication_group.redis.id],
-            [".", "DatabaseMemoryUsagePercentage", ".", "."],
           ]
         }
       },

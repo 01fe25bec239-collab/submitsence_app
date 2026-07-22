@@ -16,7 +16,6 @@ output "worker_security_group_id" { value = aws_security_group.worker_tasks.id }
 output "ecr_repository_urls" { value = { for key, repository in aws_ecr_repository.this : key => repository.repository_url } }
 output "bucket_names" { value = module.storage.bucket_names }
 output "database_endpoint" { value = aws_db_instance.postgres.endpoint }
-output "redis_endpoint" { value = aws_elasticache_replication_group.redis.primary_endpoint_address }
 output "cognito_user_pool_id" { value = aws_cognito_user_pool.this.id }
 output "cognito_client_id" { value = aws_cognito_user_pool_client.web.id }
 output "alarm_topic_arn" { value = aws_sns_topic.alarms.arn }

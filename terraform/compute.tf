@@ -188,38 +188,6 @@ resource "aws_vpc_security_group_ingress_rule" "database_workers" {
   referenced_security_group_id = aws_security_group.worker_tasks.id
 }
 
-resource "aws_vpc_security_group_egress_rule" "app_redis" {
-  security_group_id            = aws_security_group.app_tasks.id
-  ip_protocol                  = "tcp"
-  from_port                    = 6379
-  to_port                      = 6379
-  referenced_security_group_id = aws_security_group.redis.id
-}
-
-resource "aws_vpc_security_group_egress_rule" "worker_redis" {
-  security_group_id            = aws_security_group.worker_tasks.id
-  ip_protocol                  = "tcp"
-  from_port                    = 6379
-  to_port                      = 6379
-  referenced_security_group_id = aws_security_group.redis.id
-}
-
-resource "aws_vpc_security_group_ingress_rule" "redis_app" {
-  security_group_id            = aws_security_group.redis.id
-  ip_protocol                  = "tcp"
-  from_port                    = 6379
-  to_port                      = 6379
-  referenced_security_group_id = aws_security_group.app_tasks.id
-}
-
-resource "aws_vpc_security_group_ingress_rule" "redis_workers" {
-  security_group_id            = aws_security_group.redis.id
-  ip_protocol                  = "tcp"
-  from_port                    = 6379
-  to_port                      = 6379
-  referenced_security_group_id = aws_security_group.worker_tasks.id
-}
-
 resource "aws_lb" "this" {
   name                       = substr(local.name, 0, 32)
   internal                   = false
@@ -438,7 +406,6 @@ locals {
   ]
   common_secrets = [
     { name = "DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.app_database.arn}:DATABASE_URL::" },
-    { name = "REDIS_URL", valueFrom = "${aws_secretsmanager_secret.redis.arn}:REDIS_URL::" },
     { name = "AUTH_INTERNAL_SECRET", valueFrom = "${aws_secretsmanager_secret.auth.arn}:AUTH_INTERNAL_SECRET::" },
     { name = "STRIPE_SECRET_KEY", valueFrom = "${aws_secretsmanager_secret.billing.arn}:STRIPE_SECRET_KEY::" },
     { name = "STRIPE_WEBHOOK_SECRET", valueFrom = "${aws_secretsmanager_secret.billing.arn}:STRIPE_WEBHOOK_SECRET::" },

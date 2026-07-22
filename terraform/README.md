@@ -26,8 +26,21 @@ production HTTP cannot be enabled, and TLS cannot be issued before DNS ownership
 ## State and secrets
 
 State uses an S3 backend with KMS encryption, versioning, TLS-only policy, and native S3 lockfiles.
-Generated database and Redis credentials therefore exist in encrypted state and Secrets Manager, but
-never in source. Stripe and approved integration secrets are populated out of band.
+Generated database credentials therefore exist in encrypted state and Secrets Manager, but never in
+source. Stripe and approved integration secrets are populated out of band.
+
+## Queue architecture and removal impact
+
+PostgreSQL `processing_jobs` is the authoritative asynchronous queue. SubmitSense does not currently
+depend on Redis or BullMQ; reconsider either only for a measured future requirement. Queue metrics are
+deferred to PB-07 and worker autoscaling to PB-08.
+
+Applying this change to an existing environment destroys the ElastiCache replication group, its subnet
+and security groups, its secret/version, and its alarms; Secrets Manager deletion follows the configured
+recovery window. Apply and check staging first: confirm no runtime task consumes Redis configuration,
+review the Terraform plan, and verify only those intended resources are destroyed. Production apply
+requires explicit approval after that review. Because bootstrap state owns the deployment-role policy,
+apply its ElastiCache permission removal only after the environment resources have been removed.
 
 Do not commit `.tfvars`, backend configuration containing account data, plans, or state.
 

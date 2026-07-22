@@ -16,8 +16,8 @@
 - The API's current hand-built S3 signer expects static `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`.
   Infrastructure intentionally supplies only task-role credentials; backend must use the AWS credential
   provider/presigner before production uploads work.
-- Redis is provisioned, but BullMQ dispatch and queue-depth metric emission are not implemented. Workers
-  continue using the durable PostgreSQL ledger.
+- PostgreSQL `processing_jobs` is the sole active asynchronous queue. SubmitSense has no current Redis
+  or BullMQ dependency; queue metric emission remains deferred to PB-07 and worker autoscaling to PB-08.
 - Textract permissions/endpoints exist, but unsupported OCR ingestion and RFI-PDF export jobs remain disabled until production consumers exist.
 - Aconex/Procore `package_push` and `response_pull` jobs remain disabled pending production consumers, partner approval, and official adapters.
 - Real frontend Cognito sign-in/cookie handling, token revocation, and post-confirmation user-link trigger
