@@ -41,11 +41,11 @@ The API emits: `document_upload`, `extraction`, `match`, `flag`, `rfi_action`, `
 
 ## Queue/job conventions
 
-- Current implementation uses the database as the durable job ledger: `processing_jobs` for document/extraction/package/export/billing work, `sync_jobs` for integration sync, and `webhook_events`/`sync_errors` for inbound integration events.
+- PostgreSQL `processing_jobs` is the sole active asynchronous queue. Supported types are defined in `src/job-types.ts`; `sync_jobs` remains disabled until a production consumer exists. `webhook_events`/`sync_errors` continue to track inbound integration events.
 - Job lifecycle is `queued -> running -> succeeded | failed`, with `retrying` and `cancelled` available.
 - Every produced job carries an idempotency key; API callers must send `Idempotency-Key` or `X-Idempotency-Key` for upload finalisation, generated jobs, package/export generation, billing webhooks, and integration webhooks.
 - Workers must run with `withTenantClient(pool, { tenantId, userId, actorType: "system" }, fn)` using the job row's trusted `tenant_id`. Background jobs cannot set `human_approved`; the DB rejects system sign-off. `src/worker/worker.ts` claims jobs cross-tenant via `app.claim_next_job()` (SECURITY DEFINER, `0016`) and processes matching, ingestion, package generation, and package/register exports in-tenant.
 - Job audit events must be written inside the tenant transaction, with no PII, secrets, or raw document text in payload.
-- Queue broker/runtime/retry/DLQ policy is still open. Recommended default: keep these DB ledgers and add AWS SQS in `ap-southeast-2` for dispatch, with AU-only DLQ/scratch storage.
+- Unsupported job types fail with the standard controlled `503` response before a queue transaction is opened.
 
-Skipped: broker adapter and Stripe/Aconex/Procore SDK calls. Add them when DevOps confirms queue runtime, retry policy, and DLQ handling.
+Skipped: unsupported OCR, RFI-PDF export, and external integration workers. Their API paths stay disabled until production consumers exist.

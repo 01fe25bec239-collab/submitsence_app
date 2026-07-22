@@ -2,25 +2,23 @@ import type { Pool, PoolClient } from "pg";
 import { createPool } from "../db.module";
 import { withTenantClient } from "../db/tenant-db";
 import { ingestCatalogue } from "../ingestion/ingestion.service";
+import { isSupportedProcessingJobType, processingJobRegistry, type SupportedProcessingJobType } from "../job-types";
 import { computeAndStoreMatches } from "../matching/matching.service";
 import { markPackageJobFailed, processPackageJob } from "../package/package.service";
 import { generateRfiDraft, runRiskPrecheck } from "../risk/risk.service";
 
-// B6-B7 background worker. Reuses the existing DB job ledger (processing_jobs) — no broker, per the
-// API handoff which keeps broker/runtime deferred. Loop: claim one job cross-tenant via the
+// B6-B7 background worker. Uses processing_jobs, the sole active asynchronous queue. Loop: claim one job cross-tenant via the
 // SECURITY DEFINER claimer (0017), then process + mark it INSIDE a tenant transaction as actor
 // 'system' (withTenantClient), so RLS + the human-approval guard apply and a job can never sign off.
 //
-type ClaimedJob = { id: string; tenant_id: string; job_type: string; document_id: string | null; worker_output: Record<string, unknown> | null };
+type ClaimedJob = { id: string; tenant_id: string; job_type: SupportedProcessingJobType; document_id: string | null; worker_output: Record<string, unknown> | null };
 
-const HANDLED = [
-  "product_rematch", "ingest_vendor_catalogue", "ingest_past_submittal", "package_generation",
-  "risk_flag_generation", "rfi_generation",
-  "export_consultant_pdf", "export_aconex_bundle", "export_register_csv", "export_register_xlsx", "export_register_pdf",
-];
-
-export function configuredJobTypes(value = process.env.WORKER_JOB_TYPES): string[] {
-  return value?.split(",").map((item) => item.trim()).filter(Boolean) ?? HANDLED;
+export function configuredJobTypes(value = process.env.WORKER_JOB_TYPES): SupportedProcessingJobType[] {
+  const configured = value?.split(",").map((item) => item.trim()).filter(Boolean) ?? [...processingJobRegistry.asynchronous];
+  for (const jobType of configured) {
+    if (!isSupportedProcessingJobType(jobType)) throw new Error(`Unsupported WORKER_JOB_TYPES entry: ${jobType}`);
+  }
+  return configured as SupportedProcessingJobType[];
 }
 
 type Handler = (pool: Pool, job: ClaimedJob) => Promise<Record<string, unknown>>;
@@ -28,7 +26,7 @@ type Handler = (pool: Pool, job: ClaimedJob) => Promise<Record<string, unknown>>
 const tenantHandler = (handler: (client: PoolClient, job: ClaimedJob) => Promise<Record<string, unknown>>): Handler =>
   (pool, job) => withTenantClient(pool, { tenantId: job.tenant_id, actorType: "system", userId: null }, (client) => handler(client, job));
 
-const handlers: Record<string, Handler> = {
+const handlers = {
   product_rematch: tenantHandler(async (client, job) => {
     const registerItemId = String(job.worker_output?.registerItemId ?? "");
     if (!registerItemId) throw new Error("product_rematch job missing registerItemId");
@@ -75,7 +73,9 @@ const handlers: Record<string, Handler> = {
   export_register_csv: processPackageJob,
   export_register_xlsx: processPackageJob,
   export_register_pdf: processPackageJob,
-};
+} satisfies Record<SupportedProcessingJobType, Handler>;
+
+export const registeredWorkerJobTypes = Object.keys(handlers) as SupportedProcessingJobType[];
 
 async function ingestHandler(client: PoolClient, job: ClaimedJob): Promise<Record<string, unknown>> {
   const out = job.worker_output ?? {};
@@ -135,7 +135,7 @@ async function processJob(pool: Pool, job: ClaimedJob): Promise<void> {
 }
 
 // Claim + process a single job. Returns true if one was handled, false if the queue was empty.
-export async function runOnce(pool: Pool, jobTypes: string[] = HANDLED): Promise<boolean> {
+export async function runOnce(pool: Pool, jobTypes: SupportedProcessingJobType[] = [...processingJobRegistry.asynchronous]): Promise<boolean> {
   const claimed = await pool.query<ClaimedJob>(`select * from app.claim_next_job($1::text[])`, [jobTypes]);
   const job = claimed.rows[0];
   if (!job) return false;
@@ -143,10 +143,10 @@ export async function runOnce(pool: Pool, jobTypes: string[] = HANDLED): Promise
   return true;
 }
 
-export async function run(pool: Pool, opts: { idleMs?: number; signal?: AbortSignal; jobTypes?: string[] } = {}): Promise<void> {
+export async function run(pool: Pool, opts: { idleMs?: number; signal?: AbortSignal; jobTypes?: SupportedProcessingJobType[] } = {}): Promise<void> {
   const idleMs = opts.idleMs ?? 2000;
   while (!opts.signal?.aborted) {
-    const worked = await runOnce(pool, opts.jobTypes ?? HANDLED).catch((e) => {
+    const worked = await runOnce(pool, opts.jobTypes ?? [...processingJobRegistry.asynchronous]).catch((e) => {
       console.error("[worker] claim/process error", e);
       return false;
     });
