@@ -10,6 +10,7 @@ const apiService = readFileSync(new URL("../src/api/api.service.ts", import.meta
 const storage = readFileSync(new URL("../src/package/storage.ts", import.meta.url), "utf8");
 const controller = readFileSync(new URL("../src/api/api.controller.ts", import.meta.url), "utf8");
 const migration = readFileSync(new URL("../../db/migrations/0017_package_assembly.sql", import.meta.url), "utf8");
+const queueMigration = readFileSync(new URL("../../db/migrations/0022_queue_ledger_hardening.sql", import.meta.url), "utf8");
 
 test("package versions are immutable job reservations and preserve prior output documents", () => {
   assert.match(migration, /create table package_versions/);
@@ -20,6 +21,12 @@ test("package versions are immutable job reservations and preserve prior output 
   assert.match(service, /warnings: rendered\.warnings,[\s\S]*snapshot/);
   assert.match(service, /Package version snapshot is missing or does not match/);
   assert.match(service, /Package version reservation does not match the job payload/);
+});
+
+test("queue crash reconciliation remains active behind lease expiry", () => {
+  assert.match(queueMigration, /package_versions pv[\s\S]*pv\.status = 'ready'/);
+  assert.match(queueMigration, /exports e[\s\S]*e\.status = 'ready'/);
+  assert.match(queueMigration, /lease_expires_at <= clock_timestamp\(\)/);
 });
 
 test("every included file is explicitly tenant and project scoped", () => {
@@ -72,7 +79,7 @@ test("register filters, nullable edits, retries, and AU storage keep their edge-
   assert.match(apiService, /manual_notes = case when \$6 then \$7 else manual_notes end/);
   assert.match(apiService, /requireActiveTenantMember\(client, responsibleUserId\)/);
   assert.match(apiService, /if \(job\.inserted\)[\s\S]*update packages set status = 'assembling'/);
-  assert.match(worker, /last_error = null, error_details = null/);
+  assert.match(queueMigration, /last_error = null,[\s\S]*error_details = null/);
   assert.match(service, /status = 'ready'[\s\S]*error_message = null/);
   assert.match(storage, /followRegionRedirects: true/);
 });
