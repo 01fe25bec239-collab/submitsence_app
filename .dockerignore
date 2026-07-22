@@ -1,0 +1,11 @@
+.git
+.github
+.terraform
+**/.terraform
+**/node_modules
+**/.next
+**/*.log
+**/.env*
+!**/.env.example
+output
+tmp

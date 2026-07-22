@@ -1,0 +1,19 @@
+environment              = "staging"
+vpc_cidr                 = "10.30.0.0/16"
+single_nat_gateway       = true
+enable_dr                = false
+force_destroy_buckets    = false
+allow_insecure_http      = false
+db_instance_class        = "db.t4g.medium"
+db_allocated_storage     = 50
+db_max_allocated_storage = 250
+db_backup_retention_days = 14
+redis_node_type          = "cache.t4g.small"
+redis_replicas           = 1
+api_desired_count        = 2
+frontend_desired_count   = 2
+worker_desired_count     = 1
+monthly_budget_usd       = 500
+
+root_domain     = ""
+route53_zone_id = ""

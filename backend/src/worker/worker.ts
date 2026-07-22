@@ -19,6 +19,10 @@ const HANDLED = [
   "export_consultant_pdf", "export_aconex_bundle", "export_register_csv", "export_register_xlsx", "export_register_pdf",
 ];
 
+export function configuredJobTypes(value = process.env.WORKER_JOB_TYPES): string[] {
+  return value?.split(",").map((item) => item.trim()).filter(Boolean) ?? HANDLED;
+}
+
 type Handler = (pool: Pool, job: ClaimedJob) => Promise<Record<string, unknown>>;
 
 const tenantHandler = (handler: (client: PoolClient, job: ClaimedJob) => Promise<Record<string, unknown>>): Handler =>
@@ -139,10 +143,10 @@ export async function runOnce(pool: Pool, jobTypes: string[] = HANDLED): Promise
   return true;
 }
 
-export async function run(pool: Pool, opts: { idleMs?: number; signal?: AbortSignal } = {}): Promise<void> {
+export async function run(pool: Pool, opts: { idleMs?: number; signal?: AbortSignal; jobTypes?: string[] } = {}): Promise<void> {
   const idleMs = opts.idleMs ?? 2000;
   while (!opts.signal?.aborted) {
-    const worked = await runOnce(pool).catch((e) => {
+    const worked = await runOnce(pool, opts.jobTypes ?? HANDLED).catch((e) => {
       console.error("[worker] claim/process error", e);
       return false;
     });
@@ -154,7 +158,7 @@ if (require.main === module) {
   const pool = createPool();
   const controller = new AbortController();
   for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => controller.abort());
-  run(pool, { signal: controller.signal })
+  run(pool, { signal: controller.signal, jobTypes: configuredJobTypes() })
     .catch((e) => {
       console.error("[worker] fatal", e);
       process.exitCode = 1;
