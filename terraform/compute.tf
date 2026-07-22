@@ -511,7 +511,7 @@ resource "aws_ecs_task_definition" "worker" {
     name      = "worker-${each.key}"
     image     = "${aws_ecr_repository.this["backend"].repository_url}:${var.image_tag}"
     essential = true
-    command   = ["npm", "run", "worker"]
+    command   = ["node", "dist/worker/worker.js"]
     environment = concat(local.common_environment, [
       { name = "WORKER_KIND", value = each.key },
       { name = "WORKER_JOB_TYPES", value = local.worker_job_types[each.key] },
