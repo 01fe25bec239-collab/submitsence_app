@@ -191,12 +191,17 @@ test("connection loss discards the leader and hands over to a new session", asyn
   const second = new FakeClient(events);
   const controller = new AbortController();
   let sends = 0;
-  await runQueueMetrics(poolOf(first, second), cloudwatch(async () => {
-    sends += 1;
-    if (sends === 1) setImmediate(() => first.emit("error", new Error("socket lost")));
-    else controller.abort();
-    return {};
-  }), { environment: "staging", signal: controller.signal, retryMs: 1, publishMs: 60_000 });
+  const keepAlive = setInterval(() => undefined, 60_000);
+  try {
+    await runQueueMetrics(poolOf(first, second), cloudwatch(async () => {
+      sends += 1;
+      if (sends === 1) setImmediate(() => first.emit("error", new Error("socket lost")));
+      else controller.abort();
+      return {};
+    }), { environment: "staging", signal: controller.signal, retryMs: 1, publishMs: 60_000 });
+  } finally {
+    clearInterval(keepAlive);
+  }
   assert.equal(sends, 2);
   assert.match(first.releasedWith?.message ?? "", /socket lost/);
   assert.deepEqual(events.slice(-2), ["unlock", "release"]);
