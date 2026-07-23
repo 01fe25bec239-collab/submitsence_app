@@ -26,15 +26,36 @@ for f in $(ls db/migrations/0*.sql | grep -v '\.down\.'); do
 done
 ```
 
-`0001`-`0022` build the schema (`0016` adds the original `app.claim_next_job()` worker-queue claimer;
+`0001`-`0023` build the schema (`0016` adds the original `app.claim_next_job()` worker-queue claimer;
 `0017` adds package versions, package document selection, branding, register auto-population, and
 physical-deliverable tracking fields; `0018` adds versioned risk scoring, rule provenance,
 structured RFI drafts, source-risk links, and generated-checklist idempotency; `0021` adds self-serve
 onboarding, trial enforcement, Stripe/GST billing records, and reviewed public content; `0022` adds
-processing-job leases, fencing, heartbeats, and delayed retries),
+processing-job leases, fencing, heartbeats, and delayed retries; `0023` adds queue metrics),
 `0099_seed.sql` seeds roles/permissions/plans + a test fixture.
 Run migrations as the **owner/superuser** role (it owns the tables and therefore bypasses RLS, which
 is why seeding works). The runtime application connects as a different role — see below.
+
+## Migration integrity
+
+Historical migration SQL is immutable. `db/migrations/manifest.json` records the production forward
+set (`0001`-`0023` and `0099`) in numeric order with SHA-256 checksums over each file's exact raw
+bytes. `.gitattributes` marks migration SQL as `-text` so Git does not convert line endings before
+those bytes are hashed.
+
+After adding a future forward migration, add its reviewed lifecycle/category/mode/timeout metadata
+to the manifest with a 64-character placeholder checksum, then run:
+
+```bash
+npm run manifest:generate --prefix backend
+npm run manifest:check --prefix backend
+```
+
+Generation atomically refreshes derived IDs, filenames, order, and checksums; check mode is
+read-only. Production discovery and the manifest exclude every `*.down.sql` file. The current
+legacy checksums are go-forward integrity anchors from PB-10 onward: they do not prove which
+historical byte revisions an existing environment executed. The current SQL execution procedure
+above remains in place until the later PB-10 runner step.
 
 ## Runtime connection (required for RLS to work)
 
@@ -81,17 +102,16 @@ and index use. Transactional scripts roll back. All checks were executed success
 
 - **Failed apply** — every migration is wrapped in `BEGIN/COMMIT`; PostgreSQL DDL is transactional,
   so a failed file rolls itself back automatically. Fix and re-run.
-- **Full baseline teardown** — `psql -f db/migrations/9999_teardown.down.sql` drops all tables, enum
-  types, the `app` schema, and the two roles (extensions are left in place). Rebuild by re-running
-  `0001`–`0099`.
-- **Go-forward (post-baseline)** — once past this baseline, each new migration ships with a paired
-  `NNNN_*.down.sql` that reverses only its own change. Baseline is treated as a single unit.
+- **Down files** — retained for disposable local/test recovery only and excluded from production
+  execution and the production manifest.
+- **Persistent environments** — recover forward with a corrective migration; production workflows
+  must not invoke a down file.
 
 ## Layout
 
 ```
 db/
-  migrations/   0001..0022 schema, 0099 seed, 9999 teardown
+  migrations/   0001..0023 schema, 0099 seed, manifest, local/test-only downs
   test/         runnable compliance and package-assembly checks
   docs/         ERD, table/enum docs, RLS, indexing, retention, queries, HANDOFF contract
 ```

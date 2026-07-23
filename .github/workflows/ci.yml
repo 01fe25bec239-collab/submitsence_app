@@ -53,11 +53,30 @@ jobs:
       PGSSLMODE: disable
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: backend/package-lock.json
+      - run: npm ci --prefix backend
+      - name: Test migration manifest contract
+        run: node --import tsx --test test/migration-manifest.test.ts
+        working-directory: backend
+      - name: Check migration manifest
+        run: npm run manifest:check --prefix backend
+      - name: Check historical migration immutability
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            git fetch --no-tags origin main:refs/remotes/origin/main
+            MIGRATION_BASE="$(git merge-base HEAD origin/main)"
+          else
+            MIGRATION_BASE="$BEFORE_SHA"
+          fi
+          npm run manifest:history --prefix backend -- "$MIGRATION_BASE"
       - name: Apply every forward migration
         run: |
           for migration in db/migrations/0*.sql; do
@@ -69,7 +88,6 @@ jobs:
           for test_file in db/test/test*.sql; do
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$test_file"
           done
-      - run: npm ci --prefix backend
       - run: node --import tsx --test test/commercial-webhook.integration.test.ts
         working-directory: backend
 
