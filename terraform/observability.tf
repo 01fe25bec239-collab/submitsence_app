@@ -31,8 +31,8 @@ resource "aws_cloudwatch_metric_alarm" "custom_failures" {
   ok_actions          = [aws_sns_topic.alarms.arn]
 }
 
-resource "aws_cloudwatch_metric_alarm" "queue_depth" {
-  alarm_name          = "${local.name}-queue-depth"
+resource "aws_cloudwatch_metric_alarm" "queue_depth_high" {
+  alarm_name          = "${local.name}-queue-depth-high"
   alarm_description   = "PostgreSQL processing_jobs queue depth is above the operating threshold."
   namespace           = "SubmitSense/Jobs"
   metric_name         = "QueueDepth"
@@ -41,6 +41,25 @@ resource "aws_cloudwatch_metric_alarm" "queue_depth" {
   evaluation_periods  = 3
   threshold           = var.environment == "production" ? 100 : 25
   comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+  dimensions          = { Environment = var.environment }
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "queue_metrics_missing" {
+  count               = var.worker_desired_count > 0 ? 1 : 0
+  alarm_name          = "${local.name}-queue-metrics-missing"
+  alarm_description   = "QueueDepth telemetry has been absent for 30 consecutive one-minute periods."
+  namespace           = "SubmitSense/Jobs"
+  metric_name         = "QueueDepth"
+  unit                = "Count"
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 30
+  datapoints_to_alarm = 30
+  threshold           = 0
+  comparison_operator = "LessThanThreshold"
   treat_missing_data  = "breaching"
   dimensions          = { Environment = var.environment }
   alarm_actions       = [aws_sns_topic.alarms.arn]
@@ -153,10 +172,13 @@ resource "aws_cloudwatch_dashboard" "this" {
       {
         type = "metric", x = 0, y = 6, width = 24, height = 6,
         properties = {
-          title = "Jobs and failures", region = var.primary_region, period = 300,
+          title = "Jobs and failures", region = var.primary_region, period = 60,
           metrics = concat(
-            [["SubmitSense/Jobs", "QueueDepth", "Environment", var.environment]],
-            [for metric in local.custom_failure_metrics : [".", metric, ".", "."]]
+            [
+              ["SubmitSense/Jobs", "QueueDepth", "Environment", var.environment, { stat = "Maximum" }],
+              [".", "OldestJobAgeSeconds", ".", ".", { stat = "Maximum" }],
+            ],
+            [for metric in local.custom_failure_metrics : [".", metric, ".", ".", { stat = "Sum" }]]
           )
         }
       }

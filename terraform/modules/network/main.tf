@@ -107,7 +107,7 @@ resource "aws_security_group" "endpoints" {
 
 locals {
   interface_services = toset([
-    "ecr.api", "ecr.dkr", "logs", "secretsmanager", "kms", "sts", "textract", "ssmmessages"
+    "ecr.api", "ecr.dkr", "logs", "monitoring", "secretsmanager", "kms", "sts", "textract", "ssmmessages"
   ])
 }
 

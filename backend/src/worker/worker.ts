@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from "pg";
+import { CloudWatchClient } from "@aws-sdk/client-cloudwatch";
 import { createPool } from "../db.module";
 import { withTenantClient } from "../db/tenant-db";
 import { ingestCatalogue } from "../ingestion/ingestion.service";
@@ -6,6 +7,7 @@ import { isSupportedProcessingJobType, processingJobRegistry, type SupportedProc
 import { computeAndStoreMatches } from "../matching/matching.service";
 import { markPackageJobFailed, processPackageJob } from "../package/package.service";
 import { generateRfiDraft, runRiskPrecheck } from "../risk/risk.service";
+import { runQueueMetrics } from "./queue-metrics";
 
 // B6-B7 background worker. Uses processing_jobs, the sole active asynchronous queue. Loop: claim one job cross-tenant via the
 // SECURITY DEFINER claimer (0022), then process inside tenant scope as actor 'system'. Lease
@@ -304,14 +306,31 @@ export async function run(pool: Pool, opts: { idleMs?: number; signal?: AbortSig
   }
 }
 
-if (require.main === module) {
+async function main(): Promise<void> {
   const pool = createPool();
+  const cloudwatch = new CloudWatchClient({});
   const controller = new AbortController();
   for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => controller.abort());
-  run(pool, { signal: controller.signal, jobTypes: configuredJobTypes() })
-    .catch((e) => {
-      console.error("[worker] fatal", e);
-      process.exitCode = 1;
-    })
-    .finally(() => pool.end());
+  const worker = run(pool, { signal: controller.signal, jobTypes: configuredJobTypes() }).catch((e) => {
+    console.error("[worker] fatal", e);
+    process.exitCode = 1;
+    controller.abort();
+  });
+  const metrics = runQueueMetrics(pool, cloudwatch, {
+    environment: process.env.ENVIRONMENT ?? "development",
+    signal: controller.signal,
+  });
+  try {
+    await Promise.all([worker, metrics]);
+  } finally {
+    cloudwatch.destroy();
+    await pool.end();
+  }
+}
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error("[worker] shutdown failed", error);
+    process.exitCode = 1;
+  });
 }
