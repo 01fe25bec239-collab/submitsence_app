@@ -1,0 +1,478 @@
+{
+  "schemaVersion": 1,
+  "legacyBoundary": "0099",
+  "migrations": [
+    {
+      "id": "0001",
+      "filename": "0001_extensions_helpers.sql",
+      "sha256": "86bbd0fb06c3e346c088be0b710bfe6ba6ec45d89094be8df7674dc5800ce921",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema",
+        "security-policy",
+        "function-replacement"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0002",
+      "filename": "0002_enums.sql",
+      "sha256": "ace88d762a8ba8e0eee197172844d3eb74eb488bdd20a53585faaabed767d611",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0003",
+      "filename": "0003_tenancy_iam.sql",
+      "sha256": "980e3067bc4e67fa94bb7b7d75f1848758e1061bd53c0be28364069ea93ef827",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0004",
+      "filename": "0004_projects_documents.sql",
+      "sha256": "31381c4779fa2e61c58ddad1b811b59d210d02d5e3fad40da964f07852f42a42",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0005",
+      "filename": "0005_specs_requirements.sql",
+      "sha256": "b0cd3ce6750ec5e2be8fc155f6fa17d1b9aa5d5d981187c04c215d824cd4e458",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0006",
+      "filename": "0006_register_status.sql",
+      "sha256": "22853c56f32170957034ccca5fc5fc65c7dd460049055f5def08c4cdefbc7ad0",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema",
+        "function-replacement",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0007",
+      "filename": "0007_vendors_products_matches.sql",
+      "sha256": "727584d3c62a51c43dc1c384e5aa6ea3d60d0fb6db88fa46a92c613000944635",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0008",
+      "filename": "0008_risk_rfi_learning.sql",
+      "sha256": "f37b5208e07109a4bb94742d5276eb68577aa48b179d1a1835e9326ad5626132",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0009",
+      "filename": "0009_audit.sql",
+      "sha256": "4b0e218cb9655e67eab26b3050308a1e732fb0579ac9229d7ddd7a6145351c41",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema",
+        "security-policy",
+        "function-replacement",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0010",
+      "filename": "0010_billing.sql",
+      "sha256": "8d6e87a17467974af8e53fd9bfe0ef34a2198fa37450569ae38f3650a63aec7e",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0011",
+      "filename": "0011_content_kb.sql",
+      "sha256": "66de9a1f2d4a4bb1a87077da96851862b66b32572063088c0b9beb93511c4dc4",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema",
+        "security-policy",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0012",
+      "filename": "0012_integrations.sql",
+      "sha256": "f74afbecf1b5f2dc72d7837f3b09cbce3100988379ed238218c67eae0ff13cba",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0013",
+      "filename": "0013_rls_policies.sql",
+      "sha256": "6f90a58f32d75dbd0b2f458fbd5d92c19fe3a973d02e2bee6c873fae3e7c5495",
+      "lifecyclePhase": "contract",
+      "operationCategories": [
+        "security-policy"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0014",
+      "filename": "0014_auth_support.sql",
+      "sha256": "9dd131859c431c11bbedd9ebf6dac57de5ac42d30f29aad32934a89e85069adf",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema",
+        "security-policy",
+        "function-replacement",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0015",
+      "filename": "0015_webhook_tenant_resolvers.sql",
+      "sha256": "1e1f589133c98113a3f2d663f5aa9870752ed16c4f269e89af2d0273074301ba",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "security-policy",
+        "function-replacement"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0016",
+      "filename": "0016_job_claim.sql",
+      "sha256": "215ce979bc0450b75eab1db444801936d6fa3ada650229f407cc6b2dc13b0cd8",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "security-policy",
+        "function-replacement"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0017",
+      "filename": "0017_package_assembly.sql",
+      "sha256": "f6cde3f35611b4cd2c3f106d17d076cad8d84cbe5c2f58b9bfd7f005bbc9f693",
+      "lifecyclePhase": "backfill",
+      "operationCategories": [
+        "schema",
+        "data-correction",
+        "security-policy",
+        "function-replacement",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0018",
+      "filename": "0018_risk_rfi_agent.sql",
+      "sha256": "24534a5649ca399e0687c34d9de658c26e58eb6528c6ba47b23fcb22aa71077c",
+      "lifecyclePhase": "contract",
+      "operationCategories": [
+        "schema",
+        "data-correction",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0019",
+      "filename": "0019_security_hardening.sql",
+      "sha256": "3c782eb6f8e93ce9791177ee8f8cbfc178062efa820af892fc849d73af071a9f",
+      "lifecyclePhase": "contract",
+      "operationCategories": [
+        "schema",
+        "data-correction",
+        "security-policy",
+        "function-replacement",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0020",
+      "filename": "0020_integration_consultant_status.sql",
+      "sha256": "964c1497b19092d234332a8ad9976858e3bc2d15f490029472cec6280cd1a40d",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "schema"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0021",
+      "filename": "0021_commercial_content.sql",
+      "sha256": "9fd4bf893003d4963d78b460bc606b224183e6987ddd388239a39add42f6e2f5",
+      "lifecyclePhase": "contract",
+      "operationCategories": [
+        "schema",
+        "data-correction",
+        "security-policy",
+        "function-replacement",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0022",
+      "filename": "0022_queue_ledger_hardening.sql",
+      "sha256": "6e3c08f326f4c6526305cafca7018f4bf4ed6fa6c80ef5585dec0aac8024d618",
+      "lifecyclePhase": "contract",
+      "operationCategories": [
+        "schema",
+        "data-correction",
+        "security-policy",
+        "function-replacement",
+        "index"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0023",
+      "filename": "0023_queue_metrics.sql",
+      "sha256": "df5641b613cc811387b1834eda8e08e5f1d99340eacf715beed886150888ea76",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "security-policy",
+        "function-replacement"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    },
+    {
+      "id": "0099",
+      "filename": "0099_seed.sql",
+      "sha256": "c4b09a10b4f7b07bd7f3fc18e363eceeb48c1a2e569bcc947db75de0aeae1959",
+      "lifecyclePhase": "expand",
+      "operationCategories": [
+        "seed-reference"
+      ],
+      "executionMode": "legacy-verbatim",
+      "requiredRuntimeEpoch": null,
+      "timeouts": {
+        "lockMs": 5000,
+        "statementMs": 60000,
+        "transactionMs": 300000,
+        "idleInTransactionMs": 60000,
+        "wallClockMs": 900000
+      }
+    }
+  ]
+}
