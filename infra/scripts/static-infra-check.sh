@@ -18,7 +18,7 @@ grep -q 'environment = concat(local.common_environment' terraform/compute.tf
 queue_alarm="$(sed -n '/resource "aws_cloudwatch_metric_alarm" "queue_depth_high"/,/^}/p' terraform/observability.tf)"
 freshness_alarm="$(sed -n '/resource "aws_cloudwatch_metric_alarm" "queue_metrics_missing"/,/^}/p' terraform/observability.tf)"
 grep -q 'treat_missing_data[[:space:]]*=[[:space:]]*"notBreaching"' <<<"$queue_alarm"
-grep -q 'count[[:space:]]*=[[:space:]]*var.worker_desired_count > 0 ? 1 : 0' <<<"$freshness_alarm"
+! grep -q 'count[[:space:]]*=' <<<"$freshness_alarm"
 grep -q 'metric_name[[:space:]]*=[[:space:]]*"QueueDepth"' <<<"$freshness_alarm"
 grep -q 'unit[[:space:]]*=[[:space:]]*"Count"' <<<"$freshness_alarm"
 grep -q 'statistic[[:space:]]*=[[:space:]]*"Maximum"' <<<"$freshness_alarm"
@@ -30,7 +30,7 @@ grep -q 'threshold[[:space:]]*=[[:space:]]*0' <<<"$freshness_alarm"
 grep -q 'treat_missing_data[[:space:]]*=[[:space:]]*"breaching"' <<<"$freshness_alarm"
 
 ! grep -RInE 'OldestJobAgeHigh|oldest_job_age.*threshold|oldest.*age.*variable' terraform
-! grep -RInE 'resource "aws_appautoscaling_(target|policy)" "worker|QueueDepth.*target_tracking' terraform
+node infra/scripts/check-pb08-infra.mjs
 ! grep -InE 'TenantId|ProjectId|JobId|DocumentId|WorkerPool|TaskId|LeaseToken' backend/src/worker/queue-metrics.ts
 
 if grep -RInEi '(redis|bullmq|elasticache|6379)' terraform .github --include='*.tf' --include='*.example' --include='*.hcl' --include='*.yml' --include='*.yaml'; then

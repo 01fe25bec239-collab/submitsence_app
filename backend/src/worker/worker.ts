@@ -3,11 +3,12 @@ import { CloudWatchClient } from "@aws-sdk/client-cloudwatch";
 import { createPool } from "../db.module";
 import { withTenantClient } from "../db/tenant-db";
 import { ingestCatalogue } from "../ingestion/ingestion.service";
-import { isSupportedProcessingJobType, processingJobRegistry, type SupportedProcessingJobType } from "../job-types";
+import { isSupportedProcessingJobType, type SupportedProcessingJobType } from "../job-types";
 import { computeAndStoreMatches } from "../matching/matching.service";
 import { markPackageJobFailed, processPackageJob } from "../package/package.service";
 import { generateRfiDraft, runRiskPrecheck } from "../risk/risk.service";
 import { runQueueMetrics } from "./queue-metrics";
+import { createTaskProtection, type TaskProtection } from "./task-protection";
 
 // B6-B7 background worker. Uses processing_jobs, the sole active asynchronous queue. Loop: claim one job cross-tenant via the
 // SECURITY DEFINER claimer (0022), then process inside tenant scope as actor 'system'. Lease
@@ -42,8 +43,10 @@ export function configuredLease(value: Partial<Record<"WORKER_LEASE_SECONDS" | "
 }
 
 export function configuredJobTypes(value = process.env.WORKER_JOB_TYPES): SupportedProcessingJobType[] {
-  const configured = value?.split(",").map((item) => item.trim()).filter(Boolean) ?? [...processingJobRegistry.asynchronous];
-  if (!configured.length) throw new Error("WORKER_JOB_TYPES must contain at least one supported job type");
+  if (value === undefined || value.trim() === "") throw new Error("WORKER_JOB_TYPES is required");
+  const configured = value.split(",").map((item) => item.trim()).filter(Boolean);
+  if (!configured.length) throw new Error("WORKER_JOB_TYPES is required");
+  if (new Set(configured).size !== configured.length) throw new Error("WORKER_JOB_TYPES must not contain duplicates");
   for (const jobType of configured) {
     if (!isSupportedProcessingJobType(jobType)) throw new Error(`Unsupported WORKER_JOB_TYPES entry: ${jobType}`);
   }
@@ -172,6 +175,8 @@ export function startHeartbeat(
   config: WorkerLeaseConfig,
   signal?: AbortSignal,
   warn: (message: string) => void = (message) => console.warn(message),
+  protection?: TaskProtection,
+  onProtectionFailure?: () => void,
 ): Heartbeat {
   let stopped = false;
   let leaseLost = false;
@@ -187,11 +192,21 @@ export function startHeartbeat(
     leaseLost = true;
     stopTimer();
     warn(`[worker] lost lease for job ${job.id}; terminal update skipped (${reason})`);
+    onProtectionFailure?.();
   };
   const tick = () => {
     if (stopped || inFlight) return;
     inFlight = renewLease(pool, job, config.leaseSeconds)
-      .then((expiry) => { if (!expiry) lose("replaced lease"); })
+      .then(async (expiry) => {
+        if (!expiry) {
+          lose("replaced lease");
+          return;
+        }
+        if (protection && !await protection.renew()) {
+          warn(`[worker] task protection renewal failed for job ${job.id}; draining after the job`);
+          onProtectionFailure?.();
+        }
+      })
       .catch(() => lose("heartbeat error"))
       .finally(() => { inFlight = null; });
   };
@@ -220,6 +235,8 @@ export async function processClaimedJob(
   config: WorkerLeaseConfig,
   signal?: AbortSignal,
   warn?: (message: string) => void,
+  protection?: TaskProtection,
+  onProtectionFailure?: () => void,
 ): Promise<void> {
   const warning = warn ?? ((message: string) => console.warn(message));
   if (!job.lease_token) {
@@ -230,7 +247,7 @@ export async function processClaimedJob(
     warning(`[worker] shutdown before job ${job.id} started; lease left for expiry`);
     return;
   }
-  const heartbeat = startHeartbeat(pool, job, config, signal, warning);
+  const heartbeat = startHeartbeat(pool, job, config, signal, warning, protection, onProtectionFailure);
   let result: Record<string, unknown> | undefined;
   let failure: unknown;
   let didFail = false;
@@ -260,24 +277,61 @@ export async function processClaimedJob(
 }
 
 // Process one claimed job and mark it through the fenced database functions.
-async function processJob(pool: Pool, job: ClaimedJob, config: WorkerLeaseConfig, signal?: AbortSignal): Promise<void> {
+async function processJob(
+  pool: Pool,
+  job: ClaimedJob,
+  config: WorkerLeaseConfig,
+  signal?: AbortSignal,
+  protection?: TaskProtection,
+  onProtectionFailure?: () => void,
+): Promise<void> {
   const handler = handlers[job.job_type];
   await processClaimedJob(pool, job, async (handlerPool, handlerJob) => {
     if (!handler) throw new Error(`no handler for job_type ${job.job_type}`);
     return handler(handlerPool, handlerJob);
-  }, config, signal);
+  }, config, signal, undefined, protection, onProtectionFailure);
 }
 
 // Claim + process a single job. Returns true if one was handled, false if the queue was empty.
 export async function runOnce(
   pool: Pool,
-  jobTypes: SupportedProcessingJobType[] = [...processingJobRegistry.asynchronous],
+  jobTypes: SupportedProcessingJobType[],
   config: WorkerLeaseConfig = configuredLease(),
-  signal?: AbortSignal,
+  options: {
+    claimSignal?: AbortSignal;
+    hardKillSignal?: AbortSignal;
+    protection?: TaskProtection;
+    drainRequested?: () => boolean;
+    onProtectionFailure?: () => void;
+  } = {},
 ): Promise<boolean> {
+  const clearProtection = async (context: string) => {
+    if (options.protection && !await options.protection.clear()) {
+      options.onProtectionFailure?.();
+      throw new Error(`task protection could not be removed ${context}`);
+    }
+  };
+  if (options.claimSignal?.aborted || options.drainRequested?.()) return false;
+  if (options.protection && !await options.protection.enable()) {
+    console.warn("[worker] task protection could not be enabled; claim skipped");
+    return false;
+  }
+  if (options.claimSignal?.aborted || options.drainRequested?.()) {
+    await clearProtection("before claim");
+    return false;
+  }
   const job = await claimJob(pool, jobTypes, config.leaseSeconds);
-  if (!job) return false;
-  await processJob(pool, job, config, signal);
+  if (!job) {
+    await clearProtection("after an empty claim");
+    return false;
+  }
+  if (options.claimSignal?.aborted || options.drainRequested?.()) {
+    console.warn(`[worker] drain requested after claim for job ${job.id}; lease left for expiry`);
+    await clearProtection("after a drained claim");
+    return false;
+  }
+  await processJob(pool, job, config, options.hardKillSignal, options.protection, options.onProtectionFailure);
+  await clearProtection("after a job");
   return true;
 }
 
@@ -294,35 +348,109 @@ function idle(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-export async function run(pool: Pool, opts: { idleMs?: number; signal?: AbortSignal; jobTypes?: SupportedProcessingJobType[] } = {}): Promise<void> {
+export async function run(pool: Pool, opts: {
+  idleMs?: number;
+  claimSignal?: AbortSignal;
+  hardKillSignal?: AbortSignal;
+  jobTypes: SupportedProcessingJobType[];
+  protection?: TaskProtection;
+  drainRequested?: () => boolean;
+  onProtectionFailure?: () => void;
+}): Promise<void> {
   const idleMs = opts.idleMs ?? 2000;
   const lease = configuredLease();
-  while (!opts.signal?.aborted) {
-    const worked = await runOnce(pool, opts.jobTypes ?? [...processingJobRegistry.asynchronous], lease, opts.signal).catch((e) => {
+  while (!opts.claimSignal?.aborted && !opts.drainRequested?.()) {
+    const worked = await runOnce(pool, opts.jobTypes, lease, opts).catch((e) => {
       console.error("[worker] claim/process error", e);
       return false;
     });
-    if (!worked) await idle(idleMs, opts.signal);
+    if (!worked) await idle(idleMs, opts.claimSignal);
   }
 }
 
+export type WorkerShutdownState = "running" | "drainRequested" | "draining" | "stopped" | "hardKilled";
+
+export function createShutdownCoordinator(
+  onHardKill: () => void | Promise<void>,
+  schedule: (callback: () => void, milliseconds: number) => NodeJS.Timeout = setTimeout,
+) {
+  const claimController = new AbortController();
+  const metricsController = new AbortController();
+  const hardKillController = new AbortController();
+  let state: WorkerShutdownState = "running";
+  let timer: NodeJS.Timeout | undefined;
+  let hardKilling = false;
+  const hardKill = () => {
+    if (hardKilling) return;
+    hardKilling = true;
+    state = "hardKilled";
+    hardKillController.abort();
+    void onHardKill();
+  };
+  return {
+    claimController,
+    metricsController,
+    hardKillController,
+    state: () => state,
+    requestDrain: () => {
+      if (state !== "running") {
+        hardKill();
+        return false;
+      }
+      state = "drainRequested";
+      claimController.abort();
+      metricsController.abort();
+      timer = schedule(hardKill, 110_000);
+      timer.unref();
+      return true;
+    },
+    markDraining: () => {
+      if (state === "drainRequested") state = "draining";
+    },
+    stop: () => {
+      if (timer) clearTimeout(timer);
+      if (state !== "hardKilled") state = "stopped";
+    },
+  };
+}
+
 async function main(): Promise<void> {
+  const jobTypes = configuredJobTypes();
+  const lease = configuredLease();
+  const protection = createTaskProtection(lease);
   const pool = createPool();
   const cloudwatch = new CloudWatchClient({});
-  const controller = new AbortController();
-  for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => controller.abort());
-  const worker = run(pool, { signal: controller.signal, jobTypes: configuredJobTypes() }).catch((e) => {
+  const shutdown = createShutdownCoordinator(async () => {
+    await protection.clear(1000);
+    process.exit(1);
+  });
+  const requestDrain = () => {
+    if (shutdown.requestDrain()) shutdown.markDraining();
+  };
+  for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, requestDrain);
+  const drainAfterJob = () => {
+    if (shutdown.state() === "running") requestDrain();
+  };
+  const worker = run(pool, {
+    claimSignal: shutdown.claimController.signal,
+    hardKillSignal: shutdown.hardKillController.signal,
+    jobTypes,
+    protection,
+    drainRequested: () => shutdown.state() !== "running",
+    onProtectionFailure: drainAfterJob,
+  }).catch((e) => {
     console.error("[worker] fatal", e);
     process.exitCode = 1;
-    controller.abort();
+    requestDrain();
   });
   const metrics = runQueueMetrics(pool, cloudwatch, {
     environment: process.env.ENVIRONMENT ?? "development",
-    signal: controller.signal,
+    signal: shutdown.metricsController.signal,
   });
   try {
     await Promise.all([worker, metrics]);
   } finally {
+    shutdown.stop();
     cloudwatch.destroy();
     await pool.end();
   }

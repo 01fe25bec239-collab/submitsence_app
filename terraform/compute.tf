@@ -445,25 +445,18 @@ resource "aws_ecs_task_definition" "api" {
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.api_task.arn
   container_definitions = jsonencode([{
-    name             = "api"
-    image            = "${aws_ecr_repository.this["backend"].repository_url}:${var.image_tag}"
-    essential        = true
-    portMappings     = [{ containerPort = 3000, protocol = "tcp" }]
-    environment      = concat(local.common_environment, [{ name = "PORT", value = "3000" }])
+    name         = "api"
+    image        = "${aws_ecr_repository.this["backend"].repository_url}:${var.image_tag}"
+    essential    = true
+    portMappings = [{ containerPort = 3000, protocol = "tcp" }]
+    environment = concat(local.common_environment, [
+      { name = "PORT", value = "3000" },
+      { name = "PG_POOL_MAX", value = tostring(var.api_capacity.pool_max) },
+    ])
     secrets          = local.common_secrets
     healthCheck      = { command = ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/v1/openapi.json >/dev/null || exit 1"], interval = 30, timeout = 5, retries = 3, startPeriod = 30 }
     logConfiguration = { logDriver = "awslogs", options = { "awslogs-group" = aws_cloudwatch_log_group.ecs["api"].name, "awslogs-region" = var.primary_region, "awslogs-stream-prefix" = "app" } }
   }])
-}
-
-locals {
-  worker_job_types = {
-    ocr         = "ingest_past_submittal"
-    vendor      = "ingest_vendor_catalogue,product_rematch"
-    package     = "package_generation,export_consultant_pdf,export_aconex_bundle,export_register_csv,export_register_xlsx,export_register_pdf"
-    integration = "__integration_adapter_pending__"
-    scheduled   = "risk_flag_generation,rfi_generation"
-  }
 }
 
 resource "aws_ecs_task_definition" "worker" {
@@ -476,16 +469,42 @@ resource "aws_ecs_task_definition" "worker" {
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.worker_task[each.key].arn
   container_definitions = jsonencode([{
-    name      = "worker-${each.key}"
-    image     = "${aws_ecr_repository.this["backend"].repository_url}:${var.image_tag}"
-    essential = true
-    command   = ["node", "dist/worker/worker.js"]
+    name        = "worker-${each.key}"
+    image       = "${aws_ecr_repository.this["backend"].repository_url}:${var.image_tag}"
+    essential   = true
+    command     = ["node", "dist/worker/worker.js"]
+    stopTimeout = 120
     environment = concat(local.common_environment, [
       { name = "WORKER_KIND", value = each.key },
-      { name = "WORKER_JOB_TYPES", value = local.worker_job_types[each.key] },
+      { name = "WORKER_JOB_TYPES", value = join(",", each.value.job_types) },
+      { name = "PG_POOL_MAX", value = "3" },
     ])
     secrets          = local.common_secrets
     logConfiguration = { logDriver = "awslogs", options = { "awslogs-group" = aws_cloudwatch_log_group.ecs["worker-${each.key}"].name, "awslogs-region" = var.primary_region, "awslogs-stream-prefix" = "worker" } }
+  }])
+}
+
+resource "aws_ecs_task_definition" "db_capacity_check" {
+  family                   = "${local.name}-db-capacity-check"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = 512
+  memory                   = 1024
+  execution_role_arn       = aws_iam_role.migration_execution.arn
+  container_definitions = jsonencode([{
+    name      = "db-capacity-check"
+    image     = "${aws_ecr_repository.this["backend"].repository_url}:${var.image_tag}"
+    essential = true
+    command   = ["node", "dist/ops/check-db-capacity.js"]
+    environment = [
+      { name = "PGSSLMODE", value = "require" },
+      { name = "REQUIRED_CONNECTIONS", value = tostring(local.required_connections) },
+      { name = "RESERVE_PERCENT", value = "20" },
+    ]
+    secrets = [
+      { name = "DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.app_database.arn}:DATABASE_URL::" },
+    ]
+    logConfiguration = { logDriver = "awslogs", options = { "awslogs-group" = aws_cloudwatch_log_group.ecs["migrations"].name, "awslogs-region" = var.primary_region, "awslogs-stream-prefix" = "db-capacity-check" } }
   }])
 }
 
@@ -519,7 +538,7 @@ resource "aws_ecs_service" "frontend" {
   name                               = "frontend"
   cluster                            = aws_ecs_cluster.this.id
   task_definition                    = aws_ecs_task_definition.frontend.arn
-  desired_count                      = var.frontend_desired_count
+  desired_count                      = var.frontend_capacity.initial
   deployment_minimum_healthy_percent = 100
   deployment_maximum_percent         = 200
   health_check_grace_period_seconds  = 60
@@ -542,7 +561,7 @@ resource "aws_ecs_service" "frontend" {
     container_name   = "frontend"
     container_port   = 3001
   }
-  lifecycle { ignore_changes = [task_definition] }
+  lifecycle { ignore_changes = [desired_count, task_definition] }
   depends_on = [aws_lb_listener.http]
 }
 
@@ -550,7 +569,7 @@ resource "aws_ecs_service" "api" {
   name                               = "api"
   cluster                            = aws_ecs_cluster.this.id
   task_definition                    = aws_ecs_task_definition.api.arn
-  desired_count                      = var.api_desired_count
+  desired_count                      = var.api_capacity.initial
   deployment_minimum_healthy_percent = 100
   deployment_maximum_percent         = 200
   health_check_grace_period_seconds  = 60
@@ -576,7 +595,7 @@ resource "aws_ecs_service" "api" {
   service_registries {
     registry_arn = aws_service_discovery_service.api.arn
   }
-  lifecycle { ignore_changes = [task_definition] }
+  lifecycle { ignore_changes = [desired_count, task_definition] }
   depends_on = [aws_lb_listener.http]
 }
 
@@ -585,8 +604,8 @@ resource "aws_ecs_service" "worker" {
   name                               = "worker-${each.key}"
   cluster                            = aws_ecs_cluster.this.id
   task_definition                    = aws_ecs_task_definition.worker[each.key].arn
-  desired_count                      = var.worker_desired_count
-  deployment_minimum_healthy_percent = 50
+  desired_count                      = var.worker_capacities[each.key].initial
+  deployment_minimum_healthy_percent = 100
   deployment_maximum_percent         = 200
   enable_execute_command             = var.environment != "production"
   capacity_provider_strategy {
@@ -600,14 +619,14 @@ resource "aws_ecs_service" "worker" {
   network_configuration {
     assign_public_ip = false
     subnets          = module.network.private_subnet_ids
-    security_groups  = [each.key == "integration" ? aws_security_group.app_tasks.id : aws_security_group.worker_tasks.id]
+    security_groups  = [aws_security_group.worker_tasks.id]
   }
-  lifecycle { ignore_changes = [task_definition] }
+  lifecycle { ignore_changes = [desired_count, task_definition] }
 }
 
 resource "aws_appautoscaling_target" "api" {
-  max_capacity       = var.environment == "production" ? 10 : 3
-  min_capacity       = max(1, var.api_desired_count)
+  max_capacity       = var.api_capacity.max
+  min_capacity       = var.api_capacity.min
   resource_id        = "service/${aws_ecs_cluster.this.name}/${aws_ecs_service.api.name}"
   scalable_dimension = "ecs:service:DesiredCount"
   service_namespace  = "ecs"
@@ -620,7 +639,76 @@ resource "aws_appautoscaling_policy" "api_cpu" {
   scalable_dimension = aws_appautoscaling_target.api.scalable_dimension
   service_namespace  = aws_appautoscaling_target.api.service_namespace
   target_tracking_scaling_policy_configuration {
-    target_value = 60
+    target_value       = 60
+    scale_out_cooldown = 60
+    scale_in_cooldown  = 300
     predefined_metric_specification { predefined_metric_type = "ECSServiceAverageCPUUtilization" }
+  }
+}
+
+resource "aws_appautoscaling_target" "frontend" {
+  max_capacity       = var.frontend_capacity.max
+  min_capacity       = var.frontend_capacity.min
+  resource_id        = "service/${aws_ecs_cluster.this.name}/${aws_ecs_service.frontend.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
+
+resource "aws_appautoscaling_policy" "frontend_cpu" {
+  name               = "${local.name}-frontend-cpu"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.frontend.resource_id
+  scalable_dimension = aws_appautoscaling_target.frontend.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.frontend.service_namespace
+  target_tracking_scaling_policy_configuration {
+    target_value       = 60
+    scale_out_cooldown = 60
+    scale_in_cooldown  = 300
+    predefined_metric_specification { predefined_metric_type = "ECSServiceAverageCPUUtilization" }
+  }
+}
+
+resource "aws_appautoscaling_target" "worker" {
+  for_each           = local.worker_services
+  max_capacity       = var.worker_capacities[each.key].max
+  min_capacity       = var.worker_capacities[each.key].min
+  resource_id        = "service/${aws_ecs_cluster.this.name}/${aws_ecs_service.worker[each.key].name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
+
+resource "aws_appautoscaling_policy" "worker_scale_out" {
+  for_each           = local.worker_services
+  name               = "${local.name}-worker-${each.key}-scale-out"
+  policy_type        = "StepScaling"
+  resource_id        = aws_appautoscaling_target.worker[each.key].resource_id
+  scalable_dimension = aws_appautoscaling_target.worker[each.key].scalable_dimension
+  service_namespace  = aws_appautoscaling_target.worker[each.key].service_namespace
+  step_scaling_policy_configuration {
+    adjustment_type         = "ChangeInCapacity"
+    cooldown                = 60
+    metric_aggregation_type = "Maximum"
+    step_adjustment {
+      metric_interval_lower_bound = 0
+      scaling_adjustment          = 1
+    }
+  }
+}
+
+resource "aws_appautoscaling_policy" "worker_scale_in" {
+  for_each           = local.worker_services
+  name               = "${local.name}-worker-${each.key}-scale-in"
+  policy_type        = "StepScaling"
+  resource_id        = aws_appautoscaling_target.worker[each.key].resource_id
+  scalable_dimension = aws_appautoscaling_target.worker[each.key].scalable_dimension
+  service_namespace  = aws_appautoscaling_target.worker[each.key].service_namespace
+  step_scaling_policy_configuration {
+    adjustment_type         = "ChangeInCapacity"
+    cooldown                = 900
+    metric_aggregation_type = "Maximum"
+    step_adjustment {
+      metric_interval_upper_bound = 0
+      scaling_adjustment          = -1
+    }
   }
 }

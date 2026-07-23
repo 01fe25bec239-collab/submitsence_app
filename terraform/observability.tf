@@ -11,7 +11,15 @@ resource "aws_sns_topic_subscription" "email" {
 }
 
 locals {
-  custom_failure_metrics = toset(["JobFailures", "OcrFailures", "PackageFailures", "IntegrationFailures", "AuthFailures"])
+  custom_failure_metrics = toset(["JobFailures", "OcrFailures", "PackageFailures", "AuthFailures"])
+  worker_metric_queries = {
+    for pool_name, pool in local.worker_services : pool_name => [
+      for index, job_type in sort(pool.job_types) : {
+        id       = format("m%02d", index)
+        job_type = job_type
+      }
+    ]
+  }
 }
 
 resource "aws_cloudwatch_metric_alarm" "custom_failures" {
@@ -48,7 +56,6 @@ resource "aws_cloudwatch_metric_alarm" "queue_depth_high" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "queue_metrics_missing" {
-  count               = var.worker_desired_count > 0 ? 1 : 0
   alarm_name          = "${local.name}-queue-metrics-missing"
   alarm_description   = "QueueDepth telemetry has been absent for 30 consecutive one-minute periods."
   namespace           = "SubmitSense/Jobs"
@@ -64,6 +71,80 @@ resource "aws_cloudwatch_metric_alarm" "queue_metrics_missing" {
   dimensions          = { Environment = var.environment }
   alarm_actions       = [aws_sns_topic.alarms.arn]
   ok_actions          = [aws_sns_topic.alarms.arn]
+}
+
+resource "aws_cloudwatch_metric_alarm" "worker_scale_out" {
+  for_each            = local.worker_services
+  alarm_name          = "${local.name}-worker-${each.key}-queue-scale-out"
+  alarm_description   = "Scale the ${each.key} PostgreSQL-ledger worker pool out when any mapped JobType has queued work."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_appautoscaling_policy.worker_scale_out[each.key].arn]
+
+  dynamic "metric_query" {
+    for_each = local.worker_metric_queries[each.key]
+    content {
+      id          = metric_query.value.id
+      return_data = false
+      metric {
+        namespace   = "SubmitSense/Jobs"
+        metric_name = "QueueDepth"
+        period      = 60
+        stat        = "Maximum"
+        dimensions = {
+          Environment = var.environment
+          JobType     = metric_query.value.job_type
+        }
+      }
+    }
+  }
+
+  metric_query {
+    id          = "queue"
+    expression  = length(local.worker_metric_queries[each.key]) == 1 ? local.worker_metric_queries[each.key][0].id : "SUM([${join(",", [for query in local.worker_metric_queries[each.key] : query.id])}])"
+    label       = "${each.key} mapped queue depth"
+    return_data = true
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "worker_scale_in" {
+  for_each            = local.worker_services
+  alarm_name          = "${local.name}-worker-${each.key}-queue-scale-in"
+  alarm_description   = "Scale the ${each.key} PostgreSQL-ledger worker pool in only after fifteen zero-depth minutes."
+  comparison_operator = "LessThanOrEqualToThreshold"
+  evaluation_periods  = 15
+  datapoints_to_alarm = 15
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_appautoscaling_policy.worker_scale_in[each.key].arn]
+
+  dynamic "metric_query" {
+    for_each = local.worker_metric_queries[each.key]
+    content {
+      id          = metric_query.value.id
+      return_data = false
+      metric {
+        namespace   = "SubmitSense/Jobs"
+        metric_name = "QueueDepth"
+        period      = 60
+        stat        = "Maximum"
+        dimensions = {
+          Environment = var.environment
+          JobType     = metric_query.value.job_type
+        }
+      }
+    }
+  }
+
+  metric_query {
+    id          = "queue"
+    expression  = length(local.worker_metric_queries[each.key]) == 1 ? local.worker_metric_queries[each.key][0].id : "SUM([${join(",", [for query in local.worker_metric_queries[each.key] : query.id])}])"
+    label       = "${each.key} mapped queue depth"
+    return_data = true
+  }
 }
 
 resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
@@ -178,6 +259,12 @@ resource "aws_cloudwatch_dashboard" "this" {
               ["SubmitSense/Jobs", "QueueDepth", "Environment", var.environment, { stat = "Maximum" }],
               [".", "OldestJobAgeSeconds", ".", ".", { stat = "Maximum" }],
             ],
+            flatten([
+              for pool in values(local.worker_services) : [
+                for job_type in pool.job_types :
+                ["SubmitSense/Jobs", "OldestJobAgeSeconds", "Environment", var.environment, "JobType", job_type, { stat = "Maximum" }]
+              ]
+            ]),
             [for metric in local.custom_failure_metrics : [".", metric, ".", ".", { stat = "Sum" }]]
           )
         }

@@ -7,7 +7,7 @@
   block, and committed-secret patterns.
 - Backend/frontend tests, type checks, lint, dependency audit, and container builds in CI.
 - ECR high/critical image-scan gate before deployment.
-- Migration task exit-code gate and ECS stable-service gate.
+- Live in-VPC database-capacity and migration exit-code gates plus bounded ECS rollout polling.
 - Manual alert-simulation workflow and AWS Backup monthly restore testing.
 
 ## Release blockers still owned outside infrastructure
@@ -16,8 +16,8 @@
 - The API's current hand-built S3 signer expects static `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`.
   Infrastructure intentionally supplies only task-role credentials; backend must use the AWS credential
   provider/presigner before production uploads work.
-- PostgreSQL `processing_jobs` is the sole active asynchronous queue. SubmitSense has no current Redis
-  or BullMQ dependency; queue metric emission remains deferred to PB-07 and worker autoscaling to PB-08.
+- PostgreSQL `processing_jobs` is the sole active asynchronous queue. PB-07 emits queue metrics and
+  PB-08 scales canonical OCR/vendor/package/scheduled pools without Redis or BullMQ.
 - Textract permissions/endpoints exist, but unsupported OCR ingestion and RFI-PDF export jobs remain disabled until production consumers exist.
 - Aconex/Procore `package_push` and `response_pull` jobs remain disabled pending production consumers, partner approval, and official adapters.
 - Real frontend Cognito sign-in/cookie handling, token revocation, and post-confirmation user-link trigger

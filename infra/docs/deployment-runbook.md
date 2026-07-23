@@ -11,9 +11,10 @@
 4. Confirm the alarm-topic email subscription in AWS.
 5. Populate versioned legal inputs only after approval: `terms_version` and `privacy_version`.
 
-The first pipeline run creates ECR repositories before building. For a manual first deployment, set
-all desired counts to zero, apply the foundation, push images, run the migration task, then restore
-desired counts. This avoids starting the API before the first schema exists.
+The first pipeline run creates ECR repositories before building. For a manual first deployment, apply
+the reviewed tfvars baseline, push images, run the in-VPC database-capacity task, run migrations, then
+explicitly set desired counts within the registered Application Auto Scaling bounds. Do not edit
+Terraform desired counts to chase runtime scaling: Terraform ignores them after bootstrap.
 
 ## Normal deployment
 
@@ -27,12 +28,33 @@ The reusable deployment workflow:
 2. builds three immutable images and pushes them to KMS-encrypted ECR repositories;
 3. fails on high/critical ECR scan findings;
 4. applies infrastructure and registers task definitions;
-5. runs the migration task and requires exit code zero;
-6. rolls ECS services to the new revision with circuit-breaker rollback;
-7. waits for service stability and checks residency tags.
+5. runs `dist/ops/check-db-capacity.js` in the VPC and requires the live database to satisfy the
+   20%-reserve connection budget;
+6. runs the migration task and requires exit code zero;
+7. records prior task definitions, rolls API and frontend with 15-minute bounds, then OCR/vendor/package
+   together and scheduled last with 120-minute bounds;
+8. polls deployment state, desired/running/pending counts, events, and task protection instead of using
+   the unbounded standard waiter; `DEPLOYMENT_BLOCKED`, failed rollout, or timeout triggers diagnostics
+   and reverse-order rollback without force-stopping protected work;
+9. verifies PB-07 metrics, the eight worker scaling alarms, the freshness alarm, and residency tags.
 
-ECS keeps 100% healthy API/frontend capacity during rolling updates. Workers use a 50% minimum so
-long-running work can drain. Job idempotency and the durable database ledger protect retries.
+ECS keeps 100% healthy capacity during all rolling updates and may use 200% while replacing tasks.
+Workers have a 120-second stop timeout. Their task protection is renewed after every successful
+database lease heartbeat; a first signal stops claims and metrics while the active handler and
+heartbeat finish, and the 110-second hard deadline suppresses stale terminal writes before exit.
+
+Application API abuse protection is process-local. It is not a strict distributed quota and does not
+use Redis. Treat it as a bounded safety control; introduce a shared limiter only from measured need and
+a separately reviewed architecture.
+
+## Manual all-zero recovery
+
+The scheduled pool has an autoscaling minimum of one, but an operator can manually set the ECS service
+to zero and leave every PB-07 emitter absent. Missing metrics do not trigger worker scaling:
+`QueueMetricsMissing` alarms after 30 missing one-minute periods. Restore the anchor with
+`aws ecs update-service --cluster CLUSTER --service worker-scheduled --desired-count 1`, verify a
+fresh global and per-`JobType` `QueueDepth` sample, and let Application Auto Scaling resume control.
+Do not add `FILL` to alarms or use queue age as a scaling signal.
 
 ## Database migrations
 
@@ -49,7 +71,7 @@ down migration only when forward repair is unsafe. Never run application traffic
 1. Stop the workflow if still running.
 2. Find the last healthy task-definition revision in ECS deployment history.
 3. Run `aws ecs update-service --cluster CLUSTER --service SERVICE --task-definition FAMILY:REVISION`.
-4. Wait with `aws ecs wait services-stable`, then verify ALB health, errors, and job failures.
+4. Use the bounded deployment poller from `_deploy.yml`, then verify ALB health, errors, and job failures.
 5. Preserve the failed task logs and image digest for investigation.
 
 ## Adding a domain later
