@@ -17,6 +17,7 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
     environment: ${{ inputs.environment }}
     concurrency:
       group: deploy-${{ inputs.environment }}
@@ -104,6 +105,19 @@ jobs:
           terraform show -no-color deploy.tfplan
           terraform apply -auto-approve deploy.tfplan
 
+      - name: Gate database connection capacity in the VPC
+        working-directory: terraform
+        run: |
+          cluster="$(terraform output -raw ecs_cluster_name)"
+          family="$(terraform output -raw db_capacity_check_task_family)"
+          subnets="$(terraform output -json private_subnet_ids | jq -r 'join(",")')"
+          security_group="$(terraform output -raw worker_security_group_id)"
+          task="$(aws ecs run-task --cluster "$cluster" --task-definition "$family" --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$security_group],assignPublicIp=DISABLED}" --query 'tasks[0].taskArn' --output text)"
+          test "$task" != "None"
+          aws ecs wait tasks-stopped --cluster "$cluster" --tasks "$task"
+          exit_code="$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task" --query 'tasks[0].containers[?name==`db-capacity-check`].exitCode | [0]' --output text)"
+          test "$exit_code" = "0" || { aws ecs describe-tasks --cluster "$cluster" --tasks "$task"; exit 1; }
+
       - name: Run migrations
         working-directory: terraform
         run: |
@@ -117,15 +131,121 @@ jobs:
           exit_code="$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task" --query 'tasks[0].containers[?name==`migrations`].exitCode | [0]' --output text)"
           test "$exit_code" = "0" || { aws ecs describe-tasks --cluster "$cluster" --tasks "$task"; exit 1; }
 
-      - name: Roll services forward
+      - name: Roll services forward with bounded polling and rollback
         working-directory: terraform
         run: |
+          set -Eeuo pipefail
           cluster="$(terraform output -raw ecs_cluster_name)"
-          mapfile -t services < <(terraform output -json ecs_service_names | jq -r '.[]')
-          for service in "${services[@]}"; do
-            aws ecs update-service --cluster "$cluster" --service "$service" --task-definition "$cluster-$service" >/dev/null
+          api_service="$(terraform output -raw api_service_name)"
+          frontend_service="$(terraform output -raw frontend_service_name)"
+          api_family="$(terraform output -raw api_task_family)"
+          frontend_family="$(terraform output -raw frontend_task_family)"
+          declare -A worker_services worker_families prior
+          while IFS=$'\t' read -r name service; do worker_services["$name"]="$service"; done < <(terraform output -json worker_service_names | jq -r 'to_entries[] | [.key,.value] | @tsv')
+          while IFS=$'\t' read -r name family; do worker_families["$name"]="$family"; done < <(terraform output -json worker_task_families | jq -r 'to_entries[] | [.key,.value] | @tsv')
+          updated=()
+
+          diagnostics() {
+            local service="$1"
+            echo "::group::Diagnostics for $service"
+            aws ecs describe-services --cluster "$cluster" --services "$service" --include TAGS || true
+            mapfile -t tasks < <(aws ecs list-tasks --cluster "$cluster" --service-name "$service" --query 'taskArns' --output text | tr '\t' '\n' | grep -v '^None$' || true)
+            if ((${#tasks[@]})); then
+              aws ecs describe-tasks --cluster "$cluster" --tasks "${tasks[@]}" || true
+              aws ecs get-task-protection --cluster "$cluster" --tasks "${tasks[@]}" || true
+            fi
+            echo "::endgroup::"
+          }
+
+          wait_service() {
+            local service="$1" minutes="$2" deadline=$((SECONDS + minutes * 60))
+            while ((SECONDS < deadline)); do
+              description="$(aws ecs describe-services --cluster "$cluster" --services "$service" --output json)"
+              echo "$description" | jq '{service: .services[0].serviceName, desired: .services[0].desiredCount, running: .services[0].runningCount, pending: .services[0].pendingCount, deployments: [.services[0].deployments[] | {status, rolloutState, desiredCount, runningCount, pendingCount}], events: [.services[0].events[:5][]?.message]}'
+              if echo "$description" | jq -e '[.services[0].events[:10][]?.message] | any(test("DEPLOYMENT_BLOCKED"))' >/dev/null; then
+                diagnostics "$service"
+                return 1
+              fi
+              if echo "$description" | jq -e '.services[0] as $s | ($s.deployments | length) == 1 and $s.deployments[0].rolloutState == "COMPLETED" and $s.runningCount == $s.desiredCount and $s.pendingCount == 0' >/dev/null; then
+                return 0
+              fi
+              if echo "$description" | jq -e '.services[0].deployments[]? | select(.rolloutState == "FAILED")' >/dev/null; then
+                diagnostics "$service"
+                return 1
+              fi
+              sleep 15
+            done
+            diagnostics "$service"
+            return 1
+          }
+
+          rollback() {
+            status=$?
+            trap - ERR
+            echo "Deployment failed; rolling updated services back in reverse order."
+            for ((index=${#updated[@]}-1; index>=0; index--)); do
+              service="${updated[$index]}"
+              diagnostics "$service"
+              aws ecs update-service --cluster "$cluster" --service "$service" --task-definition "${prior[$service]}" >/dev/null || true
+            done
+            exit "$status"
+          }
+          trap rollback ERR
+
+          for service in "$api_service" "$frontend_service" "${worker_services[ocr]}" "${worker_services[vendor]}" "${worker_services[package]}" "${worker_services[scheduled]}"; do
+            prior["$service"]="$(aws ecs describe-services --cluster "$cluster" --services "$service" --query 'services[0].taskDefinition' --output text)"
+            test "${prior[$service]}" != "None"
           done
-          aws ecs wait services-stable --cluster "$cluster" --services "${services[@]}"
+
+          aws ecs update-service --cluster "$cluster" --service "$api_service" --task-definition "$api_family" >/dev/null
+          updated+=("$api_service")
+          wait_service "$api_service" 15
+
+          aws ecs update-service --cluster "$cluster" --service "$frontend_service" --task-definition "$frontend_family" >/dev/null
+          updated+=("$frontend_service")
+          wait_service "$frontend_service" 15
+
+          for name in ocr vendor package; do
+            service="${worker_services[$name]}"
+            aws ecs update-service --cluster "$cluster" --service "$service" --task-definition "${worker_families[$name]}" >/dev/null
+            updated+=("$service")
+          done
+          worker_waits=()
+          for name in ocr vendor package; do
+            wait_service "${worker_services[$name]}" 120 &
+            worker_waits+=("$!")
+          done
+          for worker_wait in "${worker_waits[@]}"; do wait "$worker_wait"; done
+
+          service="${worker_services[scheduled]}"
+          aws ecs update-service --cluster "$cluster" --service "$service" --task-definition "${worker_families[scheduled]}" >/dev/null
+          updated+=("$service")
+          wait_service "$service" 120
+          trap - ERR
+
+      - name: Verify PB-07 telemetry and PB-08 scaling resources
+        working-directory: terraform
+        run: |
+          environment="${{ inputs.environment }}"
+          namespace="SubmitSense/Jobs"
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          start="$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
+          metrics="$(aws cloudwatch list-metrics --namespace "$namespace" --metric-name QueueDepth --dimensions Name=Environment,Value="$environment" --recently-active PT3H --output json)"
+          test "$(jq '.Metrics | length' <<<"$metrics")" -gt 0
+          test "$(jq '[.Metrics[] | .Dimensions[] | select(.Name=="JobType").Value] | unique | length' <<<"$metrics")" -eq 11
+          job_type="$(jq -r '.Metrics[] | .Dimensions[] | select(.Name=="JobType").Value' <<<"$metrics" | head -n1)"
+          test -n "$job_type"
+          metric_data="$(aws cloudwatch get-metric-data \
+            --start-time "$start" --end-time "$now" \
+            --metric-data-queries "[{\"Id\":\"q\",\"MetricStat\":{\"Metric\":{\"Namespace\":\"$namespace\",\"MetricName\":\"QueueDepth\",\"Dimensions\":[{\"Name\":\"Environment\",\"Value\":\"$environment\"},{\"Name\":\"JobType\",\"Value\":\"$job_type\"}]},\"Period\":60,\"Stat\":\"Maximum\"},\"ReturnData\":true}]" \
+            --output json)"
+          test "$(jq -r '.MetricDataResults[0].StatusCode' <<<"$metric_data")" = "Complete"
+          test "$(jq '.MetricDataResults[0].Values | length' <<<"$metric_data")" -gt 0
+          aws cloudwatch describe-alarms --alarm-name-prefix "submitsense-$environment-worker-" --query 'MetricAlarms[].[AlarmName,ActionsEnabled,TreatMissingData]' --output table
+          test "$(aws cloudwatch describe-alarms --alarm-name-prefix "submitsense-$environment-worker-" --query 'length(MetricAlarms)' --output text)" -eq 8
+          test "$(aws cloudwatch describe-alarms --alarm-names "submitsense-$environment-queue-metrics-missing" --query 'length(MetricAlarms)' --output text)" -eq 1
+          test "$(aws application-autoscaling describe-scalable-targets --service-namespace ecs --query \"length(ScalableTargets[?contains(ResourceId, 'service/submitsense-$environment/')])\" --output text)" -eq 6
+          test "$(aws application-autoscaling describe-scaling-policies --service-namespace ecs --query \"length(ScalingPolicies[?contains(ResourceId, 'service/submitsense-$environment/')])\" --output text)" -eq 10
 
       - name: Verify Australian residency configuration
         env:

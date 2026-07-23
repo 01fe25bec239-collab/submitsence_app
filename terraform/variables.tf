@@ -101,17 +101,59 @@ variable "worker_memory" {
   type    = number
   default = 2048
 }
-variable "api_desired_count" {
-  type    = number
-  default = 1
+variable "api_capacity" {
+  type = object({
+    initial  = number
+    min      = number
+    max      = number
+    pool_max = number
+  })
+  validation {
+    condition = (
+      var.api_capacity.min >= 1 &&
+      var.api_capacity.initial >= var.api_capacity.min &&
+      var.api_capacity.initial <= var.api_capacity.max &&
+      contains([5, 10], var.api_capacity.pool_max)
+    )
+    error_message = "api_capacity initial must be within min/max, min must be at least one, and pool_max must be 5 or 10."
+  }
 }
-variable "frontend_desired_count" {
-  type    = number
-  default = 1
+
+variable "frontend_capacity" {
+  type = object({
+    initial = number
+    min     = number
+    max     = number
+  })
+  validation {
+    condition = (
+      var.frontend_capacity.min >= 1 &&
+      var.frontend_capacity.initial >= var.frontend_capacity.min &&
+      var.frontend_capacity.initial <= var.frontend_capacity.max
+    )
+    error_message = "frontend_capacity initial must be within min/max and min must be at least one."
+  }
 }
-variable "worker_desired_count" {
-  type    = number
-  default = 1
+
+variable "worker_capacities" {
+  type = map(object({
+    initial = number
+    min     = number
+    max     = number
+  }))
+  validation {
+    condition = (
+      toset(keys(var.worker_capacities)) == toset(["ocr", "vendor", "package", "scheduled"]) &&
+      alltrue([
+        for name, capacity in var.worker_capacities :
+        capacity.min >= 0 &&
+        capacity.initial >= capacity.min &&
+        capacity.initial <= capacity.max &&
+        (name == "scheduled" ? capacity.min == 1 : capacity.min == 0)
+      ])
+    )
+    error_message = "worker_capacities must define ocr, vendor, package, and scheduled; initial must be within bounds; only scheduled has min 1."
+  }
 }
 
 variable "db_instance_class" {

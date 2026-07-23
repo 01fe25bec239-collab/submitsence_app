@@ -5,7 +5,9 @@ import test from "node:test";
 import { ServiceUnavailableException } from "@nestjs/common";
 import { ApiService } from "../src/api/api.service";
 import type { AuthContext } from "../src/auth/auth.types";
-import { documentProcessingJobTypes, processingJobRegistry, syncJobRegistry } from "../src/job-types";
+import { configuredPoolMax, createPool } from "../src/db.module";
+import { documentProcessingJobTypes, processingJobRegistry, syncJobRegistry, workerPools } from "../src/job-types";
+import { evaluateDbCapacity } from "../src/ops/check-db-capacity";
 import { configuredJobTypes, registeredWorkerJobTypes } from "../src/worker/worker";
 
 const tenantId = "10000000-0000-4000-8000-000000000001";
@@ -43,10 +45,52 @@ function serviceWithoutDatabase() {
 
 test("production worker handlers exactly cover the supported asynchronous registry", () => {
   assert.deepEqual([...registeredWorkerJobTypes].sort(), [...processingJobRegistry.asynchronous].sort());
-  assert.deepEqual(configuredJobTypes(), [...processingJobRegistry.asynchronous]);
+  assert.throws(() => configuredJobTypes(undefined), /WORKER_JOB_TYPES is required/);
+  assert.throws(() => configuredJobTypes("   "), /WORKER_JOB_TYPES is required/);
   assert.deepEqual(configuredJobTypes(" ingest_vendor_catalogue, product_rematch "), ["ingest_vendor_catalogue", "product_rematch"]);
   assert.throws(() => configuredJobTypes("ingest_spec"), /Unsupported WORKER_JOB_TYPES entry/);
+  assert.throws(() => configuredJobTypes("product_rematch,product_rematch"), /must not contain duplicates/);
   assert.ok(!registeredWorkerJobTypes.includes("package_draft" as never));
+});
+
+test("canonical worker pools map every supported job exactly once with scheduled as the sole anchor", () => {
+  const enabledPools = Object.entries(workerPools).filter(([, pool]) => pool.enabled);
+  assert.deepEqual(enabledPools.map(([name]) => name), ["ocr", "vendor", "package", "scheduled"]);
+  assert.deepEqual(enabledPools.filter(([, pool]) => pool.anchor).map(([name]) => name), ["scheduled"]);
+  assert.deepEqual(enabledPools.flatMap(([, pool]) => pool.jobTypes).sort(), [...processingJobRegistry.asynchronous].sort());
+  assert.equal(new Set(enabledPools.flatMap(([, pool]) => pool.jobTypes)).size, processingJobRegistry.asynchronous.length);
+  assert.ok(!("integration" in workerPools));
+});
+
+test("PG_POOL_MAX is optional and otherwise must be a positive integer", () => {
+  assert.equal(configuredPoolMax(undefined), undefined);
+  assert.equal(configuredPoolMax("3"), 3);
+  for (const invalid of ["", " ", "0", "-1", "3.5", "nope"]) {
+    assert.throws(() => configuredPoolMax(invalid), /positive integer/);
+  }
+  const prior = process.env.PG_POOL_MAX;
+  process.env.PG_POOL_MAX = "3";
+  try {
+    const pool = createPool();
+    assert.equal(pool.options.max, 3);
+    void pool.end();
+  } finally {
+    if (prior === undefined) delete process.env.PG_POOL_MAX;
+    else process.env.PG_POOL_MAX = prior;
+  }
+});
+
+test("database capacity gate reserves 20 percent and fails closed below the required total", () => {
+  assert.deepEqual(evaluateDbCapacity(112, 61, 20), {
+    maxConnections: 112,
+    usableConnections: 89,
+    requiredConnections: 61,
+    reservePercent: 20,
+    sufficient: true,
+  });
+  assert.equal(evaluateDbCapacity(100, 81, 20).sufficient, false);
+  assert.throws(() => evaluateDbCapacity(112, 61, 100), /less than 100/);
+  assert.throws(() => evaluateDbCapacity(Number.NaN, 61, 20), /invalid max_connections/);
 });
 
 test("unsupported upload API paths fail before opening a transaction", async () => {

@@ -88,6 +88,6 @@ jobs:
       - run: bash -n infra/scripts/*.sh
       - run: infra/scripts/static-infra-check.sh
       - run: docker build -f backend/Dockerfile -t submitsense-backend:ci .
-      - run: docker run --rm submitsense-backend:ci sh -c 'test -f dist/main.js && test -f dist/worker/worker.js && ! test -e node_modules/typescript && ! test -e node_modules/.bin/tsx'
+      - run: docker run --rm submitsense-backend:ci sh -c 'test -f dist/main.js && test -f dist/worker/worker.js && test -f dist/worker-pools.json && test -f dist/ops/check-db-capacity.js && ! test -e node_modules/typescript && ! test -e node_modules/.bin/tsx'
       - run: docker build -f backend/Dockerfile.migrations -t submitsense-migrations:ci .
       - run: docker build -f web/Dockerfile -t submitsense-frontend:ci .

@@ -117,6 +117,11 @@ resource "aws_iam_role" "worker_task" {
 data "aws_iam_policy_document" "worker_task" {
   for_each = local.worker_services
   statement {
+    sid       = "TaskProtection"
+    actions   = ["ecs:GetTaskProtection", "ecs:UpdateTaskProtection"]
+    resources = ["*"]
+  }
+  statement {
     sid       = "ApplicationBucketList"
     actions   = ["s3:GetBucketLocation", "s3:ListBucket"]
     resources = values(module.storage.bucket_arns)
@@ -152,14 +157,6 @@ data "aws_iam_policy_document" "worker_task" {
         variable = "aws:RequestedRegion"
         values   = [var.primary_region]
       }
-    }
-  }
-  dynamic "statement" {
-    for_each = each.key == "integration" ? [1] : []
-    content {
-      sid       = "ApprovedIntegrationSecrets"
-      actions   = ["secretsmanager:GetSecretValue"]
-      resources = [aws_secretsmanager_secret.integrations.arn]
     }
   }
 }

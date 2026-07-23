@@ -102,11 +102,26 @@ data "aws_iam_policy_document" "github_deploy" {
   statement {
     sid = "SubmitSenseInfrastructure"
     actions = [
-      "acm:*", "application-autoscaling:*", "backup:*", "budgets:*", "cloudtrail:*", "cloudwatch:*",
+      "acm:*", "application-autoscaling:*", "backup:*", "budgets:*", "cloudtrail:*",
       "cognito-idp:*", "ec2:*", "ecr:*", "ecs:*", "elasticloadbalancing:*",
       "events:*", "kms:*", "logs:*", "rds:*", "route53:*", "s3:*",
       "secretsmanager:*", "servicediscovery:*", "sns:*", "wafv2:*"
     ]
+    resources = ["*"]
+  }
+  statement {
+    sid = "TerraformCloudWatchManagement"
+    actions = [
+      "cloudwatch:DeleteAlarms", "cloudwatch:DeleteDashboards", "cloudwatch:DescribeAlarms",
+      "cloudwatch:DescribeAlarmsForMetric", "cloudwatch:GetDashboard", "cloudwatch:ListDashboards",
+      "cloudwatch:ListTagsForResource", "cloudwatch:PutDashboard", "cloudwatch:PutMetricAlarm",
+      "cloudwatch:SetAlarmState", "cloudwatch:TagResource", "cloudwatch:UntagResource"
+    ]
+    resources = ["*"]
+  }
+  statement {
+    sid       = "DeploymentMetricVerification"
+    actions   = ["cloudwatch:GetMetricData", "cloudwatch:ListMetrics"]
     resources = ["*"]
   }
   statement {

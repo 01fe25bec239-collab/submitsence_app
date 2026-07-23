@@ -1,3 +1,5 @@
+import workerPoolsJson from "./worker-pools.json";
+
 export const processingJobRegistry = {
   asynchronous: [
     "product_rematch",
@@ -46,3 +48,25 @@ const supportedProcessingJobTypes = new Set<string>(processingJobRegistry.asynch
 export function isSupportedProcessingJobType(jobType: string): jobType is SupportedProcessingJobType {
   return supportedProcessingJobTypes.has(jobType);
 }
+
+export type WorkerPoolName = keyof typeof workerPoolsJson;
+export type WorkerPoolConfig = {
+  enabled: boolean;
+  anchor?: boolean;
+  jobTypes: SupportedProcessingJobType[];
+};
+
+function validatedWorkerPools(): Record<WorkerPoolName, WorkerPoolConfig> {
+  const pools = workerPoolsJson as Record<WorkerPoolName, { enabled: boolean; anchor?: boolean; jobTypes: string[] }>;
+  const enabled = Object.entries(pools).filter(([, pool]) => pool.enabled);
+  const assigned = enabled.flatMap(([, pool]) => pool.jobTypes);
+  const duplicates = assigned.filter((jobType, index) => assigned.indexOf(jobType) !== index);
+  const unsupported = assigned.filter((jobType) => !isSupportedProcessingJobType(jobType));
+  const missing = processingJobRegistry.asynchronous.filter((jobType) => !assigned.includes(jobType));
+  if (duplicates.length || unsupported.length || missing.length || enabled.filter(([, pool]) => pool.anchor).length !== 1) {
+    throw new Error("worker-pools.json must map every supported asynchronous job exactly once and declare exactly one enabled anchor");
+  }
+  return pools as Record<WorkerPoolName, WorkerPoolConfig>;
+}
+
+export const workerPools = validatedWorkerPools();

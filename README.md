@@ -9,8 +9,9 @@ packages, and tracks submittal status — with a licensed human always the final
 
 TypeScript-first on AWS Australia (`ap-southeast-2`): Next.js + NestJS, PostgreSQL 17 + pgvector
 (RDS), S3, and Cognito. PostgreSQL `processing_jobs` is the authoritative asynchronous queue;
-SubmitSense does not currently depend on Redis or BullMQ. Reconsider them only for a measured future
-requirement. Queue metrics are deferred to PB-07 and worker autoscaling to PB-08. Modular monolith.
+SubmitSense does not depend on Redis or BullMQ. PB-07 emits queue telemetry directly from the ledger;
+PB-08 scales dedicated ECS worker pools from per-`JobType` metric math and keeps the scheduled metrics
+anchor at a minimum of one task. Modular monolith.
 
 ## Repo layout
 

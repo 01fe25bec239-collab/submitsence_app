@@ -8,9 +8,14 @@ db_instance_class       = "db.t4g.micro"
 db_allocated_storage    = 20
 db_max_allocated_storage = 100
 db_backup_retention_days = 7
-api_desired_count       = 1
-frontend_desired_count  = 1
-worker_desired_count    = 0
+api_capacity            = { initial = 1, min = 1, max = 3, pool_max = 5 }
+frontend_capacity       = { initial = 1, min = 1, max = 3 }
+worker_capacities = {
+  ocr       = { initial = 0, min = 0, max = 1 }
+  vendor    = { initial = 0, min = 0, max = 1 }
+  package   = { initial = 0, min = 0, max = 1 }
+  scheduled = { initial = 1, min = 1, max = 2 }
+}
 monthly_budget_usd      = 150
 
 # Add these together after purchasing a domain and creating its Route53 zone.

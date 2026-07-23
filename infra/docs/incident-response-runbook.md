@@ -22,11 +22,10 @@ forward, and rerun. Never edit production migration history to make a failure di
 ## Queue backlog or failed workers
 
 Check queue-depth/custom failure alarms, ECS desired/running counts, RDS connections, and worker logs.
-Scale only the affected worker service. Preserve idempotency keys; never bulk-reset
-`running` jobs without identifying crashed tasks and the safe retry window.
-
-The integration worker is intentionally idle until approved provider adapters exist. Do not enable
-non-Australian endpoints to clear a backlog.
+Inspect the affected pool's metric-math alarm and Application Auto Scaling activity before manually
+scaling it. Preserve idempotency keys; never bulk-reset `running` jobs without identifying crashed
+tasks and the safe retry window. If all workers are zero and telemetry is missing, restore
+`worker-scheduled` to desired count one; do not enable non-Australian endpoints to clear a backlog.
 
 ## Compromised secret
 

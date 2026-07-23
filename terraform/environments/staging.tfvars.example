@@ -8,9 +8,14 @@ db_instance_class        = "db.t4g.medium"
 db_allocated_storage     = 50
 db_max_allocated_storage = 250
 db_backup_retention_days = 14
-api_desired_count        = 2
-frontend_desired_count   = 2
-worker_desired_count     = 1
+api_capacity             = { initial = 2, min = 2, max = 3, pool_max = 10 }
+frontend_capacity        = { initial = 2, min = 2, max = 3 }
+worker_capacities = {
+  ocr       = { initial = 0, min = 0, max = 2 }
+  vendor    = { initial = 0, min = 0, max = 2 }
+  package   = { initial = 0, min = 0, max = 2 }
+  scheduled = { initial = 1, min = 1, max = 3 }
+}
 monthly_budget_usd       = 500
 
 root_domain     = ""

@@ -38,15 +38,21 @@ dimensions are allowed. Dashboard gauges use `Maximum`.
 
 ## Alarms
 
-`QueueDepthHigh` is the backlog alarm. It retains the environment-specific queue thresholds and treats
-missing telemetry as `notBreaching`. `QueueMetricsMissing` is the separate dead-man's switch: when
-workers are configured, 30 consecutive missing one-minute `QueueDepth` periods alarm because missing
-data is breaching while every real value is non-negative. Development configures zero workers, so it
-does not create the freshness alarm.
+`QueueDepthHigh` is the global backlog alert and treats missing telemetry as `notBreaching`.
+`QueueMetricsMissing` is an unconditional alert-only dead-man's switch: 30 consecutive missing
+one-minute `QueueDepth` periods alarm because missing data is breaching while every real value is
+non-negative. It never invokes scaling.
+
+Each canonical worker pool has two metric-math alarms over only its mapped `JobType` series. Every
+input uses `SubmitSense/Jobs`, `QueueDepth`, `Environment` plus `JobType`, 60 seconds, and `Maximum`;
+only the final sum expression returns data and no expression uses `FILL`. One datapoint at or above one
+adds one task with a 60-second cooldown. Fifteen consecutive zero datapoints remove one task with a
+900-second cooldown. Missing data is `notBreaching`, so absence never bootstraps capacity. OCR, vendor,
+and package have minimum zero; scheduled has minimum one and is the telemetry anchor.
 
 `OldestJobAgeSeconds` is emitted and dashboard-visible. `OldestJobAgeHigh` is intentionally deferred.
 It may be added only after staging observations, an owner-approved queue-age SLO, and a threshold
-derived from observed data. PB-08 worker autoscaling remains deferred.
+derived from observed data. Queue age remains dashboard-only and is never a scaling signal.
 
 ## Networking, failure, and rollback
 
@@ -64,7 +70,8 @@ backlog. On the first deployment, apply migration 0023 before starting the new w
 leader publishes its first snapshot immediately. Roll back the worker and migration together; dropping
 the function is safe only after old emitters have stopped. A rollback removes telemetry, so the
 freshness alarm should be expected to fire
-until workers emitting PB-07 are restored or deliberately scaled to zero.
+until workers emitting PB-07 are restored. If all emitters are manually set to zero, restore
+`worker-scheduled` to desired count one; missing telemetry deliberately cannot scale it back up.
 
 ## Staging validation
 

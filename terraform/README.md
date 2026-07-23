@@ -29,18 +29,25 @@ State uses an S3 backend with KMS encryption, versioning, TLS-only policy, and n
 Generated database credentials therefore exist in encrypted state and Secrets Manager, but never in
 source. Stripe and approved integration secrets are populated out of band.
 
-## Queue architecture and removal impact
+## Queue and scaling architecture
 
-PostgreSQL `processing_jobs` is the authoritative asynchronous queue. SubmitSense does not currently
-depend on Redis or BullMQ; reconsider either only for a measured future requirement. Queue metrics are
-deferred to PB-07 and worker autoscaling to PB-08.
+PostgreSQL `processing_jobs` is the authoritative asynchronous queue. SubmitSense does not depend on
+Redis or BullMQ; reconsider either only for a measured future requirement. The canonical pool-to-job
+mapping is `backend/src/worker-pools.json`, which Terraform reads directly. OCR, vendor, and package
+pools scale from zero. The scheduled pool is the always-on PB-07 telemetry anchor and can scale above
+one. Worker scale-out and scale-in are `StepScaling` policies driven by per-pool metric-math alarms over
+the mapped `QueueDepth` `JobType` series. API and frontend use 60% CPU target tracking.
 
-Applying this change to an existing environment destroys the ElastiCache replication group, its subnet
-and security groups, its secret/version, and its alarms; Secrets Manager deletion follows the configured
-recovery window. Apply and check staging first: confirm no runtime task consumes Redis configuration,
-review the Terraform plan, and verify only those intended resources are destroyed. Production apply
-requires explicit approval after that review. Because bootstrap state owns the deployment-role policy,
-apply its ElastiCache permission removal only after the environment resources have been removed.
+Application Auto Scaling owns desired counts after the baseline is created; Terraform ignores
+`desired_count` and service `task_definition` drift. To change a baseline, review and apply the tfvars
+change, then explicitly set the ECS desired count inside the new bounds. Application Auto Scaling
+resumes from that value. Never suspend scaling during deployment.
+
+The plan-time database gate budgets the API at 200% of its maximum task count, every worker at 200% of
+its maximum with a three-connection pool, and one migration connection. Required/planned/80%-usable
+totals are dev `61/112/89`, staging `115/450/360`, and production `297/1802/1441`. Deployment repeats
+the check against live `SHOW max_connections` from a one-off task in the application VPC before
+migrations.
 
 Do not commit `.tfvars`, backend configuration containing account data, plans, or state.
 
@@ -50,6 +57,8 @@ Do not commit `.tfvars`, backend configuration containing account data, plans, o
 terraform fmt -check -recursive terraform
 terraform -chdir=terraform init -backend=false
 terraform -chdir=terraform validate
+terraform -chdir=terraform/bootstrap init -backend=false
+terraform -chdir=terraform/bootstrap validate
 infra/scripts/static-infra-check.sh
 ```
 
