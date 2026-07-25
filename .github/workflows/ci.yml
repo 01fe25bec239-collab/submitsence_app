@@ -86,8 +86,43 @@ jobs:
       - name: Run database guardrails
         run: |
           for test_file in db/test/test*.sql; do
+            [[ "$test_file" == "db/test/test_migration_control.sql" ]] && continue
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$test_file"
           done
+      - name: Apply PB-10 migration control schema
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/control/control-schema.sql
+      - name: Verify control-schema re-application fails closed
+        run: |
+          if psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/control/control-schema.sql; then
+            echo "re-application unexpectedly succeeded"
+            exit 1
+          fi
+          test "$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'migration_control' and c.relkind = 'r'")" = "2"
+      - name: Test migration control schema and advisory lock
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/test/test_migration_control.sql
+      - name: Test read-only migration plan
+        run: node --import tsx --test test/migration-runner.test.ts
+        working-directory: backend
+      - name: Verify real migration plan is read-only
+        run: |
+          before="$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from migration_control.migration_runs)")"
+          npm run --silent migrate:plan --prefix backend > /tmp/migration-plan.json
+          after="$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from migration_control.migration_runs)")"
+          test "$before" = "0:0"
+          test "$after" = "$before"
+          node -e 'const plan = require("/tmp/migration-plan.json"); if (plan.pendingCount !== 24) process.exit(1)'
+      - name: Verify plan fails closed on legacy ledger divergence
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
+            -c "create table public.infrastructure_schema_migrations (filename text primary key, applied_at timestamptz not null default now())" \
+            -c "insert into public.infrastructure_schema_migrations(filename) values ('0001_extensions_helpers.sql')"
+          if npm run --silent migrate:plan --prefix backend > /tmp/divergence.json 2>/tmp/divergence.err; then
+            echo "plan unexpectedly succeeded against an unbaselined legacy ledger"
+            exit 1
+          fi
+          grep -q "Legacy migration ledger public.infrastructure_schema_migrations" /tmp/divergence.err
+          test "$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from public.infrastructure_schema_migrations)")" = "0:1"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c "drop table public.infrastructure_schema_migrations"
       - run: node --import tsx --test test/commercial-webhook.integration.test.ts
         working-directory: backend
 
