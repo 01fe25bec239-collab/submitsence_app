@@ -105,6 +105,17 @@ async function readQueueMetrics(client: PoolClient): Promise<QueueMetricRow[]> {
   }
 }
 
+/**
+ * Sleep until the timer fires, the shutdown signal aborts, or the wake promise
+ * resolves, whichever comes first.
+ *
+ * The timer is deliberately left ref'd. An unref'd timer does not keep the event
+ * loop alive, so if nothing else has pending work the loop drains, the timer
+ * never fires, and this promise never settles — which strands the caller and, in
+ * turn, the `await Promise.all([worker, metrics])` the worker shuts down on.
+ * Prompt exit comes from `signal`, which resolves this immediately and clears
+ * the timer, not from unref'ing it.
+ */
 function wait(ms: number, signal: AbortSignal, wake?: Promise<void>): Promise<"timer" | "abort" | "wake"> {
   if (signal.aborted) return Promise.resolve("abort");
   return new Promise((resolve) => {
@@ -118,10 +129,35 @@ function wait(ms: number, signal: AbortSignal, wake?: Promise<void>): Promise<"t
     };
     const aborted = () => finish("abort");
     const timer = setTimeout(() => finish("timer"), ms);
-    timer.unref();
     signal.addEventListener("abort", aborted, { once: true });
     wake?.then(() => finish("wake"));
   });
+}
+
+/**
+ * Publish one snapshot under a bounded timeout.
+ *
+ * AbortSignal.timeout() installs an unref'd timer too, so a hung publication
+ * would never time out once the loop is otherwise idle. An owned timer stays
+ * ref'd while the request is in flight and is cleared the moment it settles, so
+ * it neither strands the caller nor outlives the request it bounds.
+ */
+async function publishQueueMetrics(
+  cloudwatch: CloudWatchClient,
+  command: PutMetricDataCommand,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<void> {
+  const timeout = new AbortController();
+  const timer = setTimeout(
+    () => timeout.abort(new Error(`queue metrics publication exceeded ${timeoutMs}ms`)),
+    timeoutMs,
+  );
+  try {
+    await cloudwatch.send(command, { abortSignal: AbortSignal.any([signal, timeout.signal]) });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function errorValue(error: unknown): Error {
@@ -206,9 +242,11 @@ export async function runQueueMetrics(pool: Pool, cloudwatch: CloudWatchClient, 
         if (options.signal.aborted) break;
 
         try {
-          await cloudwatch.send(
+          await publishQueueMetrics(
+            cloudwatch,
             new PutMetricDataCommand({ Namespace: QUEUE_METRICS_NAMESPACE, MetricData: buildQueueMetricData(options.environment, rows) }),
-            { abortSignal: AbortSignal.any([options.signal, AbortSignal.timeout(timeoutMs)]) },
+            options.signal,
+            timeoutMs,
           );
         } catch (error) {
           warn("[queue-metrics] CloudWatch publication failed", error);
