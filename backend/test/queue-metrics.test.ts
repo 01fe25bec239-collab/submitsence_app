@@ -157,6 +157,55 @@ test("CloudWatch rejection and timeout remain non-fatal and abort publication", 
   }
 });
 
+test("the publication timeout fires and aborts the in-flight request without external timers", async () => {
+  const events: string[] = [];
+  const client = new FakeClient(events);
+  const controller = new AbortController();
+  let observed: AbortSignal | undefined;
+  let abortReason: unknown;
+  await runQueueMetrics(poolOf(client), cloudwatch(async (_command, options) => {
+    observed = options?.abortSignal;
+    // Only the loop's own timeout timer can settle this; nothing else keeps the
+    // event loop alive, so an unref'd timeout would strand the run forever.
+    await new Promise<void>((_resolve, reject) => options?.abortSignal?.addEventListener("abort", () => {
+      abortReason = options.abortSignal?.reason;
+      reject(new Error("aborted"));
+    }, { once: true }));
+  }), {
+    environment: "staging",
+    signal: controller.signal,
+    publishMs: 60_000,
+    timeoutMs: 5,
+    warn: (message) => {
+      if (message.includes("CloudWatch")) controller.abort();
+    },
+  });
+  assert.equal(observed?.aborted, true);
+  assert.match(String((abortReason as Error)?.message ?? abortReason), /exceeded 5ms/);
+  assert.deepEqual(events.slice(-2), ["unlock", "release"]);
+});
+
+test("retry waits advance the loop with no external keepalive handle", async () => {
+  const events: string[] = [];
+  const client = new FakeClient(events, false);
+  const controller = new AbortController();
+  // Abort from inside the loop after the third probe. Nothing outside
+  // runQueueMetrics holds the event loop open, so the retry sleep itself must
+  // keep it alive; an unref'd timer drains the loop and never resumes.
+  const probe = client.query.bind(client);
+  let probes = 0;
+  client.query = async (sql: string, values?: unknown[]) => {
+    const result = await probe(sql, values);
+    if (sql.includes("pg_try_advisory_lock") && ++probes === 3) controller.abort();
+    return result;
+  };
+  await runQueueMetrics(poolOf(client), cloudwatch(async () => assert.fail("non-leader published")), {
+    environment: "staging", signal: controller.signal, retryMs: 1,
+  });
+  assert.equal(probes, 3);
+  assert.equal(events.filter((event) => event === "release").length, 3);
+});
+
 test("shared abort cancels an in-flight publication", async () => {
   const client = new FakeClient([]);
   const controller = new AbortController();
@@ -191,17 +240,14 @@ test("connection loss discards the leader and hands over to a new session", asyn
   const second = new FakeClient(events);
   const controller = new AbortController();
   let sends = 0;
-  const keepAlive = setInterval(() => undefined, 60_000);
-  try {
-    await runQueueMetrics(poolOf(first, second), cloudwatch(async () => {
-      sends += 1;
-      if (sends === 1) setImmediate(() => first.emit("error", new Error("socket lost")));
-      else controller.abort();
-      return {};
-    }), { environment: "staging", signal: controller.signal, retryMs: 1, publishMs: 60_000 });
-  } finally {
-    clearInterval(keepAlive);
-  }
+  // No external keepalive timer: handover must be driven entirely by the loop's
+  // own ref'd retry timer and the leadership-lost wake.
+  await runQueueMetrics(poolOf(first, second), cloudwatch(async () => {
+    sends += 1;
+    if (sends === 1) setImmediate(() => first.emit("error", new Error("socket lost")));
+    else controller.abort();
+    return {};
+  }), { environment: "staging", signal: controller.signal, retryMs: 1, publishMs: 60_000 });
   assert.equal(sends, 2);
   assert.match(first.releasedWith?.message ?? "", /socket lost/);
   assert.deepEqual(events.slice(-2), ["unlock", "release"]);
