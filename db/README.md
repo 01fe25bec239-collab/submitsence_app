@@ -66,13 +66,48 @@ PB-10 Step 2 adds the `migration_control` control schema with exactly two perman
 - `migration_runs` is an INSERT-only event stream. Each heartbeat or terminal outcome is a new
   event; previous events are never updated or deleted.
 
+Both tables reject UPDATE and DELETE with row-level triggers and TRUNCATE with statement-level
+triggers, all `ENABLE ALWAYS`. `operation_categories` must use the canonical manifest order
+(`schema`, `data-correction`, `security-policy`, `function-replacement`, `index`, `seed-reference`),
+enforced at INSERT time by `sm_categories_order_ck`: because applied rows are immutable, a row that
+disagrees with the manifest could never be repaired.
+
 PUBLIC and the `submitsense_app` runtime role have no control-schema access. Schema work is
 serialized with the session advisory lock `(1398096461, 1)`: the runner uses a dedicated pinned
 connection, polls `pg_try_advisory_lock` every five seconds for at most sixty seconds, reports only
-redacted holder diagnostics, and explicitly verifies unlock before releasing the connection.
+redacted holder diagnostics, and explicitly verifies unlock before releasing the connection. Before
+the first probe it sets `statement_timeout` (30 s) and `lock_timeout` (5 s) on that connection, so a
+plan blocked behind concurrent DDL cannot hold the schema lock indefinitely.
 
-After installing `backend/src/db/migrate/control-schema.sql` on a disposable or approved target,
-render the deterministic JSON plan with:
+### Installing the control schema
+
+The SQL lives at `db/control/control-schema.sql`. It sits under `db/`, so the existing migration
+image (`backend/Dockerfile.migrations`, which already does `COPY db ./db`) carries it at
+`/workspace/db/control/control-schema.sql` with no new deployment mechanism and no Dockerfile
+change. The supported command, from the repository root or inside that image, is:
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/control/control-schema.sql
+```
+
+- **Ownership.** Run it as the migration owner — the same role `infra/scripts/migrate.sh` uses. That
+  role owns the schema, both tables, both functions, and the sequence, and is the only role able to
+  INSERT. Do not install it as `submitsense_runtime` or any application login role.
+- **`submitsense_app` prerequisite.** Not required. The role is normally created by
+  `0001_extensions_helpers.sql`, but the installer skips its `REVOKE` statements when the role does
+  not yet exist, so a bare database works. When the role is created later it receives no
+  control-schema privileges, because nothing grants any. `runner.ts` verifies the absence either way
+  via `to_regrole`.
+- **Re-application.** The file is not idempotent by design. It runs as one transaction, so a second
+  application fails closed with SQLSTATE `42P06` (`schema "migration_control" already exists`) and
+  changes nothing. To re-check an existing installation, run the plan — its verifier fails closed on
+  any catalog drift rather than repairing it.
+- **Not a migration.** It is deliberately outside `db/migrations/`, so it is absent from the manifest
+  and is never applied by `migrate.sh`. No persistent environment has it installed today.
+
+### Rendering the plan
+
+After installing on a disposable or approved target, render the deterministic JSON plan with:
 
 ```bash
 npm run migrate:plan --prefix backend
@@ -84,6 +119,13 @@ migration SQL and inserts no ledger or run-event rows. Current legacy checksums 
 historical bytes a persistent environment executed, and persistent environments have not been
 baselined. `infra/scripts/migrate.sh` remains the production executor; migration execution in
 `runner.ts` is intentionally not implemented in Step 2.
+
+The plan also refuses to guess. `migrate.sh` records applied migrations in
+`public.infrastructure_schema_migrations`, a ledger the control schema knows nothing about. If that
+table exists with rows while `migration_control.schema_migrations` is empty, the environment was
+migrated but never baselined, so the applied set is unknown rather than empty — the plan fails
+closed instead of reporting all 24 migrations as pending. It never reads those rows, and never
+copies them into the new ledger; baseline adoption is not implemented in Step 2.
 
 ## Runtime connection (required for RLS to work)
 

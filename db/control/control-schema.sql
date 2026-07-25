@@ -1,8 +1,47 @@
+-- PB-10 Step 2 migration control schema.
+--
+-- Install (disposable or approved target only). The migration image already
+-- carries this file at /workspace/db/control/control-schema.sql:
+--   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/control/control-schema.sql
+--
+-- Runs as a single transaction, so re-application fails closed with SQLSTATE
+-- 42P06 and changes nothing. See db/README.md for ownership and prerequisites.
+
 begin;
 
 create schema migration_control;
 revoke all on schema migration_control from public;
-revoke all on schema migration_control from submitsense_app;
+
+-- Canonical manifest category order, mirroring OPERATION_CATEGORIES in
+-- backend/src/db/migrate/manifest.ts. Used by sm_categories_order_ck so a
+-- semantically equivalent but differently ordered array is rejected at INSERT
+-- time, rather than permanently wedging the read-only plan against a row that
+-- can never be updated or deleted.
+create function migration_control.canonical_operation_categories(categories text[])
+returns text[]
+language sql
+immutable
+returns null on null input
+set search_path = pg_catalog, pg_temp
+as $$
+  select array(
+    select category
+      from unnest(categories) as category
+     order by array_position(
+       array[
+         'schema',
+         'data-correction',
+         'security-policy',
+         'function-replacement',
+         'index',
+         'seed-reference'
+       ]::text[],
+       category
+     )
+  )
+$$;
+
+revoke execute on function migration_control.canonical_operation_categories(text[]) from public;
 
 create table migration_control.schema_migrations (
   migration_id text primary key,
@@ -47,6 +86,10 @@ create table migration_control.schema_migrations (
       + (case when 'function-replacement' = any(operation_categories) then 1 else 0 end)
       + (case when 'index' = any(operation_categories) then 1 else 0 end)
       + (case when 'seed-reference' = any(operation_categories) then 1 else 0 end)
+  ),
+  constraint sm_categories_order_ck check (
+    operation_categories
+      = migration_control.canonical_operation_categories(operation_categories)
   ),
   constraint sm_mode_ck check (
     execution_mode in ('legacy-verbatim', 'transactional', 'nontransactional', 'batched')
@@ -210,7 +253,6 @@ end
 $$;
 
 revoke execute on function migration_control.reject_ledger_mutation() from public;
-revoke execute on function migration_control.reject_ledger_mutation() from submitsense_app;
 
 create trigger schema_migrations_reject_mutation
 before update or delete on migration_control.schema_migrations
@@ -220,14 +262,42 @@ create trigger migration_runs_reject_mutation
 before update or delete on migration_control.migration_runs
 for each row execute function migration_control.reject_ledger_mutation();
 
+-- TRUNCATE does not fire row-level triggers, so the immutable applied set and
+-- the insert-only event stream need statement-level protection as well.
+create trigger schema_migrations_reject_truncate
+before truncate on migration_control.schema_migrations
+for each statement execute function migration_control.reject_ledger_mutation();
+
+create trigger migration_runs_reject_truncate
+before truncate on migration_control.migration_runs
+for each statement execute function migration_control.reject_ledger_mutation();
+
 alter table migration_control.schema_migrations
   enable always trigger schema_migrations_reject_mutation;
 alter table migration_control.migration_runs
   enable always trigger migration_runs_reject_mutation;
+alter table migration_control.schema_migrations
+  enable always trigger schema_migrations_reject_truncate;
+alter table migration_control.migration_runs
+  enable always trigger migration_runs_reject_truncate;
 
 revoke all on all tables in schema migration_control from public;
-revoke all on all tables in schema migration_control from submitsense_app;
 revoke all on all sequences in schema migration_control from public;
-revoke all on all sequences in schema migration_control from submitsense_app;
+
+-- submitsense_app is created by db/migrations/0001_extensions_helpers.sql. The
+-- control schema installs on a bare database too, so these revokes are skipped
+-- when the runtime role does not exist yet; runner.ts verifies the same
+-- properties with to_regrole() and reports them either way.
+do $$
+begin
+  if exists (select 1 from pg_catalog.pg_roles where rolname = 'submitsense_app') then
+    revoke all on schema migration_control from submitsense_app;
+    revoke execute on function migration_control.reject_ledger_mutation() from submitsense_app;
+    revoke execute on function migration_control.canonical_operation_categories(text[]) from submitsense_app;
+    revoke all on all tables in schema migration_control from submitsense_app;
+    revoke all on all sequences in schema migration_control from submitsense_app;
+  end if;
+end
+$$;
 
 commit;

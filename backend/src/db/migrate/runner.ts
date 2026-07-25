@@ -9,6 +9,11 @@ import {
 export const SCHEMA_ADVISORY_LOCK = [1398096461, 1] as const;
 export const SCHEMA_LOCK_POLL_MS = 5_000;
 export const SCHEMA_LOCK_BUDGET_MS = 60_000;
+// Bound the plan once the advisory lock is held: without these a catalog read
+// blocked behind concurrent DDL would hold the schema lock indefinitely.
+export const SCHEMA_STATEMENT_TIMEOUT_MS = 30_000;
+export const SCHEMA_LOCK_TIMEOUT_MS = 5_000;
+export const LEGACY_LEDGER_TABLE = "public.infrastructure_schema_migrations";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const GIT_SHA = /^[0-9a-f]{7,64}$/;
@@ -126,6 +131,7 @@ const expectedConstraints = new Map<string, Map<string, "p" | "u" | "c">>([
     ["sm_applied_sha_ck", "c"],
     ["sm_phase_ck", "c"],
     ["sm_categories_ck", "c"],
+    ["sm_categories_order_ck", "c"],
     ["sm_mode_ck", "c"],
     ["sm_baseline_ck", "c"],
     ["sm_source_sha_ck", "c"],
@@ -174,6 +180,7 @@ const constraintDefinitionFragments = new Map<string, string[]>([
     "'index'::text = ANY (operation_categories)",
     "'seed-reference'::text = ANY (operation_categories)",
   ]],
+  ["sm_categories_order_ck", ["operation_categories = migration_control.canonical_operation_categories(operation_categories)"]],
   ["sm_mode_ck", ["execution_mode", "'legacy-verbatim'", "'transactional'", "'nontransactional'", "'batched'"]],
   ["sm_baseline_ck", ["baselined", "applied_checksum_sha256 IS NULL", "execution_mode = 'legacy-verbatim'", "NOT baselined", "applied_checksum_sha256 IS NOT NULL"]],
   ["sm_source_sha_ck", ["source_git_sha ~ '^[0-9a-f]{7,64}$'"]],
@@ -310,6 +317,15 @@ export function renderMigrationPlan(plan: MigrationPlan): string {
 }
 
 export async function verifyControlSchema(client: PoolClient): Promise<void> {
+  const schema = await client.query<{ present: boolean }>(
+    "select pg_catalog.to_regnamespace($1) is not null as present",
+    ["migration_control"],
+  );
+  assertCondition(
+    schema.rows[0]?.present === true,
+    "Control schema migration_control does not exist; install db/control/control-schema.sql before planning",
+  );
+
   const objects = await client.query<{ table_name: string }>(`
     select c.relname as table_name
       from pg_catalog.pg_class c
@@ -420,23 +436,32 @@ export async function verifyControlSchema(client: PoolClient): Promise<void> {
      where n.nspname = $1 and not t.tgisinternal
      order by c.relname, t.tgname
   `, ["migration_control"]);
-  assertCondition(triggers.rows.length === 2, "Control ledger tables must have exactly two mutation-rejection triggers");
-  for (const [table, trigger] of [
-    ["schema_migrations", "schema_migrations_reject_mutation"],
-    ["migration_runs", "migration_runs_reject_mutation"],
-  ] as const) {
+  // 27 = ROW|BEFORE|DELETE|UPDATE, 34 = STATEMENT|BEFORE|TRUNCATE. TRUNCATE does
+  // not fire row triggers, so both are required for an immutable ledger.
+  const expectedTriggers = [
+    ["schema_migrations", "schema_migrations_reject_mutation", 27],
+    ["schema_migrations", "schema_migrations_reject_truncate", 34],
+    ["migration_runs", "migration_runs_reject_mutation", 27],
+    ["migration_runs", "migration_runs_reject_truncate", 34],
+  ] as const;
+  assertCondition(
+    triggers.rows.length === expectedTriggers.length,
+    `Control ledger tables must have exactly ${expectedTriggers.length} mutation-rejection triggers`,
+  );
+  for (const [table, trigger, triggerType] of expectedTriggers) {
     assertCondition(
       triggers.rows.some((row) =>
         row.table_name === table
         && row.trigger_name === trigger
         && row.enabled === "A"
-        && row.trigger_type === 27
+        && row.trigger_type === triggerType
         && row.function_name === "reject_ledger_mutation"),
-      `Missing enabled mutation-rejection trigger on migration_control.${table}`,
+      `Missing enabled mutation-rejection trigger ${trigger} on migration_control.${table}`,
     );
   }
 
   const functionContract = await client.query<{
+    function_name: string;
     language_name: string;
     volatility: string;
     security_definer: boolean;
@@ -444,8 +469,9 @@ export async function verifyControlSchema(client: PoolClient): Promise<void> {
     public_execute: boolean;
     runtime_execute: boolean;
   }>(`
-    select l.lanname as language_name,
-           p.provolatile as volatility,
+    select p.proname as function_name,
+           l.lanname as language_name,
+           p.provolatile::text as volatility,
            p.prosecdef as security_definer,
            p.proconfig as config,
            exists (
@@ -463,19 +489,32 @@ export async function verifyControlSchema(client: PoolClient): Promise<void> {
       from pg_catalog.pg_proc p
       join pg_catalog.pg_namespace n on n.oid = p.pronamespace
       join pg_catalog.pg_language l on l.oid = p.prolang
-     where n.nspname = $1 and p.proname = $2 and p.pronargs = 0
-  `, ["migration_control", "reject_ledger_mutation"]);
-  const mutationFunction = functionContract.rows[0];
+     where n.nspname = $1
+     order by p.proname
+  `, ["migration_control"]);
+  // canonical_operation_categories backs sm_categories_order_ck, so its
+  // contract is as load-bearing as the mutation-rejection function's.
+  const expectedFunctions = [
+    ["canonical_operation_categories", "sql", "i"],
+    ["reject_ledger_mutation", "plpgsql", "v"],
+  ] as const;
   assertCondition(
-    functionContract.rows.length === 1
-    && mutationFunction.language_name === "plpgsql"
-    && mutationFunction.volatility === "v"
-    && mutationFunction.security_definer === false
-    && mutationFunction.config?.includes("search_path=pg_catalog, pg_temp")
-    && mutationFunction.public_execute === false
-    && mutationFunction.runtime_execute === false,
-    "Mutation-rejection function contract is incompatible",
+    functionContract.rows.length === expectedFunctions.length,
+    `migration_control must contain exactly ${expectedFunctions.length} control functions`,
   );
+  for (const [name, language, volatility] of expectedFunctions) {
+    const contract = functionContract.rows.find((row) => row.function_name === name);
+    assertCondition(
+      contract
+      && contract.language_name === language
+      && contract.volatility === volatility
+      && contract.security_definer === false
+      && contract.config?.includes("search_path=pg_catalog, pg_temp")
+      && contract.public_execute === false
+      && contract.runtime_execute === false,
+      `Control function contract is incompatible for migration_control.${name}`,
+    );
+  }
 
   const privileges = await client.query<{
     public_schema: boolean;
@@ -600,6 +639,17 @@ export async function withSchemaAdvisoryLock<T>(
   let actionError: Error | undefined;
   let cleanupError: Error | undefined;
   try {
+    // Bound every statement on the pinned connection before the first probe, so
+    // a plan blocked behind concurrent DDL cannot hold the schema lock forever.
+    // ponytail: session-scoped; the CLI pool is single-use and ended straight
+    // after the plan. Reset these on release if a shared pool ever runs a plan.
+    for (const [setting, milliseconds] of [
+      ["statement_timeout", SCHEMA_STATEMENT_TIMEOUT_MS],
+      ["lock_timeout", SCHEMA_LOCK_TIMEOUT_MS],
+    ] as const) {
+      await client.query("select set_config($1, $2, false)", [setting, String(milliseconds)]);
+    }
+
     while (!acquired) {
       if (connectionError) throw connectionError;
       const result = await client.query<{ acquired: boolean }>(
@@ -644,6 +694,37 @@ export async function withSchemaAdvisoryLock<T>(
   return value as T;
 }
 
+/**
+ * Read-only probe for the legacy executor's ledger. infra/scripts/migrate.sh
+ * records applied migrations in public.infrastructure_schema_migrations, which
+ * the control schema knows nothing about. An empty control ledger beside a
+ * populated legacy one means the environment was migrated but never baselined,
+ * so the applied set is unknown rather than empty. Fail closed: never infer
+ * applied state from the legacy rows, and never copy them across.
+ */
+export async function assertNoLegacyLedgerDivergence(
+  client: PoolClient,
+  appliedCount: number,
+): Promise<void> {
+  if (appliedCount > 0) return;
+  const present = await client.query<{ present: boolean }>(
+    "select pg_catalog.to_regclass($1) is not null as present",
+    [LEGACY_LEDGER_TABLE],
+  );
+  if (present.rows[0]?.present !== true) return;
+  const legacy = await client.query<{ legacy_rows: string }>(
+    `select count(*)::text as legacy_rows from ${LEGACY_LEDGER_TABLE}`,
+  );
+  const legacyRows = Number(legacy.rows[0]?.legacy_rows ?? 0);
+  assertCondition(
+    legacyRows === 0,
+    `Legacy migration ledger ${LEGACY_LEDGER_TABLE} has ${legacyRows} row(s) while `
+    + "migration_control.schema_migrations is empty; this environment was migrated by "
+    + "infra/scripts/migrate.sh and has not been baselined, so the applied set is unknown. "
+    + "Baseline adoption is not implemented in PB-10 Step 2.",
+  );
+}
+
 export async function runMigrationPlan(
   pool: Pool,
   options: SchemaLockOptions & { manifest?: MigrationManifest } = {},
@@ -669,6 +750,7 @@ export async function runMigrationPlan(
         from migration_control.schema_migrations
        order by ordinal
     `);
+    await assertNoLegacyLedgerDivergence(lockedClient, result.rows.length);
     return buildMigrationPlan(manifest, result.rows, options);
   }, options);
 }

@@ -145,6 +145,9 @@ class LockClient extends EventEmitter {
     this.activeQueries += 1;
     this.maxActiveQueries = Math.max(this.maxActiveQueries, this.activeQueries);
     try {
+      if (sql.includes("set_config")) {
+        return { rows: [{ set_config: String(values?.[1]) }], rowCount: 1 };
+      }
       if (sql.includes("pg_try_advisory_lock")) {
         this.events.push("probe");
         assert.deepEqual(values, [...SCHEMA_ADVISORY_LOCK]);
@@ -323,7 +326,8 @@ const columnRows = [
 }));
 
 const compatibleConstraintDefinition = [
-  readFileSync(path.join(repositoryRoot, "backend", "src", "db", "migrate", "control-schema.sql"), "utf8"),
+  readFileSync(path.join(repositoryRoot, "db", "control", "control-schema.sql"), "utf8"),
+  "operation_categories = migration_control.canonical_operation_categories(operation_categories)",
   "PRIMARY KEY (migration_id)",
   "PRIMARY KEY (event_id)",
   "UNIQUE (ordinal)",
@@ -341,7 +345,7 @@ const constraintRows = [
   ["schema_migrations", "schema_migrations_pkey", "p"],
   ["schema_migrations", "schema_migrations_ordinal_key", "u"],
   ["schema_migrations", "schema_migrations_filename_key", "u"],
-  ...["sm_id_ck", "sm_ordinal_ck", "sm_filename_ck", "sm_manifest_sha_ck", "sm_applied_sha_ck", "sm_phase_ck", "sm_categories_ck", "sm_mode_ck", "sm_baseline_ck", "sm_source_sha_ck", "sm_image_digest_ck"]
+  ...["sm_id_ck", "sm_ordinal_ck", "sm_filename_ck", "sm_manifest_sha_ck", "sm_applied_sha_ck", "sm_phase_ck", "sm_categories_ck", "sm_categories_order_ck", "sm_mode_ck", "sm_baseline_ck", "sm_source_sha_ck", "sm_image_digest_ck"]
     .map((name) => ["schema_migrations", name, "c"]),
   ["migration_runs", "migration_runs_pkey", "p"],
   ["migration_runs", "migration_runs_run_id_event_sequence_key", "u"],
@@ -360,6 +364,10 @@ const constraintRows = [
 class PlanClient extends LockClient {
   drift = false;
   constraintDrift = false;
+  schemaMissing = false;
+  droppedTruncateTriggers = false;
+  legacyLedgerPresent = false;
+  legacyLedgerRows = 0;
   readonly ledgerRows: AppliedMigrationRow[];
 
   constructor(ledgerRows: AppliedMigrationRow[] = []) {
@@ -372,6 +380,16 @@ class PlanClient extends LockClient {
       return super.query(sql, values);
     }
     this.queries.push({ sql, values });
+    if (sql.includes("set_config")) return { rows: [{ set_config: String(values?.[1]) }], rowCount: 1 };
+    if (sql.includes("to_regnamespace")) {
+      return { rows: [{ present: !this.schemaMissing }], rowCount: 1 };
+    }
+    if (sql.includes("to_regclass")) {
+      return { rows: [{ present: this.legacyLedgerPresent }], rowCount: 1 };
+    }
+    if (sql.includes("legacy_rows")) {
+      return { rows: [{ legacy_rows: String(this.legacyLedgerRows) }], rowCount: 1 };
+    }
     if (sql.includes("c.relkind in ('r', 'p')")) {
       return { rows: this.drift ? [{ table_name: "schema_migrations" }] : [{ table_name: "migration_runs" }, { table_name: "schema_migrations" }], rowCount: 2 };
     }
@@ -382,23 +400,37 @@ class PlanClient extends LockClient {
         : constraintRows;
       return { rows, rowCount: rows.length };
     }
-    if (sql.includes("pg_trigger")) return {
-      rows: [
+    if (sql.includes("pg_trigger")) {
+      const rows = [
         { table_name: "migration_runs", trigger_name: "migration_runs_reject_mutation", enabled: "A", trigger_type: 27, function_name: "reject_ledger_mutation" },
+        { table_name: "migration_runs", trigger_name: "migration_runs_reject_truncate", enabled: "A", trigger_type: 34, function_name: "reject_ledger_mutation" },
         { table_name: "schema_migrations", trigger_name: "schema_migrations_reject_mutation", enabled: "A", trigger_type: 27, function_name: "reject_ledger_mutation" },
+        { table_name: "schema_migrations", trigger_name: "schema_migrations_reject_truncate", enabled: "A", trigger_type: 34, function_name: "reject_ledger_mutation" },
+      ].filter((row) => !(this.droppedTruncateTriggers && row.trigger_name.endsWith("_reject_truncate")));
+      return { rows, rowCount: rows.length };
+    }
+    if (sql.includes("p.provolatile")) return {
+      rows: [
+        {
+          function_name: "canonical_operation_categories",
+          language_name: "sql",
+          volatility: "i",
+          security_definer: false,
+          config: ["search_path=pg_catalog, pg_temp"],
+          public_execute: false,
+          runtime_execute: false,
+        },
+        {
+          function_name: "reject_ledger_mutation",
+          language_name: "plpgsql",
+          volatility: "v",
+          security_definer: false,
+          config: ["search_path=pg_catalog, pg_temp"],
+          public_execute: false,
+          runtime_execute: false,
+        },
       ],
       rowCount: 2,
-    };
-    if (sql.includes("p.provolatile")) return {
-      rows: [{
-        language_name: "plpgsql",
-        volatility: "v",
-        security_definer: false,
-        config: ["search_path=pg_catalog, pg_temp"],
-        public_execute: false,
-        runtime_execute: false,
-      }],
-      rowCount: 1,
     };
     if (sql.includes("control_namespace")) return {
       rows: [{
@@ -426,6 +458,90 @@ test("strict control-schema verification rejects catalog drift", async () => {
   const constraintClient = new PlanClient();
   constraintClient.constraintDrift = true;
   await assert.rejects(verifyControlSchema(constraintClient as unknown as PoolClient), /Constraint definition drift/);
+
+  const missingSchema = new PlanClient();
+  missingSchema.schemaMissing = true;
+  await assert.rejects(
+    verifyControlSchema(missingSchema as unknown as PoolClient),
+    /Control schema migration_control does not exist/,
+  );
+});
+
+test("verification rejects a ledger missing its TRUNCATE-rejection triggers", async () => {
+  const client = new PlanClient();
+  client.droppedTruncateTriggers = true;
+  await assert.rejects(
+    verifyControlSchema(client as unknown as PoolClient),
+    /exactly 4 mutation-rejection triggers/,
+  );
+
+  const intact = new PlanClient();
+  await verifyControlSchema(intact as unknown as PoolClient);
+  const triggerQuery = intact.queries.find(({ sql }) => sql.includes("pg_trigger"));
+  assert.ok(triggerQuery, "verifier must inspect pg_trigger");
+});
+
+test("canonical category order is a verified constraint, not an unordered comparison", async () => {
+  const client = new PlanClient();
+  await verifyControlSchema(client as unknown as PoolClient);
+  const constraintQuery = client.queries.find(({ sql }) => sql.includes("pg_constraint"));
+  assert.ok(constraintQuery, "verifier must inspect pg_constraint");
+
+  // The plan stays order-sensitive on purpose: canonical ordering is enforced at
+  // INSERT time by sm_categories_order_ck, so a reordered row must never be
+  // silently accepted here.
+  const reordered = manifest.migrations.findIndex((entry) => entry.operationCategories.length > 1);
+  assert.notEqual(reordered, -1, "manifest needs a multi-category entry for this test");
+  assert.throws(
+    () => buildMigrationPlan(manifest, [applied(reordered, {
+      operation_categories: [...manifest.migrations[reordered].operationCategories].reverse(),
+    })].slice(0, 1)),
+    /Operation category mismatch|contiguous ordinal prefix|ordering or migration ID mismatch/,
+  );
+});
+
+test("plan fails closed when the legacy ledger diverges from an empty control ledger", async () => {
+  const diverged = new PlanClient();
+  diverged.legacyLedgerPresent = true;
+  diverged.legacyLedgerRows = 24;
+  const pool = { connect: async () => diverged as unknown as PoolClient } as unknown as Pool;
+  await assert.rejects(
+    runMigrationPlan(pool, { manifest }),
+    /Legacy migration ledger public\.infrastructure_schema_migrations has 24 row\(s\)/,
+  );
+  // Fail closed, but never read the legacy rows themselves.
+  assert.ok(diverged.queries.every(({ sql }) => !/select\s+filename/i.test(sql)));
+  assert.deepEqual(diverged.events.slice(-2), ["unlock", "release"]);
+
+  const emptyLegacy = new PlanClient();
+  emptyLegacy.legacyLedgerPresent = true;
+  emptyLegacy.legacyLedgerRows = 0;
+  const emptyPool = { connect: async () => emptyLegacy as unknown as PoolClient } as unknown as Pool;
+  assert.equal((await runMigrationPlan(emptyPool, { manifest })).pendingCount, 24);
+
+  // A populated control ledger is authoritative; the legacy table is not probed.
+  const baselined = new PlanClient(manifest.migrations.map((_, index) => applied(index)));
+  baselined.legacyLedgerPresent = true;
+  baselined.legacyLedgerRows = 24;
+  const baselinedPool = { connect: async () => baselined as unknown as PoolClient } as unknown as Pool;
+  assert.equal((await runMigrationPlan(baselinedPool, { manifest })).pendingCount, 0);
+  assert.ok(baselined.queries.every(({ sql }) => !sql.includes("to_regclass")));
+});
+
+test("statement and lock timeouts are issued on the pinned client before the first probe", async () => {
+  const client = new LockClient();
+  await withSchemaAdvisoryLock(client as unknown as PoolClient, async () => undefined);
+  const settings = client.queries
+    .filter(({ sql }) => sql.includes("set_config"))
+    .map(({ values }) => values as [string, string]);
+  assert.deepEqual(settings, [
+    ["statement_timeout", "30000"],
+    ["lock_timeout", "5000"],
+  ]);
+  // is_local is a literal false, so the timeouts outlive each implicit transaction.
+  assert.ok(client.queries.every(({ sql }) => !sql.includes("set_config") || sql.includes("false")));
+  const kinds = client.queries.map(({ sql }) => sql.includes("set_config") ? "set_config" : sql.includes("pg_try_advisory_lock") ? "probe" : "other");
+  assert.deepEqual(kinds.slice(0, 3), ["set_config", "set_config", "probe"]);
 });
 
 test("run plan issues only read-only catalog and ledger queries", async () => {
