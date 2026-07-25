@@ -13,6 +13,7 @@
     "manifest:check": "node --import tsx src/db/migrate/manifest.ts check",
     "manifest:history": "node --import tsx src/db/migrate/manifest.ts check-history",
     "migrate:plan": "node --import tsx src/db/migrate/runner.ts plan --json",
+    "migrate:execute": "node --import tsx src/db/migrate/runner.ts execute --json",
     "render:package-fixture": "node --import tsx scripts/render-package-fixture.ts",
     "verify:package-worker": "node --import tsx scripts/verify-package-worker.ts",
     "verify:risk-rfi-worker": "node --import tsx scripts/verify-risk-rfi-worker.ts",

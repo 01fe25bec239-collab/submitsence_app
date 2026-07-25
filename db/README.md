@@ -127,6 +127,76 @@ migrated but never baselined, so the applied set is unknown rather than empty �
 closed instead of reporting all 24 migrations as pending. It never reads those rows, and never
 copies them into the new ledger; baseline adoption is not implemented in Step 2.
 
+## PB-10 migration execution
+
+Step 3 adds execution to the same runner. `migrate:plan` is unchanged and still read-only.
+
+```bash
+MIGRATION_SOURCE_GIT_SHA=<commit sha> \
+MIGRATION_EXECUTOR_IMAGE_DIGEST=sha256:<64 hex> \
+npm run migrate:execute --prefix backend
+```
+
+Both identity variables are mandatory and validated against the same patterns `schema_migrations`
+enforces; the runner never invents them. `MIGRATION_RUNNER_ID` is optional. Output is a deterministic
+JSON report containing no SQL and no connection details.
+
+### Two connections
+
+| Connection | Owns |
+|------------|------|
+| Control | The advisory lock, control-schema and manifest verification, `migration_runs` events in autocommit, wall-clock supervision and `pg_cancel_backend`. Held until execution *and* verification finish. |
+| Execution | Migration SQL and its transactions. Cancelled, or destroyed, the moment execution becomes unsafe. |
+
+Nothing executes until the advisory lock `(1398096461, 1)` is held, `migration_control` verifies
+exactly, the manifest verifies, every applied row matches manifest ordering/filename/mode/categories/
+checksum, legacy-ledger divergence is ruled out, and the same deterministic plan `migrate:plan`
+renders has been produced. Losing the control connection destroys the execution connection
+immediately, so an orphaned transaction can never commit an applied row for a run that already
+aborted.
+
+### Modes
+
+- **legacy-verbatim** (at or below `0099`) — the file's exact raw bytes are sent as one unchanged
+  multi-statement payload. Its own `BEGIN`/`COMMIT` is the only transaction; the runner never wraps,
+  parses, splits or normalises it, and only session-level timeouts are set beforehand. The applied
+  row, carrying the observed checksum, is written afterwards on the control connection. The
+  commit-to-ledger crash window is accepted for legacy only: a later run that finds prior events with
+  no applied row refuses to replay and demands manual reconciliation.
+- **transactional** — `BEGIN`, `SET LOCAL` timeouts, migration SQL, the `schema_migrations` insert,
+  `COMMIT`, all on the execution connection, so SQL and ledger row are atomic. Failure rolls back and
+  appends `transaction_rolled_back` and `execution_failed` on the control connection, where they
+  survive the rollback.
+- **nontransactional** — one independently retry-safe operation, never wrapped in a transaction, with
+  `statement_timeout = 0` and the wall clock enforced from the control connection. A
+  migration-specific verifier distinguishes absent / valid / invalid before and after. Absent
+  executes; valid-but-unrecorded is adopted; invalid or partial requires explicit verifier-led
+  recovery and is never blindly replayed. `inspectConcurrentIndex` provides that distinction for
+  `CREATE INDEX CONCURRENTLY`.
+- **batched** — mode boundary only. The runner supplies a bounded per-batch transaction and demands
+  an independent completion verifier; progress is owned by a reviewed migration-specific handler.
+  There is deliberately no generic backfill executor and no `backfill_runs` table. With no registered
+  handler, batched fails closed on an unsupported-handler error and never degrades to another mode.
+
+Both handler registries in `backend/src/db/migrate/execute.ts` are empty: no migration above `0099`
+exists yet.
+
+### Events and timeouts
+
+`migration_runs` stays INSERT-only. One run id per invocation, with `event_sequence` starting at 1 and
+increasing. Events carry a SQLSTATE, a bounded error class and whitelisted metadata only — never SQL
+bodies, query parameters, secrets, customer data or tenant identifiers.
+
+Manifest timeouts are capped at the approved limits (`lock_timeout` 5 s, `statement_timeout` 60 s,
+`transaction_timeout` 5 min, `idle_in_transaction_session_timeout` 60 s, wall clock 15 min
+transactional / 30 min nontransactional) and the declared total is capped at the 60-minute
+schema-runner budget. Anything higher fails closed before the execution connection is even opened.
+A nontransactional overrun is cancelled with `pg_cancel_backend`; if cancellation is not confirmed
+within 10 s the execution connection is destroyed rather than reused.
+
+`infra/scripts/migrate.sh` remains the production executor. Nothing in this step changes deployment,
+adopts a baseline, or installs the control schema anywhere new.
+
 ## Runtime connection (required for RLS to work)
 
 The app must **not** connect as the table owner. Create a login role that inherits `submitsense_app`:

@@ -559,13 +559,23 @@ test("run plan issues only read-only catalog and ledger queries", async () => {
 
 test("unsupported execution commands fail clearly before connecting", () => {
   const runner = path.join(repositoryRoot, "backend", "src", "db", "migrate", "runner.ts");
-  for (const command of ["run", "apply", "execute", "clean-install", "baseline-adopt"]) {
-    const result = spawnSync(process.execPath, ["--import", "tsx", runner, command], {
-      cwd: path.join(repositoryRoot, "backend"),
-      encoding: "utf8",
-      env: { ...process.env, DATABASE_URL: "" },
-    });
+  const spawn = (...arguments_: string[]) => spawnSync(process.execPath, ["--import", "tsx", runner, ...arguments_], {
+    cwd: path.join(repositoryRoot, "backend"),
+    encoding: "utf8",
+    env: { ...process.env, DATABASE_URL: "" },
+  });
+
+  // PB-10 Step 3 adds exactly one execution verb; every other spelling and every
+  // out-of-scope lifecycle command still fails closed.
+  for (const command of ["run", "apply", "clean-install", "baseline-adopt", ""]) {
+    const result = spawn(command);
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /supports only: plan/);
+    assert.match(result.stderr, /supports only: plan, execute/);
   }
+
+  // execute is recognised, but still refuses to run without a target database.
+  const recognised = spawn("execute", "--json");
+  assert.notEqual(recognised.status, 0);
+  assert.doesNotMatch(recognised.stderr, /supports only/);
+  assert.match(recognised.stderr, /DATABASE_URL is required/);
 });

@@ -16,8 +16,8 @@ export const SCHEMA_LOCK_TIMEOUT_MS = 5_000;
 export const LEGACY_LEDGER_TABLE = "public.infrastructure_schema_migrations";
 
 const SHA256 = /^[0-9a-f]{64}$/;
-const GIT_SHA = /^[0-9a-f]{7,64}$/;
-const IMAGE_DIGEST = /^sha256:[0-9a-f]{64}$/;
+export const GIT_SHA = /^[0-9a-f]{7,64}$/;
+export const IMAGE_DIGEST = /^sha256:[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export interface AppliedMigrationRow {
@@ -725,6 +725,27 @@ export async function assertNoLegacyLedgerDivergence(
   );
 }
 
+export async function readAppliedRows(client: PoolClient): Promise<AppliedMigrationRow[]> {
+  const result = await client.query<AppliedMigrationRow>(`
+    select migration_id,
+           ordinal,
+           filename,
+           manifest_checksum_sha256,
+           applied_checksum_sha256,
+           lifecycle_phase,
+           operation_categories,
+           execution_mode,
+           applied_at,
+           run_id,
+           baselined,
+           source_git_sha,
+           executor_image_digest
+      from migration_control.schema_migrations
+     order by ordinal
+  `);
+  return result.rows;
+}
+
 export async function runMigrationPlan(
   pool: Pool,
   options: SchemaLockOptions & { manifest?: MigrationManifest } = {},
@@ -733,41 +754,38 @@ export async function runMigrationPlan(
   const client = await pool.connect();
   return withSchemaAdvisoryLock(client, async (lockedClient) => {
     await verifyControlSchema(lockedClient);
-    const result = await lockedClient.query<AppliedMigrationRow>(`
-      select migration_id,
-             ordinal,
-             filename,
-             manifest_checksum_sha256,
-             applied_checksum_sha256,
-             lifecycle_phase,
-             operation_categories,
-             execution_mode,
-             applied_at,
-             run_id,
-             baselined,
-             source_git_sha,
-             executor_image_digest
-        from migration_control.schema_migrations
-       order by ordinal
-    `);
-    await assertNoLegacyLedgerDivergence(lockedClient, result.rows.length);
-    return buildMigrationPlan(manifest, result.rows, options);
+    const rows = await readAppliedRows(lockedClient);
+    await assertNoLegacyLedgerDivergence(lockedClient, rows.length);
+    return buildMigrationPlan(manifest, rows, options);
   }, options);
 }
 
 async function main(): Promise<void> {
   const [command, ...arguments_] = process.argv.slice(2);
-  assertCondition(command === "plan", `Unsupported migration command "${command ?? ""}". PB-10 Step 2 supports only: plan`);
-  assertCondition(arguments_.length === 0 || sameStrings(arguments_, ["--json"]), "Usage: runner.ts plan [--json]");
+  assertCondition(
+    command === "plan" || command === "execute",
+    `Unsupported migration command "${command ?? ""}". PB-10 supports only: plan, execute`,
+  );
+  assertCondition(arguments_.length === 0 || sameStrings(arguments_, ["--json"]), `Usage: runner.ts ${command} [--json]`);
   assertCondition(process.env.DATABASE_URL, "DATABASE_URL is required");
 
   const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    application_name: "submitsense-migration-plan",
+    application_name: `submitsense-migration-${command}`,
     ssl: process.env.PGSSLMODE === "require" ? { rejectUnauthorized: true } : undefined,
+    // Execution holds the control and execution connections concurrently; the
+    // plan path keeps its original single-connection pool defaults.
+    ...(command === "execute" ? { max: 2 } : {}),
   });
   try {
-    process.stdout.write(renderMigrationPlan(await runMigrationPlan(pool)));
+    if (command === "plan") {
+      process.stdout.write(renderMigrationPlan(await runMigrationPlan(pool)));
+    } else {
+      // Imported lazily: execute.ts depends on this module, so a top-level
+      // import would be a load-time cycle.
+      const { executeMigrations, renderExecutionReport } = await import("./execute");
+      process.stdout.write(renderExecutionReport(await executeMigrations(pool)));
+    }
   } finally {
     await pool.end();
   }

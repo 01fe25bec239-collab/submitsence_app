@@ -123,6 +123,12 @@ jobs:
           grep -q "Legacy migration ledger public.infrastructure_schema_migrations" /tmp/divergence.err
           test "$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from public.infrastructure_schema_migrations)")" = "0:1"
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c "drop table public.infrastructure_schema_migrations"
+      - name: Test migration execution modes
+        run: node --import tsx --test test/migration-execute.test.ts
+        working-directory: backend
+      - name: Test migration execution against real PostgreSQL
+        run: node --import tsx --test test/migration-execute.pg.test.ts
+        working-directory: backend
       - run: node --import tsx --test test/commercial-webhook.integration.test.ts
         working-directory: backend
 
