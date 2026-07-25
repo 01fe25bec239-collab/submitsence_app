@@ -86,8 +86,24 @@ jobs:
       - name: Run database guardrails
         run: |
           for test_file in db/test/test*.sql; do
+            [[ "$test_file" == "db/test/test_migration_control.sql" ]] && continue
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$test_file"
           done
+      - name: Apply PB-10 migration control schema
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f backend/src/db/migrate/control-schema.sql
+      - name: Test migration control schema and advisory lock
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/test/test_migration_control.sql
+      - name: Test read-only migration plan
+        run: node --import tsx --test test/migration-runner.test.ts
+        working-directory: backend
+      - name: Verify real migration plan is read-only
+        run: |
+          before="$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from migration_control.migration_runs)")"
+          npm run --silent migrate:plan --prefix backend > /tmp/migration-plan.json
+          after="$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from migration_control.migration_runs)")"
+          test "$before" = "0:0"
+          test "$after" = "$before"
+          node -e 'const plan = require("/tmp/migration-plan.json"); if (plan.pendingCount !== 24) process.exit(1)'
       - run: node --import tsx --test test/commercial-webhook.integration.test.ts
         working-directory: backend
 

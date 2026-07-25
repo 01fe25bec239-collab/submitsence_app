@@ -57,6 +57,34 @@ legacy checksums are go-forward integrity anchors from PB-10 onward: they do not
 historical byte revisions an existing environment executed. The current SQL execution procedure
 above remains in place until the later PB-10 runner step.
 
+## PB-10 read-only migration plan
+
+PB-10 Step 2 adds the `migration_control` control schema with exactly two permanent ledger tables:
+
+- `schema_migrations` is the immutable applied set. Presence means applied; UPDATE and DELETE are
+  rejected by an always-enabled trigger.
+- `migration_runs` is an INSERT-only event stream. Each heartbeat or terminal outcome is a new
+  event; previous events are never updated or deleted.
+
+PUBLIC and the `submitsense_app` runtime role have no control-schema access. Schema work is
+serialized with the session advisory lock `(1398096461, 1)`: the runner uses a dedicated pinned
+connection, polls `pg_try_advisory_lock` every five seconds for at most sixty seconds, reports only
+redacted holder diagnostics, and explicitly verifies unlock before releasing the connection.
+
+After installing `backend/src/db/migrate/control-schema.sql` on a disposable or approved target,
+render the deterministic JSON plan with:
+
+```bash
+npm run migrate:plan --prefix backend
+```
+
+The command validates the committed manifest, verifies the control-schema catalog, validates the
+applied set as a manifest prefix, and reports pending migrations. It is read-only: it executes no
+migration SQL and inserts no ledger or run-event rows. Current legacy checksums cannot prove which
+historical bytes a persistent environment executed, and persistent environments have not been
+baselined. `infra/scripts/migrate.sh` remains the production executor; migration execution in
+`runner.ts` is intentionally not implemented in Step 2.
+
 ## Runtime connection (required for RLS to work)
 
 The app must **not** connect as the table owner. Create a login role that inherits `submitsense_app`:
