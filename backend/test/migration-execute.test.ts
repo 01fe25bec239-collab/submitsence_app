@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test, { after } from "node:test";
@@ -9,21 +10,14 @@ import type { Pool, PoolClient } from "pg";
 import type { MigrationManifest, MigrationManifestEntry } from "../src/db/migrate/manifest";
 import type { AppliedMigrationRow } from "../src/db/migrate/runner";
 import {
-  CANCELLATION_GRACE_MS,
-  NONTRANSACTIONAL_WALL_CLOCK_CEILING_MS,
   SCHEMA_RUNNER_WALL_CLOCK_MS,
   TIMEOUT_CEILINGS,
-  TRANSACTIONAL_WALL_CLOCK_CEILING_MS,
-  assertTimeoutCeilings,
   executeMigrations,
-  identityFromEnvironment,
-  registeredHandlers,
-  type BatchedHandler,
-  type ExecuteOptions,
-  type MigrationHandlers,
-  type NontransactionalHandler,
-  type NontransactionalState,
 } from "../src/db/migrate/execute";
+import {
+  executeMigrationsForTest,
+  type TestExecuteOptions,
+} from "./helpers/migration-execute";
 import {
   columnRows,
   constraintRows,
@@ -34,8 +28,8 @@ import {
 
 const RUN_ID = "10000000-0000-4000-8000-0000000000ff";
 const identity = {
-  sourceGitSha: "a".repeat(40),
-  executorImageDigest: `sha256:${"b".repeat(64)}`,
+  sourceGitSha: "5324116250977b5e8ac24bc83b6cae89ebcbd990",
+  executorImageDigest: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   runnerId: "pb10-test-runner",
 };
 
@@ -113,6 +107,12 @@ function manifestOf(...selected: MigrationManifestEntry[]): MigrationManifest {
   return { schemaVersion: 1, legacyBoundary: "0099", migrations: selected };
 }
 
+writeFileSync(path.join(root, ".gitattributes"), "db/migrations/*.sql -text\n");
+writeFileSync(
+  path.join(root, "db", "migrations", "manifest.json"),
+  `${JSON.stringify(manifestOf(entries.legacy, entries.transactional, entries.nontransactional, entries.batched), null, 2)}\n`,
+);
+
 function appliedRow(entry: MigrationManifestEntry, ordinal: number, overrides: Partial<AppliedMigrationRow> = {}): AppliedMigrationRow {
   return {
     migration_id: entry.id,
@@ -128,6 +128,57 @@ function appliedRow(entry: MigrationManifestEntry, ordinal: number, overrides: P
     baselined: false,
     source_git_sha: identity.sourceGitSha,
     executor_image_digest: identity.executorImageDigest,
+    ...overrides,
+  };
+}
+
+type PriorEventFixture = {
+  migration_id: string;
+  run_id: string;
+  event_sequence: number;
+  event_type: string;
+  runner_id: string | null;
+  heartbeat_deadline: Date | string | null;
+  source_git_sha: string | null;
+  executor_image_digest: string | null;
+  sqlstate: string | null;
+  error_class: string | null;
+  metadata: unknown;
+  statement_ordinal: number | null;
+};
+
+function retryEvent(
+  event_sequence: number,
+  event_type: string,
+  overrides: Partial<PriorEventFixture> = {},
+): PriorEventFixture {
+  const failed = event_type === "transaction_rolled_back" || event_type === "execution_failed";
+  return {
+    migration_id: "0001",
+    run_id: "10000000-0000-4000-8000-000000000001",
+    event_sequence,
+    event_type,
+    runner_id: identity.runnerId,
+    heartbeat_deadline: event_type === "started" || event_type === "heartbeat"
+      ? "2030-01-01T00:01:00.000Z"
+      : null,
+    source_git_sha: identity.sourceGitSha,
+    executor_image_digest: identity.executorImageDigest,
+    sqlstate: failed ? "23505" : null,
+    error_class: failed ? "sql_failed" : null,
+    statement_ordinal: failed ? 1 : null,
+    metadata: event_type === "heartbeat"
+      ? {
+          execution_mode: "legacy-verbatim",
+          migration_filename: entries.legacy.filename,
+          migration_ordinal: 1,
+          elapsed_ms: 1,
+        }
+      : {
+          execution_mode: "legacy-verbatim",
+          migration_filename: entries.legacy.filename,
+          migration_ordinal: 1,
+        },
     ...overrides,
   };
 }
@@ -155,7 +206,9 @@ class FakeClient extends EventEmitter {
 
 class ControlClient extends FakeClient {
   ledgerRows: AppliedMigrationRow[] = [];
-  priorAttempts = 0;
+  legacyLedgerRows: string[] | null = null;
+  legacyLedgerTimestamps: unknown[] = [];
+  priorEvents: PriorEventFixture[] = [];
   unlocked = false;
   dead: Error | undefined;
   onCancel: (() => void) | undefined;
@@ -180,7 +233,16 @@ class ControlClient extends FakeClient {
       return { rows: [{ pg_cancel_backend: true }], rowCount: 1 };
     }
     if (sql.includes("to_regnamespace")) return { rows: [{ present: true }], rowCount: 1 };
-    if (sql.includes("to_regclass")) return { rows: [{ present: false }], rowCount: 1 };
+    if (sql.includes("to_regclass")) return { rows: [{ present: this.legacyLedgerRows !== null }], rowCount: 1 };
+    if (sql.includes("from public.infrastructure_schema_migrations")) {
+      const rows = (this.legacyLedgerRows ?? []).map((filename, index) => ({
+        filename,
+        applied_at: index in this.legacyLedgerTimestamps
+          ? this.legacyLedgerTimestamps[index]
+          : new Date(Date.UTC(2030, 0, index + 1)),
+      }));
+      return { rows, rowCount: rows.length };
+    }
     if (sql.includes("c.relkind in ('r', 'p')")) {
       return { rows: [{ table_name: "migration_runs" }, { table_name: "schema_migrations" }], rowCount: 2 };
     }
@@ -202,7 +264,9 @@ class ControlClient extends FakeClient {
       this.appliedInserts.push(values ?? []);
       return { rows: [], rowCount: 1 };
     }
-    if (sql.includes("as attempts")) return { rows: [{ attempts: String(this.priorAttempts) }], rowCount: 1 };
+    if (sql.includes("from migration_control.migration_runs")) {
+      return { rows: this.priorEvents, rowCount: this.priorEvents.length };
+    }
     if (sql.includes("from migration_control.schema_migrations")) {
       return { rows: this.ledgerRows, rowCount: this.ledgerRows.length };
     }
@@ -283,37 +347,170 @@ const isReadOnly = (sql: string): boolean => {
 
 const never = () => new Promise<void>(() => undefined);
 
-function options(pool: FakePool, overrides: Partial<ExecuteOptions> = {}): ExecuteOptions {
+function options(pool: FakePool, overrides: Partial<TestExecuteOptions> = {}): TestExecuteOptions {
   return {
     manifest: manifestOf(entries.legacy),
     identity,
     repositoryRoot: root,
     runId: RUN_ID,
-    handlers: { nontransactional: new Map(), batched: new Map() },
-    sleep: never,
     ...overrides,
   };
 }
 
-const run = (pool: FakePool, overrides: Partial<ExecuteOptions> = {}) =>
-  executeMigrations(pool as unknown as Pool, options(pool, overrides));
+const run = (pool: FakePool, overrides: Partial<TestExecuteOptions> = {}) =>
+  executeMigrationsForTest(pool as unknown as Pool, options(pool, overrides));
 
-const handlersWith = (over: Partial<MigrationHandlers>): MigrationHandlers => ({
-  nontransactional: new Map(),
-  batched: new Map(),
-  ...over,
-});
-
-const inspector = (...states: NontransactionalState[]): NontransactionalHandler & { calls: number } => ({
-  calls: 0,
-  async inspect(): Promise<NontransactionalState> {
-    const state = states[Math.min(this.calls, states.length - 1)];
-    this.calls += 1;
-    return state;
-  },
-});
+async function expectManifestPreflightRejection(
+  mutate: (fixtureRoot: string) => void,
+  pattern: RegExp,
+): Promise<void> {
+  const parent = mkdtempSync(path.join(os.tmpdir(), "pb10-manifest-preflight-"));
+  const fixtureRoot = path.join(parent, "repository");
+  cpSync(root, fixtureRoot, { recursive: true });
+  try {
+    mutate(fixtureRoot);
+    const pool = new FakePool();
+    await assert.rejects(
+      executeMigrationsForTest(pool as unknown as Pool, { repositoryRoot: fixtureRoot, identity }),
+      pattern,
+    );
+    assert.equal(pool.connects, 0, "manifest rejection must precede control-client acquisition");
+    assert.deepEqual(pool.control.events, []);
+    assert.deepEqual(pool.migrationSql(), []);
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+}
 
 // 1 ────────────────────────────────────────────────────────────────────────────
+test("direct JavaScript callers cannot inject any execution boundary input", async () => {
+  for (const injected of [
+    { manifest: manifestOf(entries.legacy) },
+    { repositoryRoot: root },
+    { identity },
+    { handlers: { nontransactional: new Map(), batched: new Map() } },
+    { runId: RUN_ID },
+    { sql: "select 1" },
+    { now: Date.now },
+    { sleep: never },
+  ]) {
+    const pool = new FakePool();
+    await assert.rejects(
+      executeMigrations(pool as unknown as Pool, injected as never),
+      /exactly one Pool argument/,
+    );
+    assert.equal(pool.connects, 0);
+  }
+});
+
+test("manifest trust failures occur before any database activity", async () => {
+  await expectManifestPreflightRejection(
+    (fixtureRoot) => rmSync(path.join(fixtureRoot, ".gitattributes")),
+    /\.gitattributes|ENOENT/,
+  );
+  await expectManifestPreflightRejection(
+    (fixtureRoot) => rmSync(path.join(fixtureRoot, "db", "migrations", "manifest.json")),
+    /manifest\.json|ENOENT/,
+  );
+  await expectManifestPreflightRejection((fixtureRoot) => {
+    const target = path.join(fixtureRoot, "db", "migrations", "manifest.json");
+    const fixtureManifest = JSON.parse(readFileSync(target, "utf8")) as MigrationManifest;
+    fixtureManifest.migrations.reverse();
+    writeFileSync(target, `${JSON.stringify(fixtureManifest, null, 2)}\n`);
+  }, /not in numeric order/);
+  await expectManifestPreflightRejection((fixtureRoot) => {
+    const target = path.join(fixtureRoot, "db", "migrations", "manifest.json");
+    const fixtureManifest = JSON.parse(readFileSync(target, "utf8")) as MigrationManifest;
+    fixtureManifest.migrations.pop();
+    writeFileSync(target, `${JSON.stringify(fixtureManifest, null, 2)}\n`);
+  }, /Missing manifest entry/);
+  await expectManifestPreflightRejection((fixtureRoot) => {
+    const migrations = path.join(fixtureRoot, "db", "migrations");
+    const original = path.join(migrations, "0001_legacy_demo.sql");
+    writeFileSync(path.join(migrations, "0001_renamed_demo.sql"), readFileSync(original));
+    rmSync(original);
+  }, /Missing manifest entry|Unexpected manifest entry|missing migration file/);
+  await expectManifestPreflightRejection((fixtureRoot) => {
+    const target = path.join(fixtureRoot, "db", "migrations", "0001_legacy_demo.sql");
+    writeFileSync(target, Buffer.concat([readFileSync(target), Buffer.from(" ")]));
+  }, /SHA-256 mismatch/);
+});
+
+test("normal production execution verifies the committed manifest", async () => {
+  const committedManifest = JSON.parse(
+    readFileSync(path.resolve(__dirname, "../../db/migrations/manifest.json"), "utf8"),
+  ) as MigrationManifest;
+  const pool = new FakePool();
+  pool.control.ledgerRows = committedManifest.migrations.map((entry, index) => appliedRow(entry, index + 1));
+  const previousSha = process.env.MIGRATION_SOURCE_GIT_SHA;
+  const previousDigest = process.env.MIGRATION_EXECUTOR_IMAGE_DIGEST;
+  process.env.MIGRATION_SOURCE_GIT_SHA = identity.sourceGitSha;
+  process.env.MIGRATION_EXECUTOR_IMAGE_DIGEST = identity.executorImageDigest;
+  try {
+    const report = await executeMigrations(pool as unknown as Pool);
+    assert.equal(report.outcome, "no-op");
+    assert.equal(pool.connects, 1);
+  } finally {
+    if (previousSha === undefined) delete process.env.MIGRATION_SOURCE_GIT_SHA;
+    else process.env.MIGRATION_SOURCE_GIT_SHA = previousSha;
+    if (previousDigest === undefined) delete process.env.MIGRATION_EXECUTOR_IMAGE_DIGEST;
+    else process.env.MIGRATION_EXECUTOR_IMAGE_DIGEST = previousDigest;
+  }
+});
+
+test("production source and build expose no injectable executor or mutable registry", () => {
+  assert.throws(() => require.resolve("../src/db/migrate/execute-internal"));
+
+  const buildRoot = mkdtempSync(path.join(os.tmpdir(), "pb10-production-build-"));
+  const output = path.join(buildRoot, "backend", "dist");
+  try {
+    cpSync(path.resolve(__dirname, "../../.gitattributes"), path.join(buildRoot, ".gitattributes"));
+    cpSync(path.resolve(__dirname, "../../db"), path.join(buildRoot, "db"), { recursive: true });
+    const compiler = path.resolve(__dirname, "../node_modules/typescript/bin/tsc");
+    const built = spawnSync(process.execPath, [
+      compiler,
+      "--project", path.resolve(__dirname, "../tsconfig.json"),
+      "--outDir", output,
+      "--declaration",
+    ], { encoding: "utf8" });
+    assert.equal(built.status, 0, `${built.stdout}\n${built.stderr}`);
+
+    const migrationOutput = path.join(output, "db", "migrate");
+    assert.equal(existsSync(path.join(migrationOutput, "execute-internal.js")), false);
+    assert.equal(existsSync(path.join(migrationOutput, "execute-internal.d.ts")), false);
+    const declaration = readFileSync(path.join(migrationOutput, "execute.d.ts"), "utf8");
+    assert.match(declaration, /executeMigrations\(pool: Pool\): Promise<ExecutionReport>/);
+    assert.doesNotMatch(
+      declaration,
+      /executeVerifiedMigrations|registeredHandlers|InternalExecuteOptions/,
+    );
+
+    const probe = spawnSync(process.execPath, ["-e", `
+      const assert = require("node:assert/strict");
+      const target = require(${JSON.stringify(path.join(migrationOutput, "execute.js"))});
+      assert.equal(target.executeMigrations.length, 1);
+      assert.equal("registeredHandlers" in target, false);
+      assert.equal("executeVerifiedMigrations" in target, false);
+      assert.ok(Object.values(target).every((value) =>
+        typeof value !== "object" || value === null ||
+        (!("set" in value) && !("delete" in value) && !("clear" in value))));
+      assert.throws(() => require(${JSON.stringify(path.join(migrationOutput, "execute-internal.js"))}));
+    `], {
+      encoding: "utf8",
+      env: { ...process.env, NODE_PATH: path.resolve(__dirname, "../node_modules") },
+    });
+    assert.equal(probe.status, 0, `${probe.stdout}\n${probe.stderr}`);
+
+    const emitted = readdirSync(migrationOutput)
+      .filter((filename) => filename.endsWith(".js"))
+      .map((filename) => readFileSync(path.join(migrationOutput, filename), "utf8"))
+      .join("\n");
+    assert.doesNotMatch(emitted, /exports\.(?:executeVerifiedMigrations|registeredHandlers|identityFromEnvironment)/);
+  } finally {
+    rmSync(buildRoot, { recursive: true, force: true });
+  }
+});
+
 test("no migration SQL runs before the lock, control schema and ledger verify", async () => {
   const pool = new FakePool();
   await run(pool);
@@ -329,6 +526,34 @@ test("no migration SQL runs before the lock, control schema and ledger verify", 
   const globalLedgerIndex = pool.log.findIndex(({ sql }) => sql.includes("from migration_control.schema_migrations"));
   assert.ok(globalLedgerIndex < firstExecution, "execution connection used before ledger verification");
   assert.equal(pool.connects, 2);
+});
+
+test("ambiguous or invalid legacy timestamps fail before migration SQL or ledger writes", async () => {
+  for (const [timestamps, pattern] of [
+    [[
+      "2030-01-01T00:00:00.000Z",
+      "2030-01-01T00:00:00.000Z",
+    ], /ambiguous applied_at timestamps; manual reconciliation is required/],
+    [["not-a-timestamp"], /invalid applied_at timestamps; manual reconciliation is required/],
+    [[new Date("not-a-timestamp")], /invalid applied_at timestamps; manual reconciliation is required/],
+    [[null], /invalid applied_at timestamps; manual reconciliation is required/],
+    [[42], /invalid applied_at timestamps; manual reconciliation is required/],
+    [[new Date(Number.POSITIVE_INFINITY)], /invalid applied_at timestamps; manual reconciliation is required/],
+    [["2030-01-01T00:00:00.000Z", "not-a-timestamp"], /invalid applied_at timestamps; manual reconciliation is required/],
+  ] as Array<[unknown[], RegExp]>) {
+    const pool = new FakePool();
+    pool.control.legacyLedgerRows = timestamps.map((_, index) => (
+      [entries.legacy.filename, entries.transactional.filename][index]
+    ));
+    pool.control.legacyLedgerTimestamps = timestamps;
+    await assert.rejects(
+      run(pool, { manifest: manifestOf(entries.legacy, entries.transactional) }),
+      pattern,
+    );
+    assert.deepEqual(pool.migrationSql(), []);
+    assert.deepEqual(pool.control.appliedInserts, []);
+    assert.deepEqual(pool.control.events, []);
+  }
 });
 
 // 2, 3, 4 ─────────────────────────────────────────────────────────────────────
@@ -355,14 +580,125 @@ test("legacy payload is sent byte-for-byte, unwrapped, and records its observed 
   assert.equal(pool.control.appliedInserts[0][4], checksum);
   assert.equal(pool.execution.appliedInserts.length, 0);
   assert.deepEqual(pool.control.eventTypes(), ["started", "operation_completed", "applied_committed", "succeeded"]);
+  for (const { values } of pool.control.events) {
+    const metadata = JSON.parse(String(values[10])) as Record<string, unknown>;
+    assert.equal(metadata.migration_filename, entries.legacy.filename);
+    assert.equal(metadata.migration_ordinal, 1);
+  }
 });
 
 // 5 ───────────────────────────────────────────────────────────────────────────
 test("a stale legacy attempt fails closed and is never replayed", async () => {
   const pool = new FakePool();
-  pool.control.priorAttempts = 3;
+  pool.control.priorEvents = [retryEvent(1, "started")];
   await assert.rejects(run(pool), /stale_legacy_attempt/);
   assert.deepEqual(pool.migrationSql(), [], "no legacy SQL may be replayed");
+  assert.deepEqual(pool.control.appliedInserts, []);
+});
+
+test("only the exact confirmed SQL-failure-and-rollback history may retry", async () => {
+  const safe = new FakePool();
+  safe.control.priorEvents = [
+    retryEvent(1, "started"),
+    retryEvent(2, "heartbeat"),
+    retryEvent(3, "transaction_rolled_back"),
+    retryEvent(4, "execution_failed"),
+  ];
+  await run(safe);
+  assert.equal(safe.migrationSql().length, 1);
+  assert.equal(safe.control.appliedInserts.length, 1);
+
+  const base = () => [
+    retryEvent(1, "started"),
+    retryEvent(2, "transaction_rolled_back"),
+    retryEvent(3, "execution_failed"),
+  ];
+  const otherRun = "10000000-0000-4000-8000-000000000002";
+  const cases: Array<[string, PriorEventFixture[]]> = [
+    ["duplicate started", [retryEvent(1, "started"), retryEvent(2, "started"), retryEvent(3, "transaction_rolled_back"), retryEvent(4, "execution_failed")]],
+    ["missing started", [retryEvent(1, "heartbeat"), retryEvent(2, "transaction_rolled_back"), retryEvent(3, "execution_failed")]],
+    ["sequence begins above one", base().map((event) => ({ ...event, event_sequence: event.event_sequence + 1 }))],
+    ["sequence gap", [retryEvent(1, "started"), retryEvent(3, "transaction_rolled_back"), retryEvent(4, "execution_failed")]],
+    ["duplicate sequence", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back"), retryEvent(2, "execution_failed")]],
+    ["reordered sequence", [retryEvent(1, "started"), retryEvent(3, "transaction_rolled_back"), retryEvent(2, "execution_failed")]],
+    ["heartbeat after rollback", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back"), retryEvent(3, "heartbeat"), retryEvent(4, "execution_failed")]],
+    ["rollback not immediately before failure", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back"), retryEvent(3, "operation_completed"), retryEvent(4, "execution_failed")]],
+    ["missing rollback classification", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back", { error_class: null }), retryEvent(3, "execution_failed")]],
+    ["incorrect rollback classification", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back", { error_class: "connection_lost" }), retryEvent(3, "execution_failed")]],
+    ["missing SQLSTATE", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back", { sqlstate: null }), retryEvent(3, "execution_failed", { sqlstate: null })]],
+    ["inconsistent SQLSTATE", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back"), retryEvent(3, "execution_failed", { sqlstate: "22012" })]],
+    ["unexpected started ordinal", [retryEvent(1, "started", { statement_ordinal: 99 }), ...base().slice(1)]],
+    ["unexpected heartbeat ordinal", [retryEvent(1, "started"), retryEvent(2, "heartbeat", { statement_ordinal: 1 }), retryEvent(3, "transaction_rolled_back"), retryEvent(4, "execution_failed")]],
+    ["unexpected rollback ordinal", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back", { statement_ordinal: 99 }), retryEvent(3, "execution_failed")]],
+    ["unexpected failure ordinal", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back"), retryEvent(3, "execution_failed", { statement_ordinal: 99 })]],
+    ["missing required ordinal", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back", { statement_ordinal: null }), retryEvent(3, "execution_failed")]],
+    ["ordinal when null is required", [retryEvent(1, "started", { statement_ordinal: 1 }), ...base().slice(1)]],
+    ["negative ordinal", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back", { statement_ordinal: -1 }), retryEvent(3, "execution_failed")]],
+    ["missing ordinal", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back", { statement_ordinal: undefined as never }), retryEvent(3, "execution_failed")]],
+    ["malformed ordinal", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back", { statement_ordinal: Number.NaN }), retryEvent(3, "execution_failed")]],
+    ["fractional ordinal", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back", { statement_ordinal: 1.5 }), retryEvent(3, "execution_failed")]],
+    ["inconsistent ordinals", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back"), retryEvent(3, "execution_failed", { statement_ordinal: 2 })]],
+    ["filename absent from historical events", base().map((event) => ({
+      ...event,
+      metadata: { execution_mode: "legacy-verbatim", migration_ordinal: 1 },
+    }))],
+    ["inconsistent filenames within one run", [
+      retryEvent(1, "started"),
+      retryEvent(2, "transaction_rolled_back", {
+        metadata: {
+          execution_mode: "legacy-verbatim",
+          migration_filename: "0001_renamed_after_failure.sql",
+          migration_ordinal: 1,
+        },
+      }),
+      retryEvent(3, "execution_failed"),
+    ]],
+    ["inconsistent migration ordinal", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back", {
+      metadata: {
+        execution_mode: "legacy-verbatim",
+        migration_filename: entries.legacy.filename,
+        migration_ordinal: 2,
+      },
+    }), retryEvent(3, "execution_failed")]],
+    ["malformed metadata", [retryEvent(1, "started", { metadata: { execution_mode: "transactional" } }), ...base().slice(1)]],
+    ["inconsistent identity metadata", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back", { source_git_sha: "a".repeat(40) }), retryEvent(3, "execution_failed")]],
+    ["mismatched migration ID", base().map((event) => ({ ...event, migration_id: "0002" }))],
+    ["duplicate rollback", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back"), retryEvent(3, "transaction_rolled_back"), retryEvent(4, "execution_failed")]],
+    ["duplicate terminal failure", [...base(), retryEvent(4, "execution_failed")]],
+    ["event after terminal failure", [...base(), retryEvent(4, "heartbeat")]],
+    ["operation completed without applied row", [retryEvent(1, "started"), retryEvent(2, "operation_completed")]],
+    ["unknown COMMIT", [retryEvent(1, "started"), retryEvent(2, "execution_failed")]],
+    ["connection loss", [retryEvent(1, "started"), retryEvent(2, "execution_failed", { error_class: "control_connection_lost" })]],
+    ["events from another run", [retryEvent(1, "started"), retryEvent(2, "transaction_rolled_back"), retryEvent(3, "execution_failed", { run_id: otherRun })]],
+  ];
+
+  for (const [name, events] of cases) {
+    const ambiguous = new FakePool();
+    ambiguous.control.priorEvents = events;
+    await assert.rejects(run(ambiguous), /stale_legacy_attempt/);
+    assert.deepEqual(ambiguous.migrationSql(), [], name);
+    assert.deepEqual(ambiguous.control.appliedInserts, [], name);
+  }
+
+  const renamedFilename = new FakePool();
+  renamedFilename.control.priorEvents = base();
+  writeFileSync(path.join(root, "db", "migrations", "0001_renamed_after_failure.sql"), files["0001_legacy_demo.sql"]);
+  await assert.rejects(
+    run(renamedFilename, {
+      manifest: manifestOf({ ...entries.legacy, filename: "0001_renamed_after_failure.sql" }),
+    }),
+    /stale_legacy_attempt/,
+  );
+  assert.deepEqual(renamedFilename.migrationSql(), []);
+  assert.deepEqual(renamedFilename.control.appliedInserts, []);
+});
+
+test("a legacy SQL failure records confirmed rollback before failure", async () => {
+  const pool = new FakePool();
+  pool.execution.failMigrationSql = Object.assign(new Error("known failure"), { code: "23505" });
+  await assert.rejects(run(pool), /sql_failed/);
+  assert.deepEqual(pool.control.eventTypes(), ["started", "transaction_rolled_back", "execution_failed"]);
+  assert.deepEqual(pool.control.events.map(({ values }) => values[11]), [null, 1, 1]);
   assert.deepEqual(pool.control.appliedInserts, []);
 });
 
@@ -416,179 +752,28 @@ test("transactional failure rolls back with no applied row and durable control e
   }
 });
 
-// 9 ───────────────────────────────────────────────────────────────────────────
-test("a nontransactional wall-clock expiry cancels the execution backend", async () => {
-  const pool = new FakePool();
-  pool.execution.hangMigrationSql = true;
-  pool.control.onCancel = () => pool.execution.settlePendingOperation();
+test("production handlers are private and unsupported modes fail closed", async () => {
+  const module = require("../src/db/migrate/execute") as Record<string, unknown>;
+  assert.equal("registeredHandlers" in module, false);
+  assert.ok(Object.values(module).every((value) =>
+    typeof value !== "object"
+    || value === null
+    || (!("set" in value) && !("delete" in value) && !("clear" in value))));
 
+  for (const entry of [entries.nontransactional, entries.batched]) {
+    const pool = new FakePool();
+    await assert.rejects(run(pool, { manifest: manifestOf(entry) }), /unsupported_handler/);
+    assert.deepEqual(pool.migrationSql(), []);
+    assert.deepEqual(pool.control.appliedInserts, []);
+  }
+
+  const injected = new FakePool();
+  const handlers = { nontransactional: new Map([["0101", { inspect: async () => "valid" }]]), batched: new Map() };
   await assert.rejects(
-    run(pool, {
-      manifest: manifestOf(entries.nontransactional),
-      handlers: handlersWith({ nontransactional: new Map([["0101", inspector("absent")]]) }),
-      // Only the wall-clock budget elapses; the grace period does not.
-      sleep: async (milliseconds) => { if (milliseconds !== timeouts.wallClockMs) await never(); },
-    }),
-    /wall_clock_exceeded/,
+    executeMigrations(injected as unknown as Pool, { handlers } as never),
+    /exactly one Pool argument/,
   );
-
-  const cancel = pool.log.find(({ client, sql }) => client === "control" && sql.includes("pg_cancel_backend"));
-  assert.ok(cancel, "the control connection must cancel the execution backend");
-  assert.deepEqual(cancel?.values, [4242]);
-  assert.deepEqual(pool.control.appliedInserts, []);
-  assert.equal(pool.execution.releasedWith, undefined, "a confirmed cancellation reuses the connection");
-});
-
-// 10 ──────────────────────────────────────────────────────────────────────────
-test("an unconfirmed cancellation destroys the execution client", async () => {
-  const pool = new FakePool();
-  pool.execution.hangMigrationSql = true;
-
-  await assert.rejects(
-    run(pool, {
-      manifest: manifestOf(entries.nontransactional),
-      handlers: handlersWith({ nontransactional: new Map([["0101", inspector("absent")]]) }),
-      // Budget and grace both elapse; the operation never settles.
-      sleep: async (milliseconds) => {
-        if (milliseconds !== timeouts.wallClockMs && milliseconds !== CANCELLATION_GRACE_MS) await never();
-      },
-    }),
-    /cancellation_unverified/,
-  );
-
-  assert.ok(pool.execution.releasedWith instanceof Error, "the execution client must be destroyed, not pooled");
-  assert.match(pool.execution.releasedWith?.message ?? "", /cancellation_unverified/);
-  assert.deepEqual(pool.control.appliedInserts, []);
-});
-
-// 11 ──────────────────────────────────────────────────────────────────────────
-test("a nontransactional applied row is written only after the verifier confirms completion", async () => {
-  const pool = new FakePool();
-  const handler = inspector("absent", "valid");
-  const report = await run(pool, {
-    manifest: manifestOf(entries.nontransactional),
-    handlers: handlersWith({ nontransactional: new Map([["0101", handler]]) }),
-  });
-
-  assert.equal(handler.calls, 2, "the verifier runs before and after the operation");
-  const globalOrder = pool.log.map(({ sql }) => sql);
-  const operation = globalOrder.findIndex((sql) => sql.includes("create index concurrently"));
-  const insert = globalOrder.findIndex((sql) => sql.includes("into migration_control.schema_migrations"));
-  assert.ok(operation >= 0 && operation < insert);
-  assert.equal(pool.control.appliedInserts.length, 1);
-  assert.equal(report.executed[0].adopted, false);
-  assert.deepEqual(pool.control.eventTypes(), ["started", "operation_completed", "applied_committed", "succeeded"]);
-
-  // statement/transaction/idle timeouts are disabled; the control connection owns the budget.
-  const settings = pool.log
-    .filter(({ client, sql }) => client === "execution" && sql.includes("set_config"))
-    .map(({ values }) => (values as [string, string, boolean]).slice(0, 3));
-  assert.deepEqual(settings, [
-    ["lock_timeout", "5000", false],
-    ["statement_timeout", "0", false],
-    ["transaction_timeout", "0", false],
-    ["idle_in_transaction_session_timeout", "0", false],
-  ]);
-});
-
-// 12 ──────────────────────────────────────────────────────────────────────────
-test("valid-but-unrecorded nontransactional state is adopted, not re-executed", async () => {
-  const pool = new FakePool();
-  const handler = inspector("valid");
-  const report = await run(pool, {
-    manifest: manifestOf(entries.nontransactional),
-    handlers: handlersWith({ nontransactional: new Map([["0101", handler]]) }),
-  });
-
-  assert.equal(handler.calls, 1, "an adopted operation is inspected once and never re-run");
-  assert.deepEqual(pool.migrationSql(), [], "no operation SQL may be replayed");
-  assert.equal(report.executed[0].adopted, true);
-  assert.equal(pool.control.appliedInserts.length, 1);
-  assert.deepEqual(pool.control.eventTypes(), ["started", "operation_completed", "applied_committed", "succeeded"]);
-});
-
-// 13 ──────────────────────────────────────────────────────────────────────────
-test("invalid or partial nontransactional state is never blindly replayed", async () => {
-  const pool = new FakePool();
-  await assert.rejects(
-    run(pool, {
-      manifest: manifestOf(entries.nontransactional),
-      handlers: handlersWith({ nontransactional: new Map([["0101", inspector("invalid")]]) }),
-    }),
-    /verifier_state_invalid/,
-  );
-  assert.deepEqual(pool.migrationSql(), []);
-  assert.deepEqual(pool.control.appliedInserts, []);
-  assert.deepEqual(pool.control.eventTypes(), ["started", "verification_failed"]);
-
-  // Post-execution verification failure is equally fatal and records no row.
-  const second = new FakePool();
-  await assert.rejects(
-    run(second, {
-      manifest: manifestOf(entries.nontransactional),
-      handlers: handlersWith({ nontransactional: new Map([["0101", inspector("absent", "invalid")]]) }),
-    }),
-    /verification_failed/,
-  );
-  assert.deepEqual(second.control.appliedInserts, []);
-});
-
-// 14 ──────────────────────────────────────────────────────────────────────────
-test("batched mode without a registered handler fails closed and never degrades", async () => {
-  const pool = new FakePool();
-  await assert.rejects(run(pool, { manifest: manifestOf(entries.batched) }), /unsupported_handler/);
-  assert.deepEqual(pool.migrationSql(), [], "batched must not fall back to another mode");
-  assert.deepEqual(pool.control.appliedInserts, []);
-  assert.deepEqual(pool.control.eventTypes(), []);
-
-  // Nontransactional is equally strict about its verifier.
-  const nontransactional = new FakePool();
-  await assert.rejects(
-    run(nontransactional, { manifest: manifestOf(entries.nontransactional) }),
-    /unsupported_handler/,
-  );
-  assert.deepEqual(nontransactional.migrationSql(), []);
-
-  // The shipped registry is empty on purpose: no reviewed handler exists yet.
-  assert.equal(registeredHandlers.nontransactional.size, 0);
-  assert.equal(registeredHandlers.batched.size, 0);
-});
-
-test("a registered batched handler drives bounded per-batch transactions and must verify completion", async () => {
-  const pool = new FakePool();
-  const handler: BatchedHandler = {
-    async execute(context) {
-      await context.runBatch(async (client) => { await client.query("update demo set label = 'x' where label is null"); });
-      await context.runBatch(async (client) => { await client.query("update demo set label = 'x' where label is null"); });
-    },
-    async verifyComplete() { return true; },
-  };
-  await run(pool, {
-    manifest: manifestOf(entries.batched),
-    handlers: handlersWith({ batched: new Map([["0102", handler]]) }),
-  });
-
-  const executionSql = pool.log.filter(({ client }) => client === "execution").map(({ sql }) => sql);
-  assert.equal(executionSql.filter((sql) => sql === "begin").length, 2);
-  assert.equal(executionSql.filter((sql) => sql === "commit").length, 2);
-  assert.deepEqual(pool.control.eventTypes(), [
-    "started", "operation_completed", "operation_completed", "applied_committed", "succeeded",
-  ]);
-  assert.deepEqual(
-    pool.control.events.filter(({ type }) => type === "operation_completed")
-      .map((event) => JSON.parse(String(event.values[10])).batch_number),
-    [1, 2],
-  );
-
-  const incomplete = new FakePool();
-  await assert.rejects(
-    run(incomplete, {
-      manifest: manifestOf(entries.batched),
-      handlers: handlersWith({ batched: new Map([["0102", { ...handler, verifyComplete: async () => false }]]) }),
-    }),
-    /verification_failed/,
-  );
-  assert.deepEqual(incomplete.control.appliedInserts, []);
+  assert.equal(injected.connects, 0);
 });
 
 // 15 ──────────────────────────────────────────────────────────────────────────
@@ -599,7 +784,6 @@ test("loss of the control connection aborts execution and destroys the execution
 
   const pending = run(pool, {
     manifest: manifestOf(entries.transactional),
-    handlers: handlersWith({}),
   });
   setImmediate(() => {
     pool.control.dead = lost;
@@ -647,7 +831,8 @@ test("events, reports and errors leak no SQL bodies, parameters or secrets", asy
   // Every event's metadata is confined to the mr_metadata_ck vocabulary.
   const permitted = new Set([
     "duration_ms", "elapsed_ms", "rows_affected", "statement_count", "batch_number",
-    "retry_count", "operation_category", "execution_mode", "verification", "reclaim_reason",
+    "retry_count", "operation_category", "execution_mode", "migration_filename",
+    "migration_ordinal", "verification", "reclaim_reason",
   ]);
   for (const event of pool.control.events) {
     for (const key of Object.keys(JSON.parse(String(event.values[10])))) {
@@ -722,28 +907,16 @@ test("checksum, filename, order and mode drift all block execution", async () =>
 // Timeout and identity contracts ──────────────────────────────────────────────
 test("manifest timeouts above the approved ceilings are rejected before execution", async () => {
   for (const [key, ceiling] of Object.entries(TIMEOUT_CEILINGS)) {
-    assert.throws(
-      () => assertTimeoutCeilings([{ ...entries.transactional, timeouts: { ...timeouts, [key]: ceiling + 1 } }]),
+    const pool = new FakePool();
+    await assert.rejects(
+      run(pool, { manifest: manifestOf({ ...entries.transactional, timeouts: { ...timeouts, [key]: ceiling + 1 } }) }),
       /manifest_ceiling_exceeded/,
     );
+    assert.equal(pool.connects, 1);
   }
-  assert.throws(
-    () => assertTimeoutCeilings([{ ...entries.transactional, timeouts: { ...timeouts, wallClockMs: TRANSACTIONAL_WALL_CLOCK_CEILING_MS + 1 } }]),
-    /manifest_ceiling_exceeded/,
-  );
-  // Nontransactional gets the larger cancellation budget, but not an unbounded one.
-  assertTimeoutCeilings([{ ...entries.nontransactional, timeouts: { ...timeouts, wallClockMs: NONTRANSACTIONAL_WALL_CLOCK_CEILING_MS } }]);
-  assert.throws(
-    () => assertTimeoutCeilings([{ ...entries.nontransactional, timeouts: { ...timeouts, wallClockMs: NONTRANSACTIONAL_WALL_CLOCK_CEILING_MS + 1 } }]),
-    /manifest_ceiling_exceeded/,
-  );
-  // Ceilings are per migration: the real 24-migration legacy set declares far
-  // more worst-case headroom than the runner budget and must still execute.
-  assertTimeoutCeilings(Array.from({ length: 24 }, () => entries.legacy));
-
   const pool = new FakePool();
   await assert.rejects(
-    run(pool, { manifest: manifestOf({ ...entries.legacy, timeouts: { ...timeouts, statementMs: 60_001 } }) }),
+    run(pool, { manifest: manifestOf({ ...entries.nontransactional, timeouts: { ...timeouts, wallClockMs: 1_800_001 } }) }),
     /manifest_ceiling_exceeded/,
   );
   assert.deepEqual(pool.migrationSql(), []);
@@ -768,31 +941,67 @@ test("the schema-runner budget is enforced against elapsed time, not declared ce
   assert.equal(pool.migrationSql().length, 1);
 });
 
-test("executor identity is required, validated, and never invented", () => {
-  assert.throws(() => identityFromEnvironment({}), /MIGRATION_SOURCE_GIT_SHA/);
-  assert.throws(
-    () => identityFromEnvironment({ MIGRATION_SOURCE_GIT_SHA: "zzz" }),
-    /MIGRATION_SOURCE_GIT_SHA/,
-  );
-  assert.throws(
-    () => identityFromEnvironment({ MIGRATION_SOURCE_GIT_SHA: "a".repeat(40) }),
-    /MIGRATION_EXECUTOR_IMAGE_DIGEST/,
-  );
-  assert.throws(
-    () => identityFromEnvironment({
-      MIGRATION_SOURCE_GIT_SHA: "a".repeat(40),
-      MIGRATION_EXECUTOR_IMAGE_DIGEST: `sha256:${"b".repeat(64)}`,
-      MIGRATION_RUNNER_ID: "bad id with spaces",
+test("executor identity rejects only malformed or explicit placeholder values", async () => {
+  const invalid = [
+    { ...identity, sourceGitSha: "" },
+    { ...identity, sourceGitSha: "zzz" },
+    { ...identity, sourceGitSha: identity.sourceGitSha.toUpperCase() },
+    { ...identity, sourceGitSha: ` ${identity.sourceGitSha}` },
+    { ...identity, sourceGitSha: "0".repeat(40) },
+    { ...identity, sourceGitSha: "f".repeat(40) },
+    { ...identity, sourceGitSha: "deadbeef".repeat(5) },
+    { ...identity, executorImageDigest: identity.executorImageDigest.toUpperCase() },
+    { ...identity, executorImageDigest: `${identity.executorImageDigest} ` },
+    { ...identity, executorImageDigest: `sha256:${"0".repeat(64)}` },
+    { ...identity, executorImageDigest: `sha256:${"cafebabe".repeat(8)}` },
+    { ...identity, runnerId: "bad id with spaces" },
+  ];
+  for (const candidate of invalid) {
+    const pool = new FakePool();
+    await assert.rejects(
+      executeMigrationsForTest(pool as unknown as Pool, {
+        manifest: manifestOf(entries.legacy),
+        repositoryRoot: root,
+        identity: candidate,
+      }),
+      /identity_missing/,
+    );
+    assert.equal(pool.connects, 0);
+  }
+
+  for (const candidate of [
+    identity,
+    {
+      ...identity,
+      sourceGitSha: "abcdef".repeat(7),
+      executorImageDigest: `sha256:${"01234567".repeat(8)}`,
+    },
+  ]) {
+    const pool = new FakePool();
+    pool.control.ledgerRows = [appliedRow(entries.legacy, 1)];
+    assert.equal((await executeMigrationsForTest(pool as unknown as Pool, {
+      manifest: manifestOf(entries.legacy),
+      repositoryRoot: root,
+      identity: candidate,
+    })).outcome, "no-op");
+  }
+});
+
+test("test-only injected identity is validated before client acquisition", async () => {
+  const pool = new FakePool();
+  await assert.rejects(
+    executeMigrationsForTest(pool as unknown as Pool, {
+      manifest: manifestOf(entries.legacy),
+      repositoryRoot: root,
+      identity: {
+        sourceGitSha: "0".repeat(40),
+        executorImageDigest: `sha256:${"f".repeat(64)}`,
+        runnerId: null,
+      },
     }),
-    /MIGRATION_RUNNER_ID/,
+    /identity_missing/,
   );
-  assert.deepEqual(
-    identityFromEnvironment({
-      MIGRATION_SOURCE_GIT_SHA: "a".repeat(40),
-      MIGRATION_EXECUTOR_IMAGE_DIGEST: `sha256:${"b".repeat(64)}`,
-    }),
-    { sourceGitSha: "a".repeat(40), executorImageDigest: `sha256:${"b".repeat(64)}`, runnerId: null },
-  );
+  assert.equal(pool.connects, 0);
 });
 
 test("event sequence starts at one and increases monotonically across a run", async () => {

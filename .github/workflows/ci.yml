@@ -48,8 +48,18 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/submitsense
-      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/submitsense
+      # Provisioning/teardown credential only (create/drop whole databases as
+      # the postgres superuser). Deliberately job-scoped: it is not the
+      # app-vs-migration credential pair that creates the cross-contamination
+      # risk this job guards against, so every step needing to create or drop
+      # a database may use it directly. TEST_DATABASE_URL and
+      # MIGRATION_TEST_DATABASE_URL are NOT set here — each step below opts
+      # into exactly the one(s) it needs, so a normal application/commercial
+      # step can never see the migration-only credential and vice versa. The
+      # two identity-guard steps are the sole, deliberate exception: their
+      # entire job is to prove those two credentials name different physical
+      # databases, which requires seeing both.
+      ADMIN_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/submitsense
       PGSSLMODE: disable
     steps:
       - uses: actions/checkout@v4
@@ -61,6 +71,14 @@ jobs:
           cache: npm
           cache-dependency-path: backend/package-lock.json
       - run: npm ci --prefix backend
+      - name: Verify frozen previous-schema fixture integrity
+        run: db/control/test-fixture-integrity.sh
+      - name: Verify mr_metadata_ck CHECK-clause parity (fresh install vs. upgrade)
+        run: db/control/test-check-clause-parity.sh
+      - name: Provision isolated application and migration databases
+        run: |
+          psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "create database application_test"
+          psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "create database migration_execution_test"
       - name: Test migration manifest contract
         run: node --import tsx --test test/migration-manifest.test.ts
         working-directory: backend
@@ -78,32 +96,81 @@ jobs:
           fi
           npm run manifest:history --prefix backend -- "$MIGRATION_BASE"
       - name: Apply every forward migration
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: |
           for migration in db/migrations/0*.sql; do
             [[ "$migration" == *.down.sql ]] && continue
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration"
           done
       - name: Run database guardrails
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: |
           for test_file in db/test/test*.sql; do
             [[ "$test_file" == "db/test/test_migration_control.sql" ]] && continue
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$test_file"
           done
       - name: Apply PB-10 migration control schema
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/control/control-schema.sql
       - name: Verify control-schema re-application fails closed
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: |
           if psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/control/control-schema.sql; then
             echo "re-application unexpectedly succeeded"
             exit 1
           fi
           test "$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'migration_control' and c.relkind = 'r'")" = "2"
+      - name: Verify control-schema upgrade from the previous PB-10 installation
+        run: |
+          psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "create database control_schema_upgrade_test"
+          UPGRADE_DB_URL="postgresql://postgres:postgres@localhost:5432/control_schema_upgrade_test"
+          psql "$UPGRADE_DB_URL" -v ON_ERROR_STOP=1 -f db/control/fixtures/control-schema.pre-metadata-filename-ordinal.sql
+          psql "$UPGRADE_DB_URL" -v ON_ERROR_STOP=1 -q \
+            -c "insert into migration_control.schema_migrations (migration_id, ordinal, filename, manifest_checksum_sha256, applied_checksum_sha256, lifecycle_phase, operation_categories, execution_mode, applied_at, run_id, baselined, source_git_sha, executor_image_digest) values ('0001', 1, '0001_extensions_helpers.sql', repeat('a', 64), null, 'expand', array['schema'], 'legacy-verbatim', now(), gen_random_uuid(), true, '5324116250977b5e8ac24bc83b6cae89ebcbd990', 'sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08')" \
+            -c "insert into migration_control.migration_runs (run_id, migration_id, event_sequence, event_type, metadata) values (gen_random_uuid(), '0001', 1, 'started', '{}'::jsonb)"
+          before_rows="$(psql "$UPGRADE_DB_URL" -XAtq -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from migration_control.migration_runs)")"
+          DATABASE_URL="$UPGRADE_DB_URL" db/control/install-or-upgrade-control-schema.sh
+          DATABASE_URL="$UPGRADE_DB_URL" db/control/install-or-upgrade-control-schema.sh
+          DATABASE_URL="$UPGRADE_DB_URL" db/control/install-or-upgrade-control-schema.sh
+          after_rows="$(psql "$UPGRADE_DB_URL" -XAtq -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from migration_control.migration_runs)")"
+          test "$before_rows" = "1:1"
+          test "$after_rows" = "$before_rows"
+          test "$(psql "$UPGRADE_DB_URL" -XAtq -c "select count(*) from pg_constraint where conrelid = 'migration_control.migration_runs'::regclass and conname = 'mr_metadata_ck'")" = "1"
+          psql "$UPGRADE_DB_URL" -v ON_ERROR_STOP=1 -q -c "insert into migration_control.migration_runs (run_id, migration_id, event_sequence, event_type, metadata) values (gen_random_uuid(), '0001', 2, 'started', '{\"migration_filename\":\"0001_extensions_helpers.sql\",\"migration_ordinal\":1}'::jsonb)"
+          if psql "$UPGRADE_DB_URL" -q -c "insert into migration_control.migration_runs (run_id, migration_id, event_sequence, event_type, metadata) values (gen_random_uuid(), '0001', 3, 'started', '{\"sql\":\"drop table x\"}'::jsonb)" 2>/tmp/upgrade-reject.err; then
+            echo "invalid metadata unexpectedly accepted after upgrade"
+            exit 1
+          fi
+          grep -q "mr_metadata_ck" /tmp/upgrade-reject.err
+          psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "drop database control_schema_upgrade_test with (force)"
+      - name: Verify the upgrade resists search_path spoofing
+        run: |
+          psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "create database search_path_spoof_test"
+          PGDATABASE_URL="postgresql://postgres:postgres@localhost:5432/search_path_spoof_test" \
+            db/control/test-hostile-search-path.sh
+          psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "drop database search_path_spoof_test with (force)"
+      - name: Test migrate.sh infrastructure-ledger insert is injection-safe
+        run: |
+          psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "create database migrate_ledger_insert_test"
+          PGHOST=localhost PGPORT=5432 PGDATABASE=migrate_ledger_insert_test PGUSER=postgres PGPASSWORD=postgres \
+            infra/scripts/test-migrate-ledger-insert.sh
+          psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "drop database migrate_ledger_insert_test with (force)"
       - name: Test migration control schema and advisory lock
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/test/test_migration_control.sql
       - name: Test read-only migration plan
+        # Pure unit test of runner.ts's plan-building logic; no database
+        # credential of any kind reaches this step.
         run: node --import tsx --test test/migration-runner.test.ts
         working-directory: backend
       - name: Verify real migration plan is read-only
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: |
           before="$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from migration_control.migration_runs)")"
           npm run --silent migrate:plan --prefix backend > /tmp/migration-plan.json
@@ -112,6 +179,8 @@ jobs:
           test "$after" = "$before"
           node -e 'const plan = require("/tmp/migration-plan.json"); if (plan.pendingCount !== 24) process.exit(1)'
       - name: Verify plan fails closed on legacy ledger divergence
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
             -c "create table public.infrastructure_schema_migrations (filename text primary key, applied_at timestamptz not null default now())" \
@@ -124,13 +193,44 @@ jobs:
           test "$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from public.infrastructure_schema_migrations)")" = "0:1"
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c "drop table public.infrastructure_schema_migrations"
       - name: Test migration execution modes
+        # Pure unit test of execute.ts against an in-memory fake pool; no
+        # database credential of any kind reaches this step.
         run: node --import tsx --test test/migration-execute.test.ts
         working-directory: backend
       - name: Test migration execution against real PostgreSQL
+        env:
+          # Both credentials, deliberately: this suite's own before() runs
+          # the application/migration database-identity guard (see
+          # database-identity.ts) as the very first thing, before it opens
+          # any connection or issues any destructive statement, and that
+          # guard must be able to see both databases to prove they differ.
+          MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: node --import tsx --test test/migration-execute.pg.test.ts
         working-directory: backend
-      - run: node --import tsx --test test/commercial-webhook.integration.test.ts
+      - name: Test application/migration database identity guard
+        env:
+          # Both credentials, deliberately: this suite's entire purpose is to
+          # prove they resolve to different physical databases.
+          MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
+        run: node --import tsx --test test/database-identity.pg.test.ts
         working-directory: backend
+      - name: Prove the application database survived destructive migration tests
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
+        run: |
+          test "$(psql "$TEST_DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select to_regclass('public.tenants') is not null and to_regclass('public.users') is not null")" = "t"
+      - name: Run commercial database tests against the untouched application database
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
+        run: node --import tsx --test test/commercial-webhook.integration.test.ts
+        working-directory: backend
+      - name: Delete isolated test databases
+        if: always()
+        run: |
+          psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "drop database if exists migration_execution_test with (force)"
+          psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "drop database if exists application_test with (force)"
 
   infrastructure:
     runs-on: ubuntu-latest

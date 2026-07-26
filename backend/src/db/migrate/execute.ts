@@ -17,7 +17,6 @@ import {
   readAppliedRows,
   verifyControlSchema,
   withSchemaAdvisoryLock,
-  type SchemaLockOptions,
 } from "./runner";
 
 /**
@@ -39,6 +38,7 @@ export const CANCELLATION_GRACE_MS = 10_000;
 const RUNNER_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const SQLSTATE = /^[0-9A-Z]{5}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 type EventType =
   | "started"
@@ -64,6 +64,8 @@ const METADATA_KEYS = [
   "retry_count",
   "operation_category",
   "execution_mode",
+  "migration_filename",
+  "migration_ordinal",
   "verification",
   "reclaim_reason",
 ] as const;
@@ -133,7 +135,7 @@ export interface BatchedHandler {
   verifyComplete(client: PoolClient): Promise<boolean>;
 }
 
-export interface MigrationHandlers {
+interface MigrationHandlers {
   nontransactional: ReadonlyMap<string, NontransactionalHandler>;
   batched: ReadonlyMap<string, BatchedHandler>;
 }
@@ -143,7 +145,7 @@ export interface MigrationHandlers {
  * empty and every nontransactional/batched migration fails closed on an
  * unsupported-handler error until a reviewed handler is registered here.
  */
-export const registeredHandlers: MigrationHandlers = {
+const registeredHandlers: MigrationHandlers = {
   nontransactional: new Map<string, NontransactionalHandler>(),
   batched: new Map<string, BatchedHandler>(),
 };
@@ -174,17 +176,6 @@ export interface ExecutionReport {
   outcome: "no-op" | "completed";
 }
 
-export interface ExecuteOptions extends SchemaLockOptions {
-  manifest?: MigrationManifest;
-  identity?: ExecutionIdentity;
-  handlers?: MigrationHandlers;
-  repositoryRoot?: string;
-  runId?: string;
-  /** Injectable so cancellation supervision is testable without real waiting. */
-  sleep?: (milliseconds: number) => Promise<void>;
-  now?: () => number;
-}
-
 function assertCondition(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
@@ -208,14 +199,31 @@ function classify(error: unknown, errorClass: ErrorClass, migrationId: string, d
   return new MigrationExecutionError(errorClass, detail, migrationId, sqlstateOf(error));
 }
 
-export function identityFromEnvironment(environment: NodeJS.ProcessEnv = process.env): ExecutionIdentity {
-  const sourceGitSha = environment.MIGRATION_SOURCE_GIT_SHA ?? "";
-  const executorImageDigest = environment.MIGRATION_EXECUTOR_IMAGE_DIGEST ?? "";
-  const runnerId = environment.MIGRATION_RUNNER_ID ?? null;
-  if (!GIT_SHA.test(sourceGitSha)) {
+function identityFromEnvironment(environment: NodeJS.ProcessEnv = process.env): ExecutionIdentity {
+  return validateExecutionIdentity({
+    sourceGitSha: environment.MIGRATION_SOURCE_GIT_SHA ?? "",
+    executorImageDigest: environment.MIGRATION_EXECUTOR_IMAGE_DIGEST ?? "",
+    runnerId: environment.MIGRATION_RUNNER_ID ?? null,
+  });
+}
+
+function isObviousPlaceholder(value: string): boolean {
+  const lowered = value.toLowerCase();
+  return /^0+$/.test(lowered)
+    || /^f+$/.test(lowered)
+    || /^(?:deadbeef)+$/.test(lowered)
+    || /^(?:cafebabe)+$/.test(lowered)
+    || /^(?:feedface)+$/.test(lowered)
+    || /^(?:decafbad)+$/.test(lowered);
+}
+
+function validateExecutionIdentity(identity: ExecutionIdentity): ExecutionIdentity {
+  const { sourceGitSha, executorImageDigest, runnerId } = identity;
+  if (!GIT_SHA.test(sourceGitSha) || isObviousPlaceholder(sourceGitSha)) {
     throw new MigrationExecutionError("identity_missing", "MIGRATION_SOURCE_GIT_SHA must be a 7-64 character lowercase hex commit SHA");
   }
-  if (!IMAGE_DIGEST.test(executorImageDigest)) {
+  const digest = executorImageDigest.slice("sha256:".length);
+  if (!IMAGE_DIGEST.test(executorImageDigest) || isObviousPlaceholder(digest)) {
     throw new MigrationExecutionError("identity_missing", "MIGRATION_EXECUTOR_IMAGE_DIGEST must look like sha256:<64 hex>");
   }
   if (runnerId !== null && !RUNNER_ID.test(runnerId)) {
@@ -235,7 +243,7 @@ export function identityFromEnvironment(environment: NodeJS.ProcessEnv = process
  * schema-runner budget is enforced against *elapsed* time during the run
  * instead, in executeMigrations.
  */
-export function assertTimeoutCeilings(
+function assertTimeoutCeilings(
   pending: Array<Pick<MigrationManifestEntry, "id" | "executionMode" | "timeouts">>,
 ): void {
   for (const entry of pending) {
@@ -283,6 +291,7 @@ class RunLog {
     private readonly control: PoolClient,
     readonly runId: string,
     private readonly identity: ExecutionIdentity,
+    private readonly manifest: MigrationManifest,
   ) {}
 
   get lastSequence(): number {
@@ -293,9 +302,22 @@ class RunLog {
     migrationId: string,
     eventType: EventType,
     metadata: EventMetadata = {},
-    extra: { sqlstate?: string | null; errorClass?: ErrorClass; heartbeatDeadline?: Date } = {},
+    extra: {
+      sqlstate?: string | null;
+      errorClass?: ErrorClass;
+      heartbeatDeadline?: Date;
+      statementOrdinal?: number;
+    } = {},
   ): Promise<void> {
-    for (const key of Object.keys(metadata)) {
+    const ordinal = this.manifest.migrations.findIndex(({ id }) => id === migrationId) + 1;
+    const entry = this.manifest.migrations[ordinal - 1];
+    assertCondition(entry?.id === migrationId, `Migration ${migrationId} is not present in the verified manifest`);
+    const persistedMetadata: EventMetadata = {
+      ...metadata,
+      migration_filename: entry.filename,
+      migration_ordinal: ordinal,
+    };
+    for (const key of Object.keys(persistedMetadata)) {
       assertCondition(
         (METADATA_KEYS as readonly string[]).includes(key),
         `Event metadata key ${key} is not permitted by mr_metadata_ck`,
@@ -305,12 +327,17 @@ class RunLog {
       extra.heartbeatDeadline === undefined || eventType === "started" || eventType === "heartbeat",
       "heartbeat_deadline is only permitted on started and heartbeat events",
     );
+    assertCondition(
+      extra.statementOrdinal === undefined
+        || (Number.isSafeInteger(extra.statementOrdinal) && extra.statementOrdinal > 0),
+      "statement_ordinal must be a positive safe integer",
+    );
     this.sequence += 1;
     await this.control.query(
       `insert into migration_control.migration_runs
          (run_id, migration_id, event_sequence, event_type, runner_id, heartbeat_deadline,
-          source_git_sha, executor_image_digest, sqlstate, error_class, metadata)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)`,
+          source_git_sha, executor_image_digest, sqlstate, error_class, metadata, statement_ordinal)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)`,
       [
         this.runId,
         migrationId,
@@ -322,7 +349,8 @@ class RunLog {
         this.identity.executorImageDigest,
         extra.sqlstate ?? null,
         extra.errorClass ?? null,
-        JSON.stringify(metadata),
+        JSON.stringify(persistedMetadata),
+        extra.statementOrdinal ?? null,
       ],
     );
   }
@@ -375,6 +403,118 @@ interface MigrationContext {
   destroyExecution: () => void;
 }
 
+type PriorEvent = {
+  run_id: string;
+  migration_id: string;
+  event_sequence: number;
+  event_type: string;
+  runner_id: string | null;
+  heartbeat_deadline: Date | string | null;
+  source_git_sha: string | null;
+  executor_image_digest: string | null;
+  sqlstate: string | null;
+  error_class: string | null;
+  metadata: unknown;
+  statement_ordinal: number | null;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactMetadata(value: unknown, expected: Record<string, unknown>): boolean {
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  return keys.length === expectedKeys.length
+    && keys.every((key, index) => key === expectedKeys[index] && value[key] === expected[key]);
+}
+
+function isSafeLegacyRetryHistory(events: PriorEvent[], context: MigrationContext): boolean {
+  if (events.length < 3) return false;
+  const { entry, ordinal } = context;
+  const runId = events[0]?.run_id;
+  if (!runId
+    || !UUID.test(runId)
+    || ordinal < 1
+    || entry.executionMode !== "legacy-verbatim") {
+    return false;
+  }
+
+  for (const [index, event] of events.entries()) {
+    const commonMetadata = {
+      execution_mode: entry.executionMode,
+      migration_filename: entry.filename,
+      migration_ordinal: ordinal,
+    };
+    if (event.run_id !== runId
+      || event.migration_id !== entry.id
+      || event.event_sequence !== index + 1
+      || !GIT_SHA.test(event.source_git_sha ?? "")
+      || !IMAGE_DIGEST.test(event.executor_image_digest ?? "")
+      || isObviousPlaceholder(event.source_git_sha ?? "")
+      || isObviousPlaceholder((event.executor_image_digest ?? "").slice("sha256:".length))
+      || event.source_git_sha !== events[0].source_git_sha
+      || event.executor_image_digest !== events[0].executor_image_digest
+      || (event.runner_id !== null && !RUNNER_ID.test(event.runner_id))
+      || event.runner_id !== events[0].runner_id
+      || !isRecord(event.metadata)
+      || event.metadata.execution_mode !== commonMetadata.execution_mode
+      || event.metadata.migration_filename !== commonMetadata.migration_filename
+      || event.metadata.migration_ordinal !== commonMetadata.migration_ordinal) {
+      return false;
+    }
+  }
+
+  const identityMetadata = {
+    execution_mode: entry.executionMode,
+    migration_filename: entry.filename,
+    migration_ordinal: ordinal,
+  };
+  const started = events[0];
+  if (started.event_type !== "started"
+    || started.statement_ordinal !== null
+    || started.error_class !== null
+    || started.sqlstate !== null
+    || !Number.isFinite(new Date(started.heartbeat_deadline ?? "").getTime())
+    || !hasExactMetadata(started.metadata, identityMetadata)) {
+    return false;
+  }
+
+  const rollbackIndex = events.findIndex(({ event_type }) => event_type === "transaction_rolled_back");
+  if (rollbackIndex < 1 || rollbackIndex !== events.length - 2) return false;
+
+  for (const heartbeat of events.slice(1, rollbackIndex)) {
+    if (heartbeat.event_type !== "heartbeat"
+      || heartbeat.statement_ordinal !== null
+      || heartbeat.error_class !== null
+      || heartbeat.sqlstate !== null
+      || !Number.isFinite(new Date(heartbeat.heartbeat_deadline ?? "").getTime())
+      || !isRecord(heartbeat.metadata)
+      || heartbeat.metadata.execution_mode !== "legacy-verbatim"
+      || !Number.isSafeInteger(heartbeat.metadata.elapsed_ms)
+      || Number(heartbeat.metadata.elapsed_ms) < 0
+      || !hasExactMetadata(heartbeat.metadata, { ...identityMetadata, elapsed_ms: heartbeat.metadata.elapsed_ms })) {
+      return false;
+    }
+  }
+
+  const rollback = events[rollbackIndex];
+  const failure = events[rollbackIndex + 1];
+  return rollback.event_type === "transaction_rolled_back"
+    && rollback.statement_ordinal === 1
+    && rollback.error_class === "sql_failed"
+    && rollback.heartbeat_deadline === null
+    && hasExactMetadata(rollback.metadata, identityMetadata)
+    && SQLSTATE.test(rollback.sqlstate ?? "")
+    && failure.event_type === "execution_failed"
+    && failure.statement_ordinal === 1
+    && failure.error_class === "sql_failed"
+    && failure.heartbeat_deadline === null
+    && hasExactMetadata(failure.metadata, identityMetadata)
+    && failure.sqlstate === rollback.sqlstate;
+}
+
 /**
  * Legacy files carry their own BEGIN/COMMIT and are executed as one unchanged
  * multi-statement payload: no outer transaction, no parsing, no splitting.
@@ -386,15 +526,31 @@ interface MigrationContext {
 async function executeLegacyVerbatim(context: MigrationContext): Promise<void> {
   const { entry, control, execution, runLog, bytes, checksum } = context;
 
-  const prior = await control.query<{ attempts: string }>(
-    "select count(*)::text as attempts from migration_control.migration_runs where migration_id = $1",
+  const prior = await control.query<PriorEvent>(
+    `select run_id::text,
+            migration_id,
+            event_sequence,
+            event_type,
+            runner_id,
+            heartbeat_deadline,
+            source_git_sha,
+            executor_image_digest,
+            sqlstate,
+            error_class,
+            metadata,
+            statement_ordinal
+       from migration_control.migration_runs
+      where migration_id = $1
+      order by run_id, event_sequence`,
     [entry.id],
   );
-  if (Number(prior.rows[0]?.attempts ?? 0) > 0) {
+  const runIds = new Set(prior.rows.map(({ run_id }) => run_id));
+  const safeToRetry = prior.rows.length === 0
+    || (runIds.size === 1 && isSafeLegacyRetryHistory(prior.rows, context));
+  if (!safeToRetry) {
     throw new MigrationExecutionError(
       "stale_legacy_attempt",
-      "a previous attempt recorded events but no applied row; this legacy migration may already have committed. "
-      + "Automatic replay is refused — reconcile manually before retrying",
+      "a previous attempt has an ambiguous outcome; automatic replay is refused until the ledger is reconciled",
       entry.id,
     );
   }
@@ -411,9 +567,20 @@ async function executeLegacyVerbatim(context: MigrationContext): Promise<void> {
   try {
     await execution.query(bytes.toString("utf8"));
   } catch (error) {
+    try {
+      await execution.query("rollback");
+      await runLog.append(entry.id, "transaction_rolled_back", { execution_mode: "legacy-verbatim" }, {
+        sqlstate: sqlstateOf(error),
+        errorClass: "sql_failed",
+        statementOrdinal: 1,
+      });
+    } catch {
+      context.destroyExecution();
+    }
     await runLog.append(entry.id, "execution_failed", { execution_mode: "legacy-verbatim" }, {
       sqlstate: sqlstateOf(error),
       errorClass: "sql_failed",
+      statementOrdinal: 1,
     });
     throw classify(error, "sql_failed", entry.id, "legacy payload failed");
   }
@@ -695,14 +862,18 @@ export function renderExecutionReport(report: ExecutionReport): string {
   return `${JSON.stringify(report, null, 2)}\n`;
 }
 
-export async function executeMigrations(pool: Pool, options: ExecuteOptions = {}): Promise<ExecutionReport> {
-  const manifest = options.manifest ?? await checkManifest(options.repositoryRoot);
-  const identity = options.identity ?? identityFromEnvironment();
-  const handlers = options.handlers ?? registeredHandlers;
-  const sleep = options.sleep ?? ((milliseconds: number) => delay(milliseconds, undefined, { ref: false }));
-  const now = options.now ?? Date.now;
-  const runId = options.runId ?? randomUUID();
-  const migrationDirectory = path.join(options.repositoryRoot ?? path.resolve(__dirname, "../../../.."), "db", "migrations");
+const repositoryRoot = path.resolve(__dirname, "../../../..");
+
+async function executeVerifiedMigrations(
+  pool: Pool,
+  manifest: MigrationManifest,
+  identity: ExecutionIdentity,
+): Promise<ExecutionReport> {
+  identity = validateExecutionIdentity(identity);
+  const sleep = (milliseconds: number) => delay(milliseconds, undefined, { ref: false });
+  const now = Date.now;
+  const runId = randomUUID();
+  const migrationDirectory = path.join(repositoryRoot, "db", "migrations");
 
   const control = await pool.connect();
   return withSchemaAdvisoryLock(control, async (lockedControl) => {
@@ -710,8 +881,8 @@ export async function executeMigrations(pool: Pool, options: ExecuteOptions = {}
     // and the control schema, manifest and applied ledger have all verified.
     await verifyControlSchema(lockedControl);
     const appliedRows = await readAppliedRows(lockedControl);
-    await assertNoLegacyLedgerDivergence(lockedControl, appliedRows.length);
-    const plan = buildMigrationPlan(manifest, appliedRows, options);
+    await assertNoLegacyLedgerDivergence(lockedControl, appliedRows, manifest);
+    const plan = buildMigrationPlan(manifest, appliedRows);
     assertTimeoutCeilings(plan.pendingMigrations);
 
     const report: ExecutionReport = {
@@ -746,7 +917,7 @@ export async function executeMigrations(pool: Pool, options: ExecuteOptions = {}
     };
     lockedControl.once("error", onControlError);
 
-    const runLog = new RunLog(lockedControl, runId, identity);
+    const runLog = new RunLog(lockedControl, runId, identity, manifest);
     const runStartedAt = now();
 
     try {
@@ -774,7 +945,7 @@ export async function executeMigrations(pool: Pool, options: ExecuteOptions = {}
           execution,
           runLog,
           identity,
-          handlers,
+          handlers: registeredHandlers,
           sleep,
           now,
           destroyExecution: () => {
@@ -807,5 +978,17 @@ export async function executeMigrations(pool: Pool, options: ExecuteOptions = {}
       throw new MigrationExecutionError("control_connection_lost", "the control connection was lost; execution aborted");
     }
     return report;
-  }, options);
+  });
+}
+
+/**
+ * The only production migration-execution entry point. Every security-boundary
+ * input is derived internally before a database connection is acquired.
+ */
+export async function executeMigrations(pool: Pool): Promise<ExecutionReport> {
+  if (arguments.length !== 1) {
+    throw new Error("executeMigrations accepts exactly one Pool argument; alternate execution inputs are not supported");
+  }
+  const manifest = await checkManifest();
+  return executeVerifiedMigrations(pool, manifest, identityFromEnvironment());
 }
