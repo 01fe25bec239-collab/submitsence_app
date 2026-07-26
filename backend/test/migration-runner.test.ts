@@ -137,8 +137,23 @@ class LockClient extends EventEmitter {
   unlockResult = true;
   unlockError: Error | undefined;
   releasedWith: Error | undefined;
+  releaseCount = 0;
   activeQueries = 0;
   maxActiveQueries = 0;
+  /**
+   * When set, the pg_advisory_unlock query returns a promise this test
+   * controls directly (via settleUnlock) instead of resolving immediately —
+   * so a test can interleave a client 'error' event with the unlock attempt
+   * at an exact, deterministic point, rather than racing real timing.
+   */
+  private unlockGate: { resolve: () => void; reject: (error: Error) => void } | undefined;
+  unlockStarted = false;
+
+  settleUnlock(): void {
+    assert.ok(this.unlockGate, "settleUnlock called before the unlock query was issued");
+    if (this.unlockError) this.unlockGate!.reject(this.unlockError);
+    else this.unlockGate!.resolve();
+  }
 
   async query(sql: string, values?: unknown[]): Promise<QueryResult> {
     this.queries.push({ sql, values });
@@ -160,6 +175,13 @@ class LockClient extends EventEmitter {
       if (sql.includes("pg_advisory_unlock")) {
         this.events.push("unlock");
         assert.deepEqual(values, [...SCHEMA_ADVISORY_LOCK]);
+        this.unlockStarted = true;
+        if (this.gateUnlock) {
+          await new Promise<void>((resolve, reject) => {
+            this.unlockGate = { resolve, reject };
+          });
+          return { rows: [{ unlocked: this.unlockResult }], rowCount: 1 };
+        }
         if (this.unlockError) throw this.unlockError;
         return { rows: [{ unlocked: this.unlockResult }], rowCount: 1 };
       }
@@ -169,9 +191,31 @@ class LockClient extends EventEmitter {
     }
   }
 
+  gateUnlock = false;
+
   release(error?: Error): void {
     this.releasedWith = error;
+    this.releaseCount += 1;
     this.events.push(error ? "release-error" : "release");
+  }
+}
+
+/** Fails if an uncaughtException or unhandledRejection fires while `run` executes. */
+async function withStrictProcessErrors<T>(run: () => Promise<T>): Promise<T> {
+  const uncaught: unknown[] = [];
+  const unhandled: unknown[] = [];
+  const onUncaught = (error: unknown) => uncaught.push(error);
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("uncaughtException", onUncaught);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    return await run();
+  } finally {
+    await new Promise((resolve) => setImmediate(resolve));
+    process.removeListener("uncaughtException", onUncaught);
+    process.removeListener("unhandledRejection", onUnhandled);
+    assert.deepEqual(uncaught, [], `unexpected uncaughtException: ${String(uncaught[0])}`);
+    assert.deepEqual(unhandled, [], `unexpected unhandledRejection: ${String(unhandled[0])}`);
   }
 }
 
@@ -291,6 +335,158 @@ test("plan action failures still unlock before release", async () => {
     /catalog drift/,
   );
   assert.deepEqual(client.events, ["probe", "plan-failed", "unlock", "release"]);
+});
+
+async function waitUntil(predicate: () => boolean, description: string): Promise<void> {
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`waitUntil timed out: ${description}`);
+}
+
+// PB-10 Step 3 Phase 2a control-client ownership: withSchemaAdvisoryLock is
+// the real outer owner of the control connection for the entire production
+// chain (executeMigrations -> executeVerifiedMigrations ->
+// withSchemaAdvisoryLock -> executeNontransactional -> superviseOperation).
+// superviseOperation never releases or destroys the control client itself —
+// it only ever queries it (pg_cancel_backend) and, on failure, throws — so
+// these scenarios are reproduced here exactly as the real action callback
+// would present them: a thrown error (standing in for the
+// cancellation_unverified superviseOperation raises after a failed
+// pg_cancel_backend query), interleaved with the client's own 'error' event
+// at a precise, deterministic point relative to the advisory-unlock cleanup
+// that withSchemaAdvisoryLock performs afterward.
+test("ownership: cancellation query rejects first, then a late client 'error' event during a still-pending unlock", async () => {
+  await withStrictProcessErrors(async () => {
+    const client = new LockClient();
+    client.gateUnlock = true;
+    const queryFailure = new Error("[cancellation_unverified] migration 0101: cancellation request was not accepted by PostgreSQL");
+
+    const pending = withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
+      throw queryFailure;
+    });
+
+    await waitUntil(() => client.unlockStarted, "unlock query to be issued");
+    client.emit("error", new Error("terminating connection due to administrator command"));
+    client.settleUnlock(); // the unlock response itself still arrives, reporting success
+
+    await assert.rejects(pending, /cancellation_unverified/);
+    assert.equal(client.releaseCount, 1, "the control client must be released exactly once");
+    assert.ok(client.releasedWith instanceof Error, "a late connection error must still force a destructive release, even after an apparently-successful unlock");
+    // A discarded connection intentionally keeps a (no-op) listener attached
+    // rather than being left with none: it will never return to the pool,
+    // so a genuinely delayed duplicate 'error' notification for the same
+    // underlying failure must still land on something, not crash the
+    // process. Only a healthy release removes the listener entirely.
+    assert.equal(client.listenerCount("error"), 1, "a destroyed connection must never be left with zero error listeners");
+  });
+});
+
+test("ownership: cancellation query rejects first, then the unlock attempt itself fails from socket termination", async () => {
+  await withStrictProcessErrors(async () => {
+    const client = new LockClient();
+    client.gateUnlock = true;
+    client.unlockError = new Error("Connection terminated unexpectedly");
+    const queryFailure = new Error("[cancellation_unverified] migration 0101: cancellation request was not accepted by PostgreSQL");
+
+    const pending = withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
+      throw queryFailure;
+    });
+
+    await waitUntil(() => client.unlockStarted, "unlock query to be issued");
+    client.emit("error", new Error("terminating connection due to administrator command"));
+    client.settleUnlock(); // resolves the pending unlock query as a rejection (unlockError)
+
+    await assert.rejects(pending, (error: Error) => {
+      // Both the original action failure and the unlock's own failure are
+      // real, independent problems; deterministic AggregateError behavior
+      // must be preserved rather than silently dropping one.
+      assert.ok(error instanceof AggregateError, `expected AggregateError, got: ${error.constructor.name}: ${error.message}`);
+      assert.equal(error.errors.length, 2);
+      assert.match(String(error.errors[0]), /cancellation_unverified/);
+      assert.match(String(error.errors[1]), /Connection terminated unexpectedly/);
+      return true;
+    });
+    assert.equal(client.releaseCount, 1, "the control client must be released exactly once");
+    assert.ok(client.releasedWith instanceof Error);
+    assert.equal(client.listenerCount("error"), 1, "a destroyed connection must never be left with zero error listeners");
+  });
+});
+
+test("ownership: a control 'error' event occurs before the cancellation query itself rejects", async () => {
+  await withStrictProcessErrors(async () => {
+    const client = new LockClient();
+    // The action never gets a chance to complete or throw its own
+    // cancellation_unverified error: connectionLost is actively raced
+    // against the action (pre-existing behaviour, unchanged by this fix),
+    // so an 'error' event fired synchronously as the action starts wins
+    // that race immediately, surfacing the deeper connection failure
+    // itself rather than a derived symptom of it — the more informative
+    // and, in this ordering, the only observable outcome.
+    const pending = withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
+      client.emit("error", new Error("connection reset by peer"));
+      await Promise.resolve();
+      throw new Error("[cancellation_unverified] migration 0101: cancellation request was not accepted by PostgreSQL");
+    });
+
+    await assert.rejects(pending, /connection reset by peer/);
+    assert.ok(!client.events.includes("unlock"), "an already-uncertain connection must never be depended on for a healthy unlock");
+    assert.equal(client.releaseCount, 1, "the control client must be released exactly once");
+    assert.ok(client.releasedWith instanceof Error);
+    assert.equal(client.listenerCount("error"), 1, "a destroyed connection must never be left with zero error listeners");
+  });
+});
+
+test("ownership: an ordinary non-connection cancellation-query error still allows a healthy subsequent unlock", async () => {
+  await withStrictProcessErrors(async () => {
+    const client = new LockClient(); // no 'error' event anywhere in this scenario
+    const pending = withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
+      throw new Error("cancellation query failed: permission denied for function pg_cancel_backend");
+    });
+
+    await assert.rejects(pending, /permission denied/);
+    assert.deepEqual(client.events, ["probe", "unlock", "release"], "an ordinary SQL-level failure, with no connection-level signal, must still unlock and release healthily");
+    assert.equal(client.releaseCount, 1);
+    assert.equal(client.releasedWith, undefined, "a merely logical failure must never destroy a healthy connection");
+    assert.equal(client.listenerCount("error"), 0);
+  });
+});
+
+test("ownership: advisory unlock fails after the action has already failed, with no connection-level signal", async () => {
+  await withStrictProcessErrors(async () => {
+    const client = new LockClient();
+    client.unlockError = new Error("could not send data to server");
+    const pending = withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
+      throw new Error("cancellation query failed: syntax error");
+    });
+
+    await assert.rejects(pending, (error: Error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors.length, 2);
+      assert.match(String(error.errors[0]), /syntax error/);
+      assert.match(String(error.errors[1]), /could not send data to server/);
+      return true;
+    });
+    assert.equal(client.releaseCount, 1);
+    assert.ok(client.releasedWith instanceof Error);
+    assert.equal(client.listenerCount("error"), 1, "a destroyed connection must never be left with zero error listeners");
+  });
+});
+
+test("ownership: the healthy control path releases exactly once and leaks no listener", async () => {
+  await withStrictProcessErrors(async () => {
+    const client = new LockClient();
+    const result = await withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
+      client.events.push("action");
+      return "ok";
+    });
+    assert.equal(result, "ok");
+    assert.deepEqual(client.events, ["probe", "action", "unlock", "release"]);
+    assert.equal(client.releaseCount, 1);
+    assert.equal(client.releasedWith, undefined);
+    assert.equal(client.listenerCount("error"), 0);
+  });
 });
 
 const columnRows = [

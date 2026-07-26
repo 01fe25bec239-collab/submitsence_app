@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test, { after } from "node:test";
@@ -189,6 +189,7 @@ type Recorded = { client: "control" | "execution"; sql: string; values?: unknown
 class FakeClient extends EventEmitter {
   released = false;
   releasedWith: Error | undefined;
+  releaseCount = 0;
 
   constructor(readonly role: "control" | "execution", readonly log: Recorded[]) {
     super();
@@ -201,6 +202,7 @@ class FakeClient extends EventEmitter {
   release(error?: Error): void {
     this.released = true;
     this.releasedWith = error;
+    this.releaseCount += 1;
   }
 }
 
@@ -214,6 +216,20 @@ class ControlClient extends FakeClient {
   onCancel: (() => void) | undefined;
   readonly events: Array<{ migrationId: string; sequence: number; type: string; values: unknown[] }> = [];
   readonly appliedInserts: unknown[][] = [];
+  /**
+   * When set, the advisory-unlock query blocks on a promise this test
+   * controls directly (via settleUnlock), so a test can interleave a
+   * control-client 'error' event with the unlock attempt at an exact,
+   * deterministic point rather than racing real timing.
+   */
+  gateUnlock = false;
+  unlockStarted = false;
+  private unlockGate: (() => void) | undefined;
+
+  settleUnlock(): void {
+    assert.ok(this.unlockGate, "settleUnlock called before the unlock query was issued");
+    this.unlockGate!();
+  }
 
   constructor(log: Recorded[]) {
     super("control", log);
@@ -225,6 +241,10 @@ class ControlClient extends FakeClient {
     if (sql.includes("set_config")) return { rows: [{ set_config: String(values?.[1]) }], rowCount: 1 };
     if (sql.includes("pg_try_advisory_lock")) return { rows: [{ acquired: true }], rowCount: 1 };
     if (sql.includes("pg_advisory_unlock")) {
+      this.unlockStarted = true;
+      if (this.gateUnlock) {
+        await new Promise<void>((resolve) => { this.unlockGate = resolve; });
+      }
       this.unlocked = true;
       return { rows: [{ unlocked: true }], rowCount: 1 };
     }
@@ -482,7 +502,7 @@ test("production source and build expose no injectable executor or mutable regis
     assert.match(declaration, /executeMigrations\(pool: Pool\): Promise<ExecutionReport>/);
     assert.doesNotMatch(
       declaration,
-      /executeVerifiedMigrations|registeredHandlers|InternalExecuteOptions/,
+      /executeVerifiedMigrations|registeredHandlers|InternalExecuteOptions|superviseOperation|SupervisedOperationContext/,
     );
 
     const probe = spawnSync(process.execPath, ["-e", `
@@ -491,6 +511,11 @@ test("production source and build expose no injectable executor or mutable regis
       assert.equal(target.executeMigrations.length, 1);
       assert.equal("registeredHandlers" in target, false);
       assert.equal("executeVerifiedMigrations" in target, false);
+      // The Phase 2a cancellation state machine lives in its own internal
+      // module (supervision.ts); execute.ts imports it for internal use but
+      // must never re-export it as an alternate execution entry point.
+      assert.equal("superviseOperation" in target, false);
+      assert.equal("SupervisedOperationContext" in target, false);
       assert.ok(Object.values(target).every((value) =>
         typeof value !== "object" || value === null ||
         (!("set" in value) && !("delete" in value) && !("clear" in value))));
@@ -501,11 +526,16 @@ test("production source and build expose no injectable executor or mutable regis
     });
     assert.equal(probe.status, 0, `${probe.stdout}\n${probe.stderr}`);
 
-    const emitted = readdirSync(migrationOutput)
-      .filter((filename) => filename.endsWith(".js"))
-      .map((filename) => readFileSync(path.join(migrationOutput, filename), "utf8"))
-      .join("\n");
-    assert.doesNotMatch(emitted, /exports\.(?:executeVerifiedMigrations|registeredHandlers|identityFromEnvironment)/);
+    // Only execute.js/.d.ts — not every emitted file — must never export the
+    // supervision internals: supervision.ts is its own internal module and
+    // legitimately exports superviseOperation for execute.ts's own import and
+    // for its focused unit tests; the property under test is that execute.ts
+    // does not re-export it, not that no file anywhere does.
+    const executeEmitted = readFileSync(path.join(migrationOutput, "execute.js"), "utf8");
+    assert.doesNotMatch(
+      executeEmitted,
+      /exports\.(?:executeVerifiedMigrations|registeredHandlers|identityFromEnvironment|superviseOperation|SupervisedOperationContext)\b/,
+    );
   } finally {
     rmSync(buildRoot, { recursive: true, force: true });
   }
@@ -794,15 +824,64 @@ test("loss of the control connection aborts execution and destroys the execution
   await assert.rejects(pending, /control connection lost/);
   assert.ok(pool.control.releasedWith instanceof Error, "the control client is destroyed, not returned");
   assert.equal(pool.control.unlocked, false, "a lost connection must not be trusted to unlock");
+  assert.equal(pool.control.releaseCount, 1, "the control client must be released exactly once — never twice");
 
   // The execution connection is destroyed the moment control is lost, so its
   // in-flight transaction cannot go on to COMMIT an applied row for a run that
   // has already aborted.
   assert.ok(pool.execution.releasedWith instanceof Error, "the execution client must be destroyed on control loss");
   assert.equal(pool.execution.releasedWith?.message, lost.message);
+  // onControlError's own releaseExecution(controlLost) call and the outer
+  // finally's releaseExecution(destroyExecution) both fire here, but the
+  // idempotent releaseExecution guard in executeVerifiedMigrations must
+  // collapse them into exactly one real release — never a double release
+  // across that boundary.
+  assert.equal(pool.execution.releaseCount, 1, "the execution client must be released exactly once — never twice");
   const executionSql = pool.log.filter(({ client }) => client === "execution").map(({ sql }) => sql);
   assert.ok(!executionSql.includes("commit"), "an orphaned transaction must never commit");
   assert.deepEqual(pool.execution.appliedInserts, []);
+});
+
+async function waitUntil(predicate: () => boolean, description: string): Promise<void> {
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`waitUntil timed out: ${description}`);
+}
+
+// 15b ─────────────────────────────────────────────────────────────────────────
+// PB-10 Step 3 Phase 2a control-client ownership, through the real production
+// chain: executeMigrations -> executeVerifiedMigrations ->
+// withSchemaAdvisoryLock -> [a reachable mode's own destroyExecution() path]
+// -> advisory unlock -> final control-client release/destruction.
+// executeNontransactional/superviseOperation are not reachable here (no
+// handler can be registered — see migration-execute-supervision.test.ts's
+// own header comment), so this reproduces the bug's exact ordering — a
+// failure that already forces execution-client destruction, followed later
+// by a control-client 'error' event arriving mid-unlock — using
+// transactional mode's own rollback-failure path, which calls
+// context.destroyExecution() through the identical mechanism
+// superviseOperation's cancellation_unverified path would.
+test("both clients are destroyed exactly once when a control 'error' arrives mid-unlock during an execution-destroying failure", async () => {
+  const pool = new FakePool();
+  pool.execution.failMigrationSql = Object.assign(new Error("boom"), { code: "42601" });
+  pool.execution.failRollback = true; // forces context.destroyExecution() in executeTransactional's catch
+  pool.control.gateUnlock = true;
+
+  const pending = run(pool, { manifest: manifestOf(entries.transactional) });
+
+  await waitUntil(() => pool.control.unlockStarted, "the advisory unlock query to be issued");
+  pool.control.emit("error", new Error("terminating connection due to administrator command"));
+  pool.control.settleUnlock();
+
+  await assert.rejects(pending, /sql_failed/);
+
+  assert.ok(pool.execution.releasedWith instanceof Error, "the execution client must be destroyed");
+  assert.equal(pool.execution.releaseCount, 1, "the execution client must be released exactly once");
+
+  assert.ok(pool.control.releasedWith instanceof Error, "a late connection error must force a destructive control release, even after an apparently-successful unlock");
+  assert.equal(pool.control.releaseCount, 1, "the control client must be released exactly once");
 });
 
 // 16 ──────────────────────────────────────────────────────────────────────────
@@ -814,8 +893,10 @@ test("the advisory lock is verifiably released before the control client returns
   assert.equal(pool.control.unlocked, true);
   assert.equal(pool.control.released, true);
   assert.equal(pool.control.releasedWith, undefined);
+  assert.equal(pool.control.releaseCount, 1, "a healthy control client is released exactly once — never twice");
   assert.equal(pool.execution.released, true);
   assert.equal(pool.execution.releasedWith, undefined);
+  assert.equal(pool.execution.releaseCount, 1, "a healthy execution client is released exactly once — never twice");
 });
 
 // 17 ──────────────────────────────────────────────────────────────────────────

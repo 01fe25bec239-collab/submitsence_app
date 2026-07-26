@@ -633,11 +633,25 @@ export async function withSchemaAdvisoryLock<T>(
   const connectionLost = new Promise<never>((_resolve, reject) => {
     rejectConnectionLoss = reject;
   });
+  // connectionLost is raced against below, but only while a race is
+  // actually in flight (lock polling, then the action itself). A
+  // connection-level error can also arrive later — during the advisory
+  // unlock attempt in the finally block, or in the gap immediately after —
+  // when nothing is racing this promise any more; without a permanent
+  // handler that later rejection would be an unhandled rejection in its own
+  // right, on top of the ownership problem this function exists to avoid.
+  connectionLost.catch(() => undefined);
   const onConnectionError = (error: Error) => {
     connectionError = errorValue(error);
     rejectConnectionLoss(connectionError);
   };
-  client.once("error", onConnectionError);
+  // A persistent listener, not .once(): ownership requires staying informed
+  // of a connection failure for the client's entire held lifetime — lock
+  // acquisition, the action, and the unlock/release cleanup that follows —
+  // not just the first error observed before that cleanup begins. It is
+  // removed only once release/destruction below is complete, at which point
+  // the pool resumes its own management of the client.
+  client.on("error", onConnectionError);
 
   let value: T | undefined;
   let actionError: Error | undefined;
@@ -672,22 +686,54 @@ export async function withSchemaAdvisoryLock<T>(
   } catch (error) {
     actionError = errorValue(error);
   } finally {
-    client.removeListener("error", onConnectionError);
-    if (connectionError) {
-      client.release(connectionError);
-    } else if (acquired) {
+    // The lock is only worth releasing if the connection wasn't already
+    // known bad going in, and doing so is skipped entirely once it is —
+    // never depend on an unlock succeeding when connection health is
+    // already uncertain. An ordinary SQL error from the action (or from
+    // this unlock query itself) does not set connectionError: that signal
+    // is reserved for the client's own 'error' event, which PostgreSQL
+    // drivers raise specifically for connection-level failures (backend
+    // termination, socket failure, connection reset) and never for a mere
+    // query rejection — exactly the distinction an ownership decision here
+    // needs to make.
+    if (!connectionError && acquired) {
       try {
         const result = await client.query<{ unlocked: boolean }>(
           "select pg_advisory_unlock($1, $2) as unlocked",
           [...SCHEMA_ADVISORY_LOCK],
         );
         assertCondition(result.rows[0]?.unlocked === true, "Schema advisory unlock returned false");
-        client.release();
       } catch (error) {
         cleanupError = errorValue(error);
-        client.release(cleanupError);
       }
+    }
+    // connectionError is read again here, after the unlock attempt (if any):
+    // a connection failure observed at any point up to and including that
+    // attempt — even one that arrives just as an apparently-successful
+    // unlock response comes back — must still result in a destructive
+    // release, never a healthy one trusted back into the pool.
+    if (connectionError || cleanupError) {
+      // This client will never return to the pool, so there is no benefit
+      // to removing the listener outright — and every benefit to leaving
+      // one attached: a genuinely dead connection can still emit a second,
+      // delayed 'error' notification for the very same underlying failure
+      // (a query rejection and the raw socket's own event, both stemming
+      // from one root termination, are not guaranteed to be the same
+      // single event), and a connection nothing will ever touch again must
+      // never let that become an uncaught exception. Swapped for a no-op
+      // rather than left as onConnectionError itself, since connectionError
+      // and cleanupError have already been captured and there is nothing
+      // further for this specific handler to do.
+      client.removeListener("error", onConnectionError);
+      client.on("error", () => undefined);
+      client.release(connectionError ?? cleanupError);
     } else {
+      // Healthy release: ownership is handed back to the pool, which
+      // resumes its own error handling for the client from this point, so
+      // this is the one path where it is correct — and necessary, so the
+      // pool's own listener can attach — to stop listening entirely rather
+      // than leave anything behind.
+      client.removeListener("error", onConnectionError);
       client.release();
     }
   }

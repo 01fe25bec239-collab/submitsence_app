@@ -213,6 +213,13 @@ jobs:
           MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
           TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: npm run test:pg:migration --prefix backend
+      - name: Test cancellation-confirmation hardening against real PostgreSQL
+        env:
+          # Only the migration credential: these tests supervise a single
+          # statement in isolation (no migration_control install, no
+          # application schema touched), so they need no TEST_DATABASE_URL.
+          MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
+        run: npm run test:pg:supervision --prefix backend
       - name: Test application/migration database identity guard
         env:
           # Both credentials, deliberately: this suite's entire purpose is to
