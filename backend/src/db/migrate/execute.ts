@@ -18,6 +18,11 @@ import {
   verifyControlSchema,
   withSchemaAdvisoryLock,
 } from "./runner";
+import { ERROR_CLASSES, MigrationExecutionError, SQLSTATE, assertCondition, classify, sqlstateOf, type ErrorClass } from "./execution-errors";
+import { superviseOperation } from "./supervision";
+
+export { ERROR_CLASSES, MigrationExecutionError, type ErrorClass } from "./execution-errors";
+export { CANCELLATION_GRACE_MS } from "./supervision";
 
 /**
  * Approved architecture limits. Manifest entries declare their own timeouts;
@@ -33,10 +38,8 @@ export const TIMEOUT_CEILINGS = {
 export const TRANSACTIONAL_WALL_CLOCK_CEILING_MS = 900_000;
 export const NONTRANSACTIONAL_WALL_CLOCK_CEILING_MS = 1_800_000;
 export const SCHEMA_RUNNER_WALL_CLOCK_MS = 3_600_000;
-export const CANCELLATION_GRACE_MS = 10_000;
 
 const RUNNER_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
-const SQLSTATE = /^[0-9A-Z]{5}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -71,42 +74,6 @@ const METADATA_KEYS = [
 ] as const;
 
 type EventMetadata = Partial<Record<(typeof METADATA_KEYS)[number], number | string>>;
-
-/**
- * Fixed error vocabulary. Errors carry a classification, a SQLSTATE and an
- * identifier — never a PostgreSQL message, which can quote row values.
- */
-export const ERROR_CLASSES = [
-  "cancellation_unverified",
-  "checksum_drift",
-  "control_connection_lost",
-  "identity_missing",
-  "ledger_insert_failed",
-  "manifest_ceiling_exceeded",
-  "run_budget_exceeded",
-  "sql_failed",
-  "stale_legacy_attempt",
-  "unsupported_handler",
-  "verification_failed",
-  "verifier_state_invalid",
-  "wall_clock_exceeded",
-] as const;
-
-export type ErrorClass = (typeof ERROR_CLASSES)[number];
-
-export class MigrationExecutionError extends Error {
-  readonly errorClass: ErrorClass;
-  readonly sqlstate: string | null;
-  readonly migrationId: string | null;
-
-  constructor(errorClass: ErrorClass, detail: string, migrationId: string | null = null, sqlstate: string | null = null) {
-    super(migrationId ? `[${errorClass}] migration ${migrationId}: ${detail}` : `[${errorClass}] ${detail}`);
-    this.name = "MigrationExecutionError";
-    this.errorClass = errorClass;
-    this.sqlstate = sqlstate;
-    this.migrationId = migrationId;
-  }
-}
 
 /** Catalog/business state of one nontransactional operation. */
 export type NontransactionalState = "absent" | "valid" | "invalid";
@@ -176,27 +143,8 @@ export interface ExecutionReport {
   outcome: "no-op" | "completed";
 }
 
-function assertCondition(condition: unknown, message: string): asserts condition {
-  if (!condition) throw new Error(message);
-}
-
 function sha256(bytes: NodeJS.ArrayBufferView): string {
   return createHash("sha256").update(bytes).digest("hex");
-}
-
-function sqlstateOf(error: unknown): string | null {
-  const code = (error as { code?: unknown })?.code;
-  return typeof code === "string" && SQLSTATE.test(code) ? code : null;
-}
-
-/**
- * Collapses any driver or server error into the fixed vocabulary. The original
- * message is dropped on purpose: it can contain SQL text, bound parameters or
- * conflicting row values.
- */
-function classify(error: unknown, errorClass: ErrorClass, migrationId: string, detail: string): MigrationExecutionError {
-  if (error instanceof MigrationExecutionError) return error;
-  return new MigrationExecutionError(errorClass, detail, migrationId, sqlstateOf(error));
 }
 
 function identityFromEnvironment(environment: NodeJS.ProcessEnv = process.env): ExecutionIdentity {
@@ -640,44 +588,6 @@ async function executeTransactional(context: MigrationContext): Promise<void> {
     duration_ms: Math.max(0, Math.trunc(context.now() - startedAt)),
   });
   void control;
-}
-
-/**
- * Runs one statement under a wall-clock budget supervised by the control
- * connection. On expiry the control connection cancels the execution backend;
- * if cancellation cannot be verified within the grace period the execution
- * connection is destroyed rather than reused.
- */
-async function superviseOperation(context: MigrationContext, sql: string, budgetMs: number): Promise<void> {
-  const { entry, control, execution } = context;
-  const pidResult = await execution.query<{ pid: number }>("select pg_backend_pid() as pid");
-  const pid = pidResult.rows[0]?.pid;
-  assertCondition(Number.isInteger(pid), `Could not identify the execution backend for ${entry.id}`);
-
-  const operation = execution.query(sql).then(() => "completed" as const, (error: unknown) => ({ failed: error }));
-  const expiry = context.sleep(budgetMs).then(() => "expired" as const);
-  const outcome = await Promise.race([operation, expiry]);
-
-  if (outcome === "expired") {
-    await control.query("select pg_cancel_backend($1)", [pid]);
-    const settled = await Promise.race([
-      operation.then(() => "settled" as const),
-      context.sleep(CANCELLATION_GRACE_MS).then(() => "unverified" as const),
-    ]);
-    if (settled === "unverified") {
-      context.destroyExecution();
-      throw new MigrationExecutionError(
-        "cancellation_unverified",
-        `cancellation was not confirmed within ${CANCELLATION_GRACE_MS}ms; the execution connection was destroyed`,
-        entry.id,
-      );
-    }
-    throw new MigrationExecutionError("wall_clock_exceeded", `operation exceeded its ${budgetMs}ms wall-clock budget and was cancelled`, entry.id);
-  }
-
-  if (outcome !== "completed") {
-    throw classify(outcome.failed, "sql_failed", entry.id, "nontransactional operation failed");
-  }
 }
 
 /**
