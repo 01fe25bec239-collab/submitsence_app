@@ -22,7 +22,13 @@ jobs:
             web/package-lock.json
       - run: npm ci --prefix backend
       - run: npm run typecheck --prefix backend
-      - run: npm test --prefix backend
+      # Deliberately not `npm test`: that script's plain *.test.ts glob also
+      # matches the dedicated PostgreSQL suites (*.pg.test.ts), which throw
+      # at module-load time when CI is set and their required database URL
+      # is absent — as it always is in this job. test:application excludes
+      # them explicitly; they run in their own steps in the database job
+      # below, each with exactly the credential it needs.
+      - run: npm run test:application --prefix backend
       - run: npm run build --prefix backend
       - run: npm audit --prefix backend --omit=dev --audit-level=high
       - run: npm ci --prefix web
@@ -206,16 +212,14 @@ jobs:
           # guard must be able to see both databases to prove they differ.
           MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
           TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
-        run: node --import tsx --test test/migration-execute.pg.test.ts
-        working-directory: backend
+        run: npm run test:pg:migration --prefix backend
       - name: Test application/migration database identity guard
         env:
           # Both credentials, deliberately: this suite's entire purpose is to
           # prove they resolve to different physical databases.
           MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
           TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
-        run: node --import tsx --test test/database-identity.pg.test.ts
-        working-directory: backend
+        run: npm run test:pg:identity --prefix backend
       - name: Prove the application database survived destructive migration tests
         env:
           TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
@@ -224,8 +228,7 @@ jobs:
       - name: Run commercial database tests against the untouched application database
         env:
           TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
-        run: node --import tsx --test test/commercial-webhook.integration.test.ts
-        working-directory: backend
+        run: npm run test:pg:commercial --prefix backend
       - name: Delete isolated test databases
         if: always()
         run: |
