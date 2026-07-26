@@ -123,7 +123,7 @@ test("only baselined legacy rows may have null applied checksums", () => {
 test("rendered plans contain operational metadata but no SQL or connection secrets", () => {
   const rendered = renderMigrationPlan(buildMigrationPlan(manifest, []));
   assert.match(rendered, /"pendingCount": 24/);
-  assert.match(rendered, /PB-10 Step 2 is read-only/);
+  assert.match(rendered, /PB-10 Step 3 execution is implemented; migrate:plan remains read-only/);
   assert.doesNotMatch(rendered, /postgres(?:ql)?:\/\/|password|BEGIN;|CREATE TABLE|SELECT \*/i);
 });
 
@@ -367,7 +367,8 @@ class PlanClient extends LockClient {
   schemaMissing = false;
   droppedTruncateTriggers = false;
   legacyLedgerPresent = false;
-  legacyLedgerRows = 0;
+  legacyLedgerRows: string[] = [];
+  legacyLedgerTimestamps: unknown[] = [];
   readonly ledgerRows: AppliedMigrationRow[];
 
   constructor(ledgerRows: AppliedMigrationRow[] = []) {
@@ -387,8 +388,14 @@ class PlanClient extends LockClient {
     if (sql.includes("to_regclass")) {
       return { rows: [{ present: this.legacyLedgerPresent }], rowCount: 1 };
     }
-    if (sql.includes("legacy_rows")) {
-      return { rows: [{ legacy_rows: String(this.legacyLedgerRows) }], rowCount: 1 };
+    if (sql.includes("from public.infrastructure_schema_migrations")) {
+      const rows = this.legacyLedgerRows.map((filename, index) => ({
+        filename,
+        applied_at: index in this.legacyLedgerTimestamps
+          ? this.legacyLedgerTimestamps[index]
+          : new Date(Date.UTC(2030, 0, index + 1)),
+      }));
+      return { rows, rowCount: rows.length };
     }
     if (sql.includes("c.relkind in ('r', 'p')")) {
       return { rows: this.drift ? [{ table_name: "schema_migrations" }] : [{ table_name: "migration_runs" }, { table_name: "schema_migrations" }], rowCount: 2 };
@@ -503,29 +510,119 @@ test("canonical category order is a verified constraint, not an unordered compar
 test("plan fails closed when the legacy ledger diverges from an empty control ledger", async () => {
   const diverged = new PlanClient();
   diverged.legacyLedgerPresent = true;
-  diverged.legacyLedgerRows = 24;
+  diverged.legacyLedgerRows = manifest.migrations.map(({ filename }) => filename);
   const pool = { connect: async () => diverged as unknown as PoolClient } as unknown as Pool;
   await assert.rejects(
     runMigrationPlan(pool, { manifest }),
-    /Legacy migration ledger public\.infrastructure_schema_migrations has 24 row\(s\)/,
+    /incompatible.*legacy rows: 24, control rows: 0/,
   );
-  // Fail closed, but never read the legacy rows themselves.
-  assert.ok(diverged.queries.every(({ sql }) => !/select\s+filename/i.test(sql)));
+  assert.ok(diverged.queries.some(({ sql }) => /select\s+filename/i.test(sql)));
   assert.deepEqual(diverged.events.slice(-2), ["unlock", "release"]);
 
   const emptyLegacy = new PlanClient();
   emptyLegacy.legacyLedgerPresent = true;
-  emptyLegacy.legacyLedgerRows = 0;
   const emptyPool = { connect: async () => emptyLegacy as unknown as PoolClient } as unknown as Pool;
   assert.equal((await runMigrationPlan(emptyPool, { manifest })).pendingCount, 24);
 
-  // A populated control ledger is authoritative; the legacy table is not probed.
   const baselined = new PlanClient(manifest.migrations.map((_, index) => applied(index)));
   baselined.legacyLedgerPresent = true;
-  baselined.legacyLedgerRows = 24;
+  baselined.legacyLedgerRows = manifest.migrations.map(({ filename }) => filename);
   const baselinedPool = { connect: async () => baselined as unknown as PoolClient } as unknown as Pool;
   assert.equal((await runMigrationPlan(baselinedPool, { manifest })).pendingCount, 0);
-  assert.ok(baselined.queries.every(({ sql }) => !sql.includes("to_regclass")));
+  assert.ok(baselined.queries.some(({ sql }) => sql.includes("to_regclass")));
+});
+
+test("complete legacy and control ledgers must match exactly", async () => {
+  const check = async (
+    control: AppliedMigrationRow[],
+    legacy: string[],
+    pattern?: RegExp,
+  ): Promise<void> => {
+    const client = new PlanClient(control);
+    client.legacyLedgerPresent = true;
+    client.legacyLedgerRows = legacy;
+    const pool = { connect: async () => client as unknown as PoolClient } as unknown as Pool;
+    if (pattern) await assert.rejects(runMigrationPlan(pool, { manifest }), pattern);
+    else await runMigrationPlan(pool, { manifest });
+  };
+
+  await check(
+    [applied(0), applied(1)],
+    manifest.migrations.slice(0, 2).map(({ filename }) => filename),
+  );
+  await check(
+    [applied(0)],
+    manifest.migrations.slice(0, 2).map(({ filename }) => filename),
+    /legacy rows: 2, control rows: 1/,
+  );
+  await check(
+    [applied(0), applied(1)],
+    [manifest.migrations[0].filename],
+    /legacy rows: 1, control rows: 2/,
+  );
+  await check(
+    [applied(0), applied(1)],
+    [manifest.migrations[1].filename, manifest.migrations[0].filename],
+    /incompatible/,
+  );
+  await check(
+    [applied(0), applied(1)],
+    [manifest.migrations[0].filename, "0002_filename_drift.sql"],
+    /incompatible/,
+  );
+  await check(
+    [applied(1)],
+    [manifest.migrations[1].filename],
+    /ordinal prefix|ordering or migration ID mismatch/,
+  );
+  await check(
+    [applied(0), applied(1, { manifest_checksum_sha256: "0".repeat(64) })],
+    manifest.migrations.slice(0, 2).map(({ filename }) => filename),
+    /Manifest checksum mismatch/,
+  );
+  await check(
+    [applied(0), applied(1)],
+    [manifest.migrations[0].filename, manifest.migrations[0].filename],
+    /incompatible/,
+  );
+});
+
+test("legacy applied_at values must be valid, finite, distinct timestamps", async () => {
+  const check = async (filenames: string[], timestamps: unknown[], pattern?: RegExp) => {
+    const client = new PlanClient(filenames.map((_, index) => applied(index)));
+    client.legacyLedgerPresent = true;
+    client.legacyLedgerRows = filenames;
+    client.legacyLedgerTimestamps = timestamps;
+    const pool = { connect: async () => client as unknown as PoolClient } as unknown as Pool;
+    if (pattern) await assert.rejects(runMigrationPlan(pool, { manifest }), pattern);
+    else assert.equal((await runMigrationPlan(pool, { manifest })).appliedCount, filenames.length);
+  };
+
+  const [first, second, third] = manifest.migrations;
+  const tied = new Date("2030-01-01T00:00:00.000Z");
+  const tiedError = /ambiguous applied_at timestamps; manual reconciliation is required/;
+  await check([first.filename, second.filename], [tied, tied], tiedError);
+  await check([second.filename, first.filename], [tied, tied], tiedError);
+  await check([first.filename, second.filename, third.filename], [tied, tied, tied], tiedError);
+  await check(
+    [first.filename, second.filename, third.filename],
+    [
+      new Date("2030-01-01T00:00:00.000Z"),
+      new Date("2030-01-02T00:00:00.000Z"),
+      new Date("2030-01-03T00:00:00.000Z"),
+    ],
+  );
+  const invalidError = /invalid applied_at timestamps; manual reconciliation is required/;
+  for (const timestamps of [
+    ["not-a-timestamp"],
+    [new Date("not-a-timestamp")],
+    [null],
+    [{ date: "2030-01-01T00:00:00.000Z" }],
+    [new Date(Number.POSITIVE_INFINITY)],
+    ["2030-01-01T00:00:00.000Z", "not-a-timestamp"],
+  ]) {
+    await check(manifest.migrations.slice(0, timestamps.length).map(({ filename }) => filename), timestamps, invalidError);
+  }
 });
 
 test("statement and lock timeouts are issued on the pinned client before the first probe", async () => {
@@ -559,13 +656,23 @@ test("run plan issues only read-only catalog and ledger queries", async () => {
 
 test("unsupported execution commands fail clearly before connecting", () => {
   const runner = path.join(repositoryRoot, "backend", "src", "db", "migrate", "runner.ts");
-  for (const command of ["run", "apply", "execute", "clean-install", "baseline-adopt"]) {
-    const result = spawnSync(process.execPath, ["--import", "tsx", runner, command], {
-      cwd: path.join(repositoryRoot, "backend"),
-      encoding: "utf8",
-      env: { ...process.env, DATABASE_URL: "" },
-    });
+  const spawn = (...arguments_: string[]) => spawnSync(process.execPath, ["--import", "tsx", runner, ...arguments_], {
+    cwd: path.join(repositoryRoot, "backend"),
+    encoding: "utf8",
+    env: { ...process.env, DATABASE_URL: "" },
+  });
+
+  // PB-10 Step 3 adds exactly one execution verb; every other spelling and every
+  // out-of-scope lifecycle command still fails closed.
+  for (const command of ["run", "apply", "clean-install", "baseline-adopt", ""]) {
+    const result = spawn(command);
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /supports only: plan/);
+    assert.match(result.stderr, /supports only: plan, execute/);
   }
+
+  // execute is recognised, but still refuses to run without a target database.
+  const recognised = spawn("execute", "--json");
+  assert.notEqual(recognised.status, 0);
+  assert.doesNotMatch(recognised.stderr, /supports only/);
+  assert.match(recognised.stderr, /DATABASE_URL is required/);
 });

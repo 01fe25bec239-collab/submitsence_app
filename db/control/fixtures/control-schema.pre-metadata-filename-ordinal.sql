@@ -1,3 +1,10 @@
+-- Frozen regression fixture: migration_control exactly as it existed before
+-- mr_metadata_ck gained migration_filename/migration_ordinal (PB-10 Step 3
+-- Phase 1). Used only to prove db/control/control-schema-upgrade.sql
+-- upgrades a real prior installation without data loss. Do not edit to
+-- track the current schema — db/control/control-schema.sql is canonical for
+-- fresh installs.
+--
 -- PB-10 Step 2 migration control schema.
 --
 -- Install (disposable or approved target only). The migration image already
@@ -148,15 +155,7 @@ create table migration_control.migration_runs (
   constraint mr_error_class_ck check (
     error_class is null or error_class ~ '^[a-z][a-z0-9_]{0,63}$'
   ),
-  -- The body below is kept byte-identical (modulo indentation — see
-  -- db/control/test-check-clause-parity.sh) to the ALTER TABLE ... ADD
-  -- CONSTRAINT body in db/control/control-schema-upgrade.sql, so a fresh
-  -- install and an upgraded install always produce the same stored
-  -- constraint (PostgreSQL deparses a reparsed AND-chain differently
-  -- depending on how it was originally parsed, even when semantically
-  -- identical, so the two DDL statements must share literal source text).
   constraint mr_metadata_ck check (
-    -- mr_metadata_ck-body: begin
     jsonb_typeof(metadata) = 'object'
     and metadata - array[
       'duration_ms',
@@ -167,8 +166,6 @@ create table migration_control.migration_runs (
       'retry_count',
       'operation_category',
       'execution_mode',
-      'migration_filename',
-      'migration_ordinal',
       'verification',
       'reclaim_reason'
     ]::text[] = '{}'::jsonb
@@ -235,19 +232,6 @@ create table migration_control.migration_runs (
       )
     )
     and (
-      not (metadata ? 'migration_filename')
-      or case when jsonb_typeof(metadata -> 'migration_filename') = 'string' then
-        metadata ->> 'migration_filename' ~ '^[0-9]{4}_[a-z0-9]+(_[a-z0-9]+)*[.]sql$'
-      else false end
-    )
-    and (
-      not (metadata ? 'migration_ordinal')
-      or case when jsonb_typeof(metadata -> 'migration_ordinal') = 'number' then
-        (metadata ->> 'migration_ordinal')::numeric between 1 and 9007199254740991
-        and (metadata ->> 'migration_ordinal')::numeric = trunc((metadata ->> 'migration_ordinal')::numeric)
-      else false end
-    )
-    and (
       not (metadata ? 'verification')
       or metadata ->> 'verification' in ('passed', 'failed')
     )
@@ -259,7 +243,6 @@ create table migration_control.migration_runs (
         'operator_approved'
       )
     )
-    -- mr_metadata_ck-body: end
   )
 );
 

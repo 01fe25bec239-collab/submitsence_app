@@ -1,0 +1,25 @@
+CHECK (((jsonb_typeof(metadata) = 'object'::text) AND ((metadata - ARRAY['duration_ms'::text, 'elapsed_ms'::text, 'rows_affected'::text, 'statement_count'::text, 'batch_number'::text, 'retry_count'::text, 'operation_category'::text, 'execution_mode'::text, 'verification'::text, 'reclaim_reason'::text]) = '{}'::jsonb) AND ((NOT (metadata ? 'duration_ms'::text)) OR
+CASE
+    WHEN (jsonb_typeof((metadata -> 'duration_ms'::text)) = 'number'::text) THEN (((((metadata ->> 'duration_ms'::text))::numeric >= (0)::numeric) AND (((metadata ->> 'duration_ms'::text))::numeric <= ('9007199254740991'::bigint)::numeric)) AND (((metadata ->> 'duration_ms'::text))::numeric = trunc(((metadata ->> 'duration_ms'::text))::numeric)))
+    ELSE false
+END) AND ((NOT (metadata ? 'elapsed_ms'::text)) OR
+CASE
+    WHEN (jsonb_typeof((metadata -> 'elapsed_ms'::text)) = 'number'::text) THEN (((((metadata ->> 'elapsed_ms'::text))::numeric >= (0)::numeric) AND (((metadata ->> 'elapsed_ms'::text))::numeric <= ('9007199254740991'::bigint)::numeric)) AND (((metadata ->> 'elapsed_ms'::text))::numeric = trunc(((metadata ->> 'elapsed_ms'::text))::numeric)))
+    ELSE false
+END) AND ((NOT (metadata ? 'rows_affected'::text)) OR
+CASE
+    WHEN (jsonb_typeof((metadata -> 'rows_affected'::text)) = 'number'::text) THEN (((((metadata ->> 'rows_affected'::text))::numeric >= (0)::numeric) AND (((metadata ->> 'rows_affected'::text))::numeric <= ('9007199254740991'::bigint)::numeric)) AND (((metadata ->> 'rows_affected'::text))::numeric = trunc(((metadata ->> 'rows_affected'::text))::numeric)))
+    ELSE false
+END) AND ((NOT (metadata ? 'statement_count'::text)) OR
+CASE
+    WHEN (jsonb_typeof((metadata -> 'statement_count'::text)) = 'number'::text) THEN (((((metadata ->> 'statement_count'::text))::numeric >= (0)::numeric) AND (((metadata ->> 'statement_count'::text))::numeric <= ('9007199254740991'::bigint)::numeric)) AND (((metadata ->> 'statement_count'::text))::numeric = trunc(((metadata ->> 'statement_count'::text))::numeric)))
+    ELSE false
+END) AND ((NOT (metadata ? 'batch_number'::text)) OR
+CASE
+    WHEN (jsonb_typeof((metadata -> 'batch_number'::text)) = 'number'::text) THEN (((((metadata ->> 'batch_number'::text))::numeric >= (0)::numeric) AND (((metadata ->> 'batch_number'::text))::numeric <= ('9007199254740991'::bigint)::numeric)) AND (((metadata ->> 'batch_number'::text))::numeric = trunc(((metadata ->> 'batch_number'::text))::numeric)))
+    ELSE false
+END) AND ((NOT (metadata ? 'retry_count'::text)) OR
+CASE
+    WHEN (jsonb_typeof((metadata -> 'retry_count'::text)) = 'number'::text) THEN (((((metadata ->> 'retry_count'::text))::numeric >= (0)::numeric) AND (((metadata ->> 'retry_count'::text))::numeric <= ('9007199254740991'::bigint)::numeric)) AND (((metadata ->> 'retry_count'::text))::numeric = trunc(((metadata ->> 'retry_count'::text))::numeric)))
+    ELSE false
+END) AND ((NOT (metadata ? 'operation_category'::text)) OR ((metadata ->> 'operation_category'::text) = ANY (ARRAY['schema'::text, 'data-correction'::text, 'security-policy'::text, 'function-replacement'::text, 'index'::text, 'seed-reference'::text]))) AND ((NOT (metadata ? 'execution_mode'::text)) OR ((metadata ->> 'execution_mode'::text) = ANY (ARRAY['legacy-verbatim'::text, 'transactional'::text, 'nontransactional'::text, 'batched'::text]))) AND ((NOT (metadata ? 'verification'::text)) OR ((metadata ->> 'verification'::text) = ANY (ARRAY['passed'::text, 'failed'::text]))) AND ((NOT (metadata ? 'reclaim_reason'::text)) OR ((metadata ->> 'reclaim_reason'::text) = ANY (ARRAY['heartbeat_expired'::text, 'connection_lost'::text, 'operator_approved'::text])))))

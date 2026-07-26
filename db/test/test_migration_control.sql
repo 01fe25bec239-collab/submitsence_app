@@ -156,7 +156,7 @@ insert into migration_control.migration_runs (
   '0001',
   1,
   'started',
-  '{}'::jsonb
+  '{"execution_mode":"legacy-verbatim","migration_filename":"0001_extensions_helpers.sql","migration_ordinal":1}'::jsonb
 );
 select pg_temp.migration_control_assert(true, 'migration_runs valid INSERT succeeds');
 
@@ -298,7 +298,9 @@ begin
         ('invalid event type', 'unknown', '{}'::jsonb),
         ('invalid metadata shape', 'started', '[]'::jsonb),
         ('metadata rejects unconstrained keys', 'started', '{"sql":"select secret"}'::jsonb),
-        ('metadata rejects free text in numeric fields', 'started', '{"duration_ms":"secret"}'::jsonb)
+        ('metadata rejects free text in numeric fields', 'started', '{"duration_ms":"secret"}'::jsonb),
+        ('metadata rejects malformed migration filenames', 'started', '{"migration_filename":"../0001.sql"}'::jsonb),
+        ('metadata rejects non-positive migration ordinals', 'started', '{"migration_ordinal":0}'::jsonb)
       ) as cases(label, event_type, metadata)
   loop
     begin
