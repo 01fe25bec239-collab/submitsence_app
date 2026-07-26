@@ -14,13 +14,7 @@ import * as v from "../auth/validation";
 import { assertSafeStatusLanguage } from "../compliance/language";
 import { getEmbedder, toVectorLiteral } from "../ingestion/embedder";
 import { extractStandards } from "../ingestion/extraction";
-import { listProviderCapabilities, mapExternalConsultantStatus } from "../integrations/provider";
-import {
-  documentProcessingJobTypes,
-  isSupportedProcessingJobType,
-  type SynchronousProcessingLedgerJobType,
-  type SupportedProcessingJobType,
-} from "../job-types";
+import { assertAustralianSecretReference, listProviderCapabilities, mapExternalConsultantStatus, providerCapabilities } from "../integrations/provider";
 import { resolveCoverSheet } from "../package/package.service";
 import { withTenantClient } from "../db/tenant-db";
 import { PG_POOL } from "../db.module";
@@ -50,7 +44,16 @@ type JobRow = {
   inserted?: boolean;
 };
 
-const uploadDocTypes = new Set<string>(Object.keys(documentProcessingJobTypes));
+const uploadDocTypes = new Set(["spec", "drawing", "addendum", "vendor_catalogue", "past_submittal", "attachment", "other"]);
+const ingestJobType: Record<string, string> = {
+  spec: "ingest_spec",
+  drawing: "ingest_drawing",
+  addendum: "ingest_addendum",
+  vendor_catalogue: "ingest_vendor_catalogue",
+  past_submittal: "ingest_past_submittal",
+  attachment: "ingest_attachment",
+  other: "ingest_document",
+};
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 
 @Injectable()
@@ -184,7 +187,6 @@ export class ApiService {
     const pid = v.uuid(projectId, "projectId");
     const docType = api.enumValue(forcedDocType ?? body.docType, "docType", api.documentTypes);
     if (!uploadDocTypes.has(docType)) throw new BadRequestException("docType cannot be uploaded through this endpoint");
-    this.requireSupportedProcessingJobType(documentProcessingJobTypes[docType as keyof typeof documentProcessingJobTypes]);
     if (docType === "vendor_catalogue") await this.auth.requireTenantPermission(ctx, "vendor.manage", req);
     const filename = api.safeFilename(body.filename);
     const mimeType = v.string(body.mimeType, "mimeType").toLowerCase();
@@ -204,7 +206,6 @@ export class ApiService {
   async finalizeUpload(ctx: AuthContext, projectId: string, body: Record<string, unknown>, idempotencyKey: string, req?: AuthedRequest) {
     const pid = v.uuid(projectId, "projectId");
     const docType = api.enumValue(body.docType, "docType", api.documentTypes);
-    const jobType = this.requireSupportedProcessingJobType(documentProcessingJobTypes[docType as keyof typeof documentProcessingJobTypes] ?? "ingest_document");
     if (docType === "vendor_catalogue") await this.auth.requireTenantPermission(ctx, "vendor.manage", req);
     const bucket = process.env.S3_UPLOAD_BUCKET ?? process.env.S3_BUCKET ?? "submitsense-dev-uploads";
     const requestedBucket = api.optionalString(body.bucket);
@@ -216,6 +217,7 @@ export class ApiService {
     this.assertAllowedMime(docType, mimeType);
     const checksum = api.hexSha256(body.checksumSha256);
     const sizeBytes = this.uploadSize(body.sizeBytes);
+    const jobType = ingestJobType[docType] ?? "ingest_document";
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
       await this.requireProject(client, pid, false);
       const doc = await client.query<{ id: string }>(
@@ -1190,7 +1192,6 @@ export class ApiService {
     await this.auth.requireTenantPermission(ctx, "rfi.manage", req);
     const pid = v.uuid(projectId, "projectId");
     const id = v.uuid(rfiId, "rfiId");
-    this.requireSupportedProcessingJobType("export_rfi_pdf");
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
       const rfi = await this.requireRfi(client, pid, id);
       if (rfi.review_status !== "approved") throw new BadRequestException("RFI draft requires human review before export handoff");
@@ -1200,10 +1201,16 @@ export class ApiService {
 
   async handoffRfi(ctx: AuthContext, projectId: string, rfiId: string, body: Record<string, unknown>, idempotencyKey: string, req?: AuthedRequest) {
     await this.auth.requireTenantPermission(ctx, "rfi.manage", req);
-    v.uuid(projectId, "projectId");
-    v.uuid(rfiId, "rfiId");
-    v.uuid(body.connectionId, "connectionId");
-    return this.unavailableJobType();
+    const pid = v.uuid(projectId, "projectId");
+    const id = v.uuid(rfiId, "rfiId");
+    const connectionId = v.uuid(body.connectionId, "connectionId");
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      const rfi = await this.requireRfi(client, pid, id);
+      if (rfi.review_status !== "approved") throw new BadRequestException("RFI draft requires human review before send handoff");
+      const job = await this.enqueueSyncJob(client, ctx, connectionId, pid, null, "package_push", `rfi_handoff:${id}:${idempotencyKey}`, { rfiId: id });
+      await this.recordAudit(client, ctx, "integration_sync", "rfi_draft", id, "rfi_handoff", "RFI handoff requested", { project_id: pid, jobId: job.id }, req);
+      return job;
+    });
   }
 
   async createPackage(ctx: AuthContext, projectId: string, body: Record<string, unknown>, idempotencyKey: string, req?: AuthedRequest) {
@@ -1214,7 +1221,7 @@ export class ApiService {
     const coverOverrides = v.object(body.coverSheet, "coverSheet");
     assertSafeStatusLanguage(name);
     return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
-      const job = await this.startSynchronousProjectJob(client, ctx, pid, "package_draft", `package_draft:${idempotencyKey}`, { itemIds });
+      const job = await this.enqueueProjectJob(client, ctx, pid, "package_draft", `package_draft:${idempotencyKey}`, { itemIds });
       if (!job.inserted && job.worker_output?.packageId) {
         const existing = await client.query(`select id, name, status from packages where id = $1 and project_id = $2`, [job.worker_output.packageId, pid]);
         if (!existing.rows[0]) throw new Error("Idempotent package draft resource is missing");
@@ -1543,11 +1550,24 @@ export class ApiService {
 
   async createSyncJob(ctx: AuthContext, connectionId: string, body: Record<string, unknown>, idempotencyKey: string, req?: AuthedRequest) {
     await this.auth.requireTenantPermission(ctx, "integration.manage", req);
-    v.uuid(connectionId, "connectionId");
-    api.optionalUuid(body.projectId, "projectId");
-    api.optionalUuid(body.packageId, "packageId");
-    api.enumValue(body.jobType ?? "package_push", "jobType", api.syncJobTypes);
-    return this.unavailableJobType();
+    const id = v.uuid(connectionId, "connectionId");
+    const projectId = api.optionalUuid(body.projectId, "projectId");
+    const packageId = api.optionalUuid(body.packageId, "packageId");
+    const jobType = api.enumValue(body.jobType ?? "package_push", "jobType", api.syncJobTypes);
+    return withTenantClient(this.pool, this.dbContext(ctx), async (client) => {
+      const connection = await client.query<{ provider: string; status: string; token_reference: string | null }>(
+        `select provider::text, status::text, token_reference from integration_connections where id = $1`,
+        [id],
+      );
+      const row = connection.rows[0] ?? this.notFound("integration connection");
+      const capabilities = providerCapabilities(row.provider);
+      if (!capabilities?.enabled) throw new ForbiddenException(capabilities?.reason ?? "Integration provider is not approved");
+      if (row.status !== "connected") throw new ForbiddenException("Integration connection is not connected");
+      assertAustralianSecretReference(row.token_reference);
+      const job = await this.enqueueSyncJob(client, ctx, id, projectId, packageId, jobType, `integration_sync:${id}:${idempotencyKey}`, api.object(body.payload));
+      await this.recordAudit(client, ctx, "integration_sync", "sync_job", job.id, "sync_job_create", "Integration sync job created", { project_id: projectId, connectionId: id }, req);
+      return job;
+    });
   }
 
   async syncJobStatus(ctx: AuthContext, jobId: string) {
@@ -1682,31 +1702,18 @@ export class ApiService {
   }
 
   private async enqueueDocumentJob(client: PoolClient, ctx: AuthContext, documentId: string, jobType: string, idempotencyKey: string, payload: Record<string, unknown>): Promise<JobRow> {
-    const supportedJobType = this.requireSupportedProcessingJobType(jobType);
     const result = await client.query<JobRow>(
       `insert into processing_jobs (tenant_id, document_id, job_type, idempotency_key, worker_output)
        values ($1, $2, $3, $4, $5::jsonb)
        on conflict (tenant_id, idempotency_key) do update set idempotency_key = excluded.idempotency_key
        returning id, job_type, status, worker_output, (xmax = 0) as inserted`,
-      [ctx.tenantId, documentId, supportedJobType, idempotencyKey, JSON.stringify(payload)],
+      [ctx.tenantId, documentId, jobType, idempotencyKey, JSON.stringify(payload)],
     );
     await this.recordAudit(client, ctx, "extraction", "processing_job", result.rows[0].id, "job_enqueue", "Document processing job enqueued", payload);
     return result.rows[0];
   }
 
   private async enqueueProjectJob(client: PoolClient, ctx: Pick<AuthContext, "tenantId">, projectId: string | null, jobType: string, idempotencyKey: string, payload: Record<string, unknown>): Promise<JobRow> {
-    const supportedJobType = this.requireSupportedProcessingJobType(jobType);
-    const result = await client.query<JobRow>(
-      `insert into processing_jobs (tenant_id, document_id, job_type, idempotency_key, worker_output)
-       values ($1, null, $2, $3, $4::jsonb)
-       on conflict (tenant_id, idempotency_key) do update set idempotency_key = excluded.idempotency_key
-       returning id, job_type, status, worker_output, (xmax = 0) as inserted`,
-      [ctx.tenantId, supportedJobType, idempotencyKey, JSON.stringify({ projectId, ...payload })],
-    );
-    return result.rows[0];
-  }
-
-  private async startSynchronousProjectJob(client: PoolClient, ctx: Pick<AuthContext, "tenantId">, projectId: string | null, jobType: SynchronousProcessingLedgerJobType, idempotencyKey: string, payload: Record<string, unknown>): Promise<JobRow> {
     const result = await client.query<JobRow>(
       `insert into processing_jobs (tenant_id, document_id, job_type, idempotency_key, worker_output)
        values ($1, null, $2, $3, $4::jsonb)
@@ -1717,13 +1724,24 @@ export class ApiService {
     return result.rows[0];
   }
 
-  private requireSupportedProcessingJobType(jobType: string): SupportedProcessingJobType {
-    if (!isSupportedProcessingJobType(jobType)) return this.unavailableJobType();
-    return jobType;
-  }
-
-  private unavailableJobType(): never {
-    throw new ServiceUnavailableException("This operation is temporarily unavailable");
+  private async enqueueSyncJob(
+    client: PoolClient,
+    ctx: AuthContext,
+    connectionId: string,
+    projectId: string | null,
+    packageId: string | null,
+    jobType: string,
+    idempotencyKey: string,
+    payload: Record<string, unknown>,
+  ): Promise<JobRow> {
+    const result = await client.query<JobRow>(
+      `insert into sync_jobs (tenant_id, connection_id, project_id, package_id, job_type, idempotency_key, payload)
+       values ($1, $2, $3, $4, $5::sync_job_type, $6, $7::jsonb)
+       on conflict (tenant_id, idempotency_key) do update set idempotency_key = excluded.idempotency_key
+       returning id, job_type, status, payload as worker_output, (xmax = 0) as inserted`,
+      [ctx.tenantId, connectionId, projectId, packageId, jobType, idempotencyKey, JSON.stringify(payload)],
+    );
+    return result.rows[0];
   }
 
   private async patchJobOutput(client: PoolClient, jobId: string, patch: Record<string, unknown>) {

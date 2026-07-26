@@ -26,8 +26,6 @@ tmp/
 *.tfstate
 *.tfstate.*
 *.tfvars
-!*.tfvars.example
-*.tfplan
 crash.log
 # keep .terraform.lock.hcl checked in
 

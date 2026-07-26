@@ -122,15 +122,14 @@ begin
 end$$;
 
 -- A job abandoned by a crashed worker is reclaimed under the same idempotency key/version.
-insert into processing_jobs (id, tenant_id, job_type, status, attempts, max_attempts, idempotency_key, started_at, lease_token, lease_expires_at)
+insert into processing_jobs (id, tenant_id, job_type, status, attempts, max_attempts, idempotency_key, started_at)
 values ('f0f0f0f0-f0f0-40f0-80f0-f0f0f0f0f0f0', '11111111-1111-1111-1111-111111111111',
-        'package_generation_recovery_test', 'running', 1, 3, 'stale-package-job-test', now() - interval '16 minutes',
-        'f1f1f1f1-f1f1-41f1-81f1-f1f1f1f1f1f1', now() - interval '1 minute');
+        'package_generation_recovery_test', 'running', 1, 3, 'stale-package-job-test', now() - interval '16 minutes');
 
 do $$
 declare claimed uuid; claimed_attempts integer; claimed_status job_status;
 begin
-  select id into claimed from app.claim_next_job(array['package_generation_recovery_test'], 900);
+  select id into claimed from app.claim_next_job(array['package_generation_recovery_test']);
   select attempts, status into claimed_attempts, claimed_status from processing_jobs where id = claimed;
   if claimed <> 'f0f0f0f0-f0f0-40f0-80f0-f0f0f0f0f0f0' or claimed_attempts <> 2 or claimed_status <> 'running' then
     raise exception 'FAIL package 6: stale package job was not reclaimed safely';
@@ -158,11 +157,10 @@ begin
 end$$;
 
 -- A final-attempt crash closes package/export state instead of leaving it generating forever.
-insert into processing_jobs (id, tenant_id, job_type, status, attempts, max_attempts, idempotency_key, started_at, worker_output, lease_token, lease_expires_at)
+insert into processing_jobs (id, tenant_id, job_type, status, attempts, max_attempts, idempotency_key, started_at, worker_output)
 values ('13131313-1313-4313-8313-131313131313', '11111111-1111-1111-1111-111111111111',
         'export_aconex_bundle', 'running', 3, 3, 'exhausted-package-job-test', now() - interval '16 minutes',
-        '{"projectId":"55555555-5555-5555-5555-555555555555","packageId":"20202020-2020-4020-8020-202020202020","exportId":"14141414-1414-4414-8414-141414141414"}',
-        '13231313-1313-4313-8313-131313131313', now() - interval '1 minute');
+        '{"projectId":"55555555-5555-5555-5555-555555555555","packageId":"20202020-2020-4020-8020-202020202020","exportId":"14141414-1414-4414-8414-141414141414"}');
 insert into package_versions (id, tenant_id, package_id, version_number, generation_job_id)
 values ('15151515-1515-4515-8515-151515151515', '11111111-1111-1111-1111-111111111111',
         '20202020-2020-4020-8020-202020202020', 2, '13131313-1313-4313-8313-131313131313');
@@ -170,7 +168,7 @@ insert into exports (id, tenant_id, project_id, package_id, export_type)
 values ('14141414-1414-4414-8414-141414141414', '11111111-1111-1111-1111-111111111111',
         '55555555-5555-5555-5555-555555555555', '20202020-2020-4020-8020-202020202020', 'aconex_bundle');
 update packages set status = 'assembling' where id = '20202020-2020-4020-8020-202020202020';
-select id from app.claim_next_job(array['no_matching_test_job'], 900);
+select id from app.claim_next_job(array['no_matching_test_job']);
 
 do $$
 declare job_state job_status; version_state export_status; export_state export_status; package_state package_status;
@@ -190,18 +188,17 @@ insert into documents (id, tenant_id, project_id, doc_type, title, storage_bucke
 values ('16161616-1616-4616-8616-161616161616', '11111111-1111-1111-1111-111111111111',
         '55555555-5555-5555-5555-555555555555', 'generated_package', 'Committed package output',
         'test-ap-southeast-2', 'package-test/committed.pdf', repeat('a', 64));
-insert into processing_jobs (id, tenant_id, job_type, status, attempts, max_attempts, idempotency_key, started_at, worker_output, lease_token, lease_expires_at)
+insert into processing_jobs (id, tenant_id, job_type, status, attempts, max_attempts, idempotency_key, started_at, worker_output)
 values ('17171717-1717-4717-8717-171717171717', '11111111-1111-1111-1111-111111111111',
         'package_generation', 'running', 3, 3, 'committed-package-job-test', now() - interval '16 minutes',
-        '{"projectId":"55555555-5555-5555-5555-555555555555","packageId":"20202020-2020-4020-8020-202020202020"}',
-        '17271717-1717-4717-8717-171717171717', now() - interval '1 minute');
+        '{"projectId":"55555555-5555-5555-5555-555555555555","packageId":"20202020-2020-4020-8020-202020202020"}');
 insert into package_versions (id, tenant_id, package_id, version_number, generation_job_id, status, output_document_id, checksum_sha256)
 values ('18181818-1818-4818-8818-181818181818', '11111111-1111-1111-1111-111111111111',
         '20202020-2020-4020-8020-202020202020', 3, '17171717-1717-4717-8717-171717171717',
         'ready', '16161616-1616-4616-8616-161616161616', repeat('a', 64));
 update packages set status = 'ready', output_document_id = '16161616-1616-4616-8616-161616161616'
  where id = '20202020-2020-4020-8020-202020202020';
-select id from app.claim_next_job(array['no_matching_test_job'], 900);
+select id from app.claim_next_job(array['no_matching_test_job']);
 
 do $$
 declare job_state job_status; version_state export_status; package_state package_status;
