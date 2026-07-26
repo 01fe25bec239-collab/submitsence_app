@@ -1,0 +1,22 @@
+environment              = "staging"
+vpc_cidr                 = "10.30.0.0/16"
+single_nat_gateway       = true
+enable_dr                = false
+force_destroy_buckets    = false
+allow_insecure_http      = false
+db_instance_class        = "db.t4g.medium"
+db_allocated_storage     = 50
+db_max_allocated_storage = 250
+db_backup_retention_days = 14
+api_capacity             = { initial = 2, min = 2, max = 3, pool_max = 10 }
+frontend_capacity        = { initial = 2, min = 2, max = 3 }
+worker_capacities = {
+  ocr       = { initial = 0, min = 0, max = 2 }
+  vendor    = { initial = 0, min = 0, max = 2 }
+  package   = { initial = 0, min = 0, max = 2 }
+  scheduled = { initial = 1, min = 1, max = 3 }
+}
+monthly_budget_usd       = 500
+
+root_domain     = ""
+route53_zone_id = ""

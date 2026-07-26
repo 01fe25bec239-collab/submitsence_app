@@ -1,0 +1,17 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_sha:
+        description: Tested commit SHA to deploy
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: production
+      git_sha: ${{ inputs.git_sha }}
+    secrets: inherit

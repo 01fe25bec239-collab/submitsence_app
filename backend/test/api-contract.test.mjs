@@ -40,9 +40,10 @@ test("webhooks resolve tenant from a trusted server-side mapping, never the requ
   assert.doesNotMatch(commercialSource, /body\.tenantId/);
 });
 
-test("queue handoff keeps broker/runtime open and DB ledgers binding", () => {
+test("queue handoff makes PostgreSQL processing_jobs the sole active asynchronous queue", () => {
   assert.match(handoff, /processing_jobs/);
   assert.match(handoff, /sync_jobs/);
-  assert.match(handoff, /Queue broker\/runtime\/retry\/DLQ policy is still open/);
+  assert.match(handoff, /sole active asynchronous queue/);
+  assert.match(handoff, /fail with the standard controlled `503` response/);
   assert.match(handoff, /actorType: "system"/);
 });

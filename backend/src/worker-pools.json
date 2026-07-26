@@ -1,0 +1,34 @@
+{
+  "ocr": {
+    "enabled": true,
+    "jobTypes": [
+      "ingest_past_submittal"
+    ]
+  },
+  "vendor": {
+    "enabled": true,
+    "jobTypes": [
+      "ingest_vendor_catalogue",
+      "product_rematch"
+    ]
+  },
+  "package": {
+    "enabled": true,
+    "jobTypes": [
+      "package_generation",
+      "export_consultant_pdf",
+      "export_aconex_bundle",
+      "export_register_csv",
+      "export_register_xlsx",
+      "export_register_pdf"
+    ]
+  },
+  "scheduled": {
+    "enabled": true,
+    "anchor": true,
+    "jobTypes": [
+      "risk_flag_generation",
+      "rfi_generation"
+    ]
+  }
+}

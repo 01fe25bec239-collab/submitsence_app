@@ -1,0 +1,253 @@
+name: Deploy environment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      git_sha:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_sha }}
+          fetch-depth: 0
+      - name: Accept only commits from main
+        run: git merge-base --is-ancestor "${{ inputs.git_sha }}" origin/main
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.7
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ap-southeast-2
+
+      - name: Initialize Terraform
+        working-directory: terraform
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          terraform init \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=submitsense/${{ inputs.environment }}/terraform.tfstate" \
+            -backend-config="region=ap-southeast-2" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+          cp "environments/${{ inputs.environment }}.tfvars.example" terraform.tfvars
+
+      - name: Bootstrap image repositories on first deployment
+        working-directory: terraform
+        env:
+          TF_VAR_image_tag: ${{ inputs.git_sha }}
+        run: |
+          if ! aws ecr describe-repositories --repository-names "submitsense-${{ inputs.environment }}/backend" >/dev/null 2>&1; then
+            terraform apply -auto-approve -target=aws_ecr_repository.this -target=aws_ecr_lifecycle_policy.this
+          fi
+
+      - name: Build and push immutable images
+        env:
+          IMAGE_TAG: ${{ inputs.git_sha }}
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="$ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+          push_image() {
+            local repo="$1" dockerfile="$2"
+            local name="submitsense-${{ inputs.environment }}/$repo"
+            if aws ecr describe-images --repository-name "$name" --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+              echo "Reusing immutable $name:$IMAGE_TAG"
+              return
+            fi
+            docker build -f "$dockerfile" -t "$REGISTRY/$name:$IMAGE_TAG" .
+            docker push "$REGISTRY/$name:$IMAGE_TAG"
+          }
+          push_image backend backend/Dockerfile
+          push_image migrations backend/Dockerfile.migrations
+          push_image frontend web/Dockerfile
+
+      - name: Gate on ECR scan
+        env:
+          IMAGE_TAG: ${{ inputs.git_sha }}
+        run: |
+          for repo in backend migrations frontend; do
+            name="submitsense-${{ inputs.environment }}/$repo"
+            aws ecr wait image-scan-complete --repository-name "$name" --image-id imageTag="$IMAGE_TAG"
+            severe="$(aws ecr describe-image-scan-findings --repository-name "$name" --image-id imageTag="$IMAGE_TAG" --query 'imageScanFindings.findingSeverityCounts.[HIGH,CRITICAL]' --output text | awk '{print ($1+0)+($2+0)}')"
+            test "$severe" -eq 0 || { echo "$name has $severe high/critical findings"; exit 1; }
+          done
+
+      - name: Plan and apply infrastructure and task definitions
+        working-directory: terraform
+        env:
+          TF_VAR_image_tag: ${{ inputs.git_sha }}
+          TF_VAR_alarm_email: ${{ vars.ALARM_EMAIL }}
+          TF_VAR_root_domain: ${{ vars.ROOT_DOMAIN }}
+          TF_VAR_route53_zone_id: ${{ vars.ROUTE53_ZONE_ID }}
+          TF_VAR_terms_version: ${{ vars.TERMS_VERSION }}
+          TF_VAR_privacy_version: ${{ vars.PRIVACY_VERSION }}
+        run: |
+          terraform plan -out=deploy.tfplan
+          terraform show -no-color deploy.tfplan
+          terraform apply -auto-approve deploy.tfplan
+
+      - name: Gate database connection capacity in the VPC
+        working-directory: terraform
+        run: |
+          cluster="$(terraform output -raw ecs_cluster_name)"
+          family="$(terraform output -raw db_capacity_check_task_family)"
+          subnets="$(terraform output -json private_subnet_ids | jq -r 'join(",")')"
+          security_group="$(terraform output -raw worker_security_group_id)"
+          task="$(aws ecs run-task --cluster "$cluster" --task-definition "$family" --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$security_group],assignPublicIp=DISABLED}" --query 'tasks[0].taskArn' --output text)"
+          test "$task" != "None"
+          aws ecs wait tasks-stopped --cluster "$cluster" --tasks "$task"
+          exit_code="$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task" --query 'tasks[0].containers[?name==`db-capacity-check`].exitCode | [0]' --output text)"
+          test "$exit_code" = "0" || { aws ecs describe-tasks --cluster "$cluster" --tasks "$task"; exit 1; }
+
+      - name: Run migrations
+        working-directory: terraform
+        run: |
+          cluster="$(terraform output -raw ecs_cluster_name)"
+          family="$(terraform output -raw migration_task_family)"
+          subnets="$(terraform output -json private_subnet_ids | jq -r 'join(",")')"
+          security_group="$(terraform output -raw worker_security_group_id)"
+          task="$(aws ecs run-task --cluster "$cluster" --task-definition "$family" --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$security_group],assignPublicIp=DISABLED}" --query 'tasks[0].taskArn' --output text)"
+          test "$task" != "None"
+          aws ecs wait tasks-stopped --cluster "$cluster" --tasks "$task"
+          exit_code="$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task" --query 'tasks[0].containers[?name==`migrations`].exitCode | [0]' --output text)"
+          test "$exit_code" = "0" || { aws ecs describe-tasks --cluster "$cluster" --tasks "$task"; exit 1; }
+
+      - name: Roll services forward with bounded polling and rollback
+        working-directory: terraform
+        run: |
+          set -Eeuo pipefail
+          cluster="$(terraform output -raw ecs_cluster_name)"
+          api_service="$(terraform output -raw api_service_name)"
+          frontend_service="$(terraform output -raw frontend_service_name)"
+          api_family="$(terraform output -raw api_task_family)"
+          frontend_family="$(terraform output -raw frontend_task_family)"
+          declare -A worker_services worker_families prior
+          while IFS=$'\t' read -r name service; do worker_services["$name"]="$service"; done < <(terraform output -json worker_service_names | jq -r 'to_entries[] | [.key,.value] | @tsv')
+          while IFS=$'\t' read -r name family; do worker_families["$name"]="$family"; done < <(terraform output -json worker_task_families | jq -r 'to_entries[] | [.key,.value] | @tsv')
+          updated=()
+
+          diagnostics() {
+            local service="$1"
+            echo "::group::Diagnostics for $service"
+            aws ecs describe-services --cluster "$cluster" --services "$service" --include TAGS || true
+            mapfile -t tasks < <(aws ecs list-tasks --cluster "$cluster" --service-name "$service" --query 'taskArns' --output text | tr '\t' '\n' | grep -v '^None$' || true)
+            if ((${#tasks[@]})); then
+              aws ecs describe-tasks --cluster "$cluster" --tasks "${tasks[@]}" || true
+              aws ecs get-task-protection --cluster "$cluster" --tasks "${tasks[@]}" || true
+            fi
+            echo "::endgroup::"
+          }
+
+          wait_service() {
+            local service="$1" minutes="$2" deadline=$((SECONDS + minutes * 60))
+            while ((SECONDS < deadline)); do
+              description="$(aws ecs describe-services --cluster "$cluster" --services "$service" --output json)"
+              echo "$description" | jq '{service: .services[0].serviceName, desired: .services[0].desiredCount, running: .services[0].runningCount, pending: .services[0].pendingCount, deployments: [.services[0].deployments[] | {status, rolloutState, desiredCount, runningCount, pendingCount}], events: [.services[0].events[:5][]?.message]}'
+              if echo "$description" | jq -e '[.services[0].events[:10][]?.message] | any(test("DEPLOYMENT_BLOCKED"))' >/dev/null; then
+                diagnostics "$service"
+                return 1
+              fi
+              if echo "$description" | jq -e '.services[0] as $s | ($s.deployments | length) == 1 and $s.deployments[0].rolloutState == "COMPLETED" and $s.runningCount == $s.desiredCount and $s.pendingCount == 0' >/dev/null; then
+                return 0
+              fi
+              if echo "$description" | jq -e '.services[0].deployments[]? | select(.rolloutState == "FAILED")' >/dev/null; then
+                diagnostics "$service"
+                return 1
+              fi
+              sleep 15
+            done
+            diagnostics "$service"
+            return 1
+          }
+
+          rollback() {
+            status=$?
+            trap - ERR
+            echo "Deployment failed; rolling updated services back in reverse order."
+            for ((index=${#updated[@]}-1; index>=0; index--)); do
+              service="${updated[$index]}"
+              diagnostics "$service"
+              aws ecs update-service --cluster "$cluster" --service "$service" --task-definition "${prior[$service]}" >/dev/null || true
+            done
+            exit "$status"
+          }
+          trap rollback ERR
+
+          for service in "$api_service" "$frontend_service" "${worker_services[ocr]}" "${worker_services[vendor]}" "${worker_services[package]}" "${worker_services[scheduled]}"; do
+            prior["$service"]="$(aws ecs describe-services --cluster "$cluster" --services "$service" --query 'services[0].taskDefinition' --output text)"
+            test "${prior[$service]}" != "None"
+          done
+
+          aws ecs update-service --cluster "$cluster" --service "$api_service" --task-definition "$api_family" >/dev/null
+          updated+=("$api_service")
+          wait_service "$api_service" 15
+
+          aws ecs update-service --cluster "$cluster" --service "$frontend_service" --task-definition "$frontend_family" >/dev/null
+          updated+=("$frontend_service")
+          wait_service "$frontend_service" 15
+
+          for name in ocr vendor package; do
+            service="${worker_services[$name]}"
+            aws ecs update-service --cluster "$cluster" --service "$service" --task-definition "${worker_families[$name]}" >/dev/null
+            updated+=("$service")
+          done
+          worker_waits=()
+          for name in ocr vendor package; do
+            wait_service "${worker_services[$name]}" 120 &
+            worker_waits+=("$!")
+          done
+          for worker_wait in "${worker_waits[@]}"; do wait "$worker_wait"; done
+
+          service="${worker_services[scheduled]}"
+          aws ecs update-service --cluster "$cluster" --service "$service" --task-definition "${worker_families[scheduled]}" >/dev/null
+          updated+=("$service")
+          wait_service "$service" 120
+          trap - ERR
+
+      - name: Verify PB-07 telemetry and PB-08 scaling resources
+        working-directory: terraform
+        run: |
+          environment="${{ inputs.environment }}"
+          namespace="SubmitSense/Jobs"
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          start="$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
+          metrics="$(aws cloudwatch list-metrics --namespace "$namespace" --metric-name QueueDepth --dimensions Name=Environment,Value="$environment" --recently-active PT3H --output json)"
+          test "$(jq '.Metrics | length' <<<"$metrics")" -gt 0
+          test "$(jq '[.Metrics[] | .Dimensions[] | select(.Name=="JobType").Value] | unique | length' <<<"$metrics")" -eq 11
+          job_type="$(jq -r '.Metrics[] | .Dimensions[] | select(.Name=="JobType").Value' <<<"$metrics" | head -n1)"
+          test -n "$job_type"
+          metric_data="$(aws cloudwatch get-metric-data \
+            --start-time "$start" --end-time "$now" \
+            --metric-data-queries "[{\"Id\":\"q\",\"MetricStat\":{\"Metric\":{\"Namespace\":\"$namespace\",\"MetricName\":\"QueueDepth\",\"Dimensions\":[{\"Name\":\"Environment\",\"Value\":\"$environment\"},{\"Name\":\"JobType\",\"Value\":\"$job_type\"}]},\"Period\":60,\"Stat\":\"Maximum\"},\"ReturnData\":true}]" \
+            --output json)"
+          test "$(jq -r '.MetricDataResults[0].StatusCode' <<<"$metric_data")" = "Complete"
+          test "$(jq '.MetricDataResults[0].Values | length' <<<"$metric_data")" -gt 0
+          aws cloudwatch describe-alarms --alarm-name-prefix "submitsense-$environment-worker-" --query 'MetricAlarms[].[AlarmName,ActionsEnabled,TreatMissingData]' --output table
+          test "$(aws cloudwatch describe-alarms --alarm-name-prefix "submitsense-$environment-worker-" --query 'length(MetricAlarms)' --output text)" -eq 8
+          test "$(aws cloudwatch describe-alarms --alarm-names "submitsense-$environment-queue-metrics-missing" --query 'length(MetricAlarms)' --output text)" -eq 1
+          test "$(aws application-autoscaling describe-scalable-targets --service-namespace ecs --query \"length(ScalableTargets[?contains(ResourceId, 'service/submitsense-$environment/')])\" --output text)" -eq 6
+          test "$(aws application-autoscaling describe-scaling-policies --service-namespace ecs --query \"length(ScalingPolicies[?contains(ResourceId, 'service/submitsense-$environment/')])\" --output text)" -eq 10
+
+      - name: Verify Australian residency configuration
+        env:
+          AWS_REGION: ap-southeast-2
+        run: infra/scripts/residency-check.sh

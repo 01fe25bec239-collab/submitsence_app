@@ -1,5 +1,6 @@
 import { BadRequestException } from "@nestjs/common";
 import * as v from "../auth/validation";
+import { syncJobRegistry } from "../job-types";
 
 export const documentTypes = new Set(["spec", "drawing", "addendum", "vendor_catalogue", "past_submittal", "generated_package", "export", "attachment", "other"]);
 export const projectStatuses = new Set(["draft", "active", "on_hold", "completed", "archived", "cancelled"]);
@@ -13,7 +14,7 @@ export const consultantOutcomes = new Set(["approved", "revise_and_resubmit", "r
 export const registerExportFormats = new Set(["csv", "xlsx", "pdf"]);
 export const rfiConflictTypes = new Set(["ambiguity", "conflict", "missing_information", "discrepancy", "other"]);
 export const integrationProviders = new Set(["aconex", "procore", "other"]);
-export const syncJobTypes = new Set(["package_push", "response_pull"]);
+export const syncJobTypes = new Set<string>(syncJobRegistry.unsupported);
 export const consentStates = new Set(["opted_in", "opted_out"]); // 'unset' is the default, never a user choice
 export const requirementCategories = new Set(["submission", "hold_point", "evidence_of_conformity", "sample", "shop_drawing", "product_data", "test_report", "certificate", "manual", "commissioning_record", "other"]);
 

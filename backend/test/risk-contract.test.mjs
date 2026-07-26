@@ -35,13 +35,13 @@ test("persistence keeps reviewed decisions and every finding carries source and 
   assert.match(migration, /chk_risk_evidence_array/);
 });
 
-test("RFI drafts are structured, source-cited, human-reviewed, and gated before handoff", () => {
+test("RFI drafts are structured and human-reviewed while unsupported output paths fail closed", () => {
   assert.match(riskService, /issue_summary, question, suggested_attachments/);
   assert.match(riskService, /rfi_cited_clauses/);
   assert.match(riskService, /rfi_cited_documents/);
   assert.match(apiService, /RFI review requires an active human user/);
-  assert.match(apiService, /requires human review before export handoff/);
-  assert.match(apiService, /requires human review before send handoff/);
+  assert.match(apiService, /requireSupportedProcessingJobType\("export_rfi_pdf"\)/);
+  assert.match(apiService, /async handoffRfi[\s\S]*return this\.unavailableJobType\(\)/);
   assert.match(handoff, /does not render, email, upload, or send it/);
 });
 

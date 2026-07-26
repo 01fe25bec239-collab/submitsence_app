@@ -82,7 +82,8 @@ Run the worker: `npm --prefix backend run worker` (separate process; same DB rol
   (CSV/xlsx rows) only; PDF/scanned input ingests zero products with a recorded reason. A real
   extractor MUST run on Australian-hosted/approved infra (compliance §5-6) — processor-approval
   decision. Also unwired: downloading the S3 object and parsing CSV/xlsx into rows (needs AU S3 + a
-  parser dep); until then the worker reads rows from `worker_output`.
+  parser dep); until then the worker reads rows from `worker_output`. Spec, drawing, addendum,
+  attachment, and generic-document ingestion endpoints are disabled until those consumers exist.
 - **Embeddings** use a deterministic local hashing embedder so ingestion/pgvector/semantic search run
   reproducibly without shipping tenant text to any processor. Swap in an AU-resident model
   (`setEmbedder`, keep `dim=1536`) once approved — that is a processor decision, **stop and ask**.
