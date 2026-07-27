@@ -1134,9 +1134,11 @@ function mockMonotonic(...millisecondsSequence: number[]): { restore(): void } {
 function controllableSleep() {
   const pending: Array<() => void> = [];
   const durations: number[] = [];
+  let notifyFirstSleep: (() => void) | undefined;
   const sleep = (milliseconds: number): Promise<void> => new Promise((resolve) => {
     durations.push(milliseconds);
     pending.push(resolve);
+    if (pending.length === 1) notifyFirstSleep?.();
   });
   return {
     sleep,
@@ -1149,6 +1151,11 @@ function controllableSleep() {
       assert.ok(resolve, `no sleep() call recorded at index ${index}`);
       resolve();
     },
+    /** Resolves as soon as the production code actually invokes sleep() for the first time. */
+    waitForFirstSleep(): Promise<void> {
+      if (pending.length > 0) return Promise.resolve();
+      return new Promise((resolve) => { notifyFirstSleep = resolve; });
+    },
   };
 }
 
@@ -1157,17 +1164,20 @@ function tick(): Promise<void> {
 }
 
 /**
- * A full run through withSchemaAdvisoryLock's control-schema verification
- * plus the manifest/ledger reads is many more sequential awaits than
- * superviseOperation's own single pg_backend_pid lookup, so a fixed tick()
- * count would be timing-fragile. Flushes ticks until the sleep controller
- * has recorded the budget-expiry wait, with a generous, deterministic cap.
+ * superviseOperation is reached via real fs.readFile calls and other awaits
+ * whose completion order is not deterministic under load, so this waits on
+ * the sleep controller's own barrier (resolved exactly when the production
+ * code invokes context.sleep) rather than polling a fixed number of event
+ * loop turns. The 10s timer is only a watchdog against a genuine hang, never
+ * the synchronization mechanism itself.
  */
 async function tickUntilFirstSleep(sleepController: ReturnType<typeof controllableSleep>): Promise<void> {
-  for (let attempt = 0; attempt < 50 && sleepController.callCount() === 0; attempt += 1) {
-    await tick();
-  }
-  assert.ok(sleepController.callCount() > 0, "the wall-clock supervision sleep was never reached");
+  let timedOut = false;
+  const watchdog = new Promise<void>((resolve) => {
+    setTimeout(() => { timedOut = true; resolve(); }, 10_000).unref();
+  });
+  await Promise.race([sleepController.waitForFirstSleep(), watchdog]);
+  assert.ok(!timedOut && sleepController.callCount() > 0, "the wall-clock supervision sleep was never reached");
 }
 
 async function withStrictUnhandledRejection<T>(action: () => Promise<T>): Promise<T> {
