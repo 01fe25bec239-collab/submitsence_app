@@ -7,7 +7,6 @@ import {
   checkManifest,
   type MigrationManifest,
   type MigrationManifestEntry,
-  type MigrationTimeouts,
 } from "./manifest";
 import {
   GIT_SHA,
@@ -18,11 +17,25 @@ import {
   verifyControlSchema,
   withSchemaAdvisoryLock,
 } from "./runner";
-import { ERROR_CLASSES, MigrationExecutionError, SQLSTATE, assertCondition, classify, sqlstateOf, type ErrorClass } from "./execution-errors";
+import { ERROR_CLASSES, MigrationExecutionError, SQLSTATE, assertCondition, classify } from "./execution-errors";
 import { superviseOperation } from "./supervision";
+import {
+  applyTimeouts,
+  errorSqlstate,
+  insertAppliedRow,
+  monotonicMs,
+  recordedErrorClass,
+  remainingBudgetMs,
+  RunLog,
+  type ExecutionIdentity,
+  type MigrationContext,
+  type MigrationHandlers,
+} from "./execution-context";
+import { executeBatched } from "./batched";
 
 export { ERROR_CLASSES, MigrationExecutionError, type ErrorClass } from "./execution-errors";
 export { CANCELLATION_GRACE_MS } from "./supervision";
+export type { ExecutionIdentity } from "./execution-context";
 
 /**
  * Approved architecture limits. Manifest entries declare their own timeouts;
@@ -40,40 +53,7 @@ export const NONTRANSACTIONAL_WALL_CLOCK_CEILING_MS = 1_800_000;
 export const SCHEMA_RUNNER_WALL_CLOCK_MS = 3_600_000;
 
 const RUNNER_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
-const SHA256 = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-type EventType =
-  | "started"
-  | "heartbeat"
-  | "transaction_rolled_back"
-  | "operation_completed"
-  | "execution_failed"
-  | "applied_committed"
-  | "verification_failed"
-  | "succeeded"
-  | "stale_reclaimed";
-
-/**
- * Exactly the keys mr_metadata_ck permits. Enforced in code as well so a bad
- * key fails before it reaches an INSERT that would abort mid-run.
- */
-const METADATA_KEYS = [
-  "duration_ms",
-  "elapsed_ms",
-  "rows_affected",
-  "statement_count",
-  "batch_number",
-  "retry_count",
-  "operation_category",
-  "execution_mode",
-  "migration_filename",
-  "migration_ordinal",
-  "verification",
-  "reclaim_reason",
-] as const;
-
-type EventMetadata = Partial<Record<(typeof METADATA_KEYS)[number], number | string>>;
 
 /** Catalog/business state of one nontransactional operation. */
 export type NontransactionalState = "absent" | "valid" | "invalid";
@@ -102,11 +82,6 @@ export interface BatchedHandler {
   verifyComplete(client: PoolClient): Promise<boolean>;
 }
 
-interface MigrationHandlers {
-  nontransactional: ReadonlyMap<string, NontransactionalHandler>;
-  batched: ReadonlyMap<string, BatchedHandler>;
-}
-
 /**
  * No migration above the legacy boundary exists yet, so both registries are
  * empty and every nontransactional/batched migration fails closed on an
@@ -116,12 +91,6 @@ const registeredHandlers: MigrationHandlers = {
   nontransactional: new Map<string, NontransactionalHandler>(),
   batched: new Map<string, BatchedHandler>(),
 };
-
-export interface ExecutionIdentity {
-  sourceGitSha: string;
-  executorImageDigest: string;
-  runnerId: string | null;
-}
 
 export interface ExecutedMigration {
   id: string;
@@ -215,140 +184,6 @@ function assertTimeoutCeilings(
       );
     }
   }
-}
-
-async function applyTimeouts(client: PoolClient, timeouts: MigrationTimeouts, local: boolean): Promise<void> {
-  // set_config is the parameterised form of SET/SET LOCAL, so no timeout value
-  // is ever interpolated into SQL text.
-  for (const [setting, milliseconds] of [
-    ["lock_timeout", timeouts.lockMs],
-    ["statement_timeout", timeouts.statementMs],
-    ["transaction_timeout", timeouts.transactionMs],
-    ["idle_in_transaction_session_timeout", timeouts.idleInTransactionMs],
-  ] as const) {
-    assertCondition(Number.isInteger(milliseconds) && milliseconds >= 0, `Invalid ${setting}`);
-    await client.query("select set_config($1, $2, $3)", [setting, String(milliseconds), local]);
-  }
-}
-
-/** INSERT-only event stream. One run id, one strictly increasing sequence. */
-class RunLog {
-  private sequence = 0;
-
-  constructor(
-    private readonly control: PoolClient,
-    readonly runId: string,
-    private readonly identity: ExecutionIdentity,
-    private readonly manifest: MigrationManifest,
-  ) {}
-
-  get lastSequence(): number {
-    return this.sequence;
-  }
-
-  async append(
-    migrationId: string,
-    eventType: EventType,
-    metadata: EventMetadata = {},
-    extra: {
-      sqlstate?: string | null;
-      errorClass?: ErrorClass;
-      heartbeatDeadline?: Date;
-      statementOrdinal?: number;
-    } = {},
-  ): Promise<void> {
-    const ordinal = this.manifest.migrations.findIndex(({ id }) => id === migrationId) + 1;
-    const entry = this.manifest.migrations[ordinal - 1];
-    assertCondition(entry?.id === migrationId, `Migration ${migrationId} is not present in the verified manifest`);
-    const persistedMetadata: EventMetadata = {
-      ...metadata,
-      migration_filename: entry.filename,
-      migration_ordinal: ordinal,
-    };
-    for (const key of Object.keys(persistedMetadata)) {
-      assertCondition(
-        (METADATA_KEYS as readonly string[]).includes(key),
-        `Event metadata key ${key} is not permitted by mr_metadata_ck`,
-      );
-    }
-    assertCondition(
-      extra.heartbeatDeadline === undefined || eventType === "started" || eventType === "heartbeat",
-      "heartbeat_deadline is only permitted on started and heartbeat events",
-    );
-    assertCondition(
-      extra.statementOrdinal === undefined
-        || (Number.isSafeInteger(extra.statementOrdinal) && extra.statementOrdinal > 0),
-      "statement_ordinal must be a positive safe integer",
-    );
-    this.sequence += 1;
-    await this.control.query(
-      `insert into migration_control.migration_runs
-         (run_id, migration_id, event_sequence, event_type, runner_id, heartbeat_deadline,
-          source_git_sha, executor_image_digest, sqlstate, error_class, metadata, statement_ordinal)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)`,
-      [
-        this.runId,
-        migrationId,
-        this.sequence,
-        eventType,
-        this.identity.runnerId,
-        extra.heartbeatDeadline ?? null,
-        this.identity.sourceGitSha,
-        this.identity.executorImageDigest,
-        extra.sqlstate ?? null,
-        extra.errorClass ?? null,
-        JSON.stringify(persistedMetadata),
-        extra.statementOrdinal ?? null,
-      ],
-    );
-  }
-}
-
-async function insertAppliedRow(
-  client: PoolClient,
-  entry: MigrationManifestEntry,
-  ordinal: number,
-  appliedChecksum: string,
-  runId: string,
-  identity: ExecutionIdentity,
-): Promise<void> {
-  assertCondition(SHA256.test(appliedChecksum), `Refusing to record a malformed applied checksum for ${entry.id}`);
-  await client.query(
-    `insert into migration_control.schema_migrations
-       (migration_id, ordinal, filename, manifest_checksum_sha256, applied_checksum_sha256,
-        lifecycle_phase, operation_categories, execution_mode, applied_at, run_id,
-        baselined, source_git_sha, executor_image_digest)
-     values ($1, $2, $3, $4, $5, $6, $7::text[], $8, now(), $9, false, $10, $11)`,
-    [
-      entry.id,
-      ordinal,
-      entry.filename,
-      entry.sha256,
-      appliedChecksum,
-      entry.lifecyclePhase,
-      entry.operationCategories,
-      entry.executionMode,
-      runId,
-      identity.sourceGitSha,
-      identity.executorImageDigest,
-    ],
-  );
-}
-
-interface MigrationContext {
-  entry: MigrationManifestEntry;
-  ordinal: number;
-  bytes: Buffer;
-  checksum: string;
-  control: PoolClient;
-  execution: PoolClient;
-  runLog: RunLog;
-  identity: ExecutionIdentity;
-  handlers: MigrationHandlers;
-  sleep: (milliseconds: number) => Promise<void>;
-  now: () => number;
-  /** Set when the execution connection must be destroyed rather than returned to the pool. */
-  destroyExecution: () => void;
 }
 
 type PriorEvent = {
@@ -504,6 +339,7 @@ async function executeLegacyVerbatim(context: MigrationContext): Promise<void> {
   }
 
   const startedAt = context.now();
+  const deadlineMs = monotonicMs() + entry.timeouts.wallClockMs;
   await runLog.append(entry.id, "started", { execution_mode: "legacy-verbatim" }, {
     heartbeatDeadline: new Date(Date.now() + entry.timeouts.wallClockMs),
   });
@@ -512,13 +348,45 @@ async function executeLegacyVerbatim(context: MigrationContext): Promise<void> {
   // nowhere to live and wrapping it in one is prohibited.
   await applyTimeouts(execution, entry.timeouts, false);
 
+  const budget = remainingBudgetMs(deadlineMs);
+  if (budget <= 0) {
+    await runLog.append(entry.id, "execution_failed", { execution_mode: "legacy-verbatim" }, { errorClass: "wall_clock_exceeded" });
+    throw new MigrationExecutionError("wall_clock_exceeded", "no wall-clock budget remained before the legacy payload could begin", entry.id);
+  }
+
   try {
-    await execution.query(bytes.toString("utf8"));
+    await superviseOperation(context, bytes.toString("utf8"), budget);
   } catch (error) {
+    // The legacy payload is one opaque blob that carries its own internal
+    // BEGIN/COMMIT: a cancellation cannot be proven to have landed before or
+    // after that internal COMMIT, so on any cancellation-driven outcome
+    // (confirmed or unverified) no rollback is ever claimed and the
+    // connection is never reused — Phase 2c's full ambiguous-COMMIT
+    // reconciliation will replace this coarse fail-closed treatment.
+    const cancellationDriven = error instanceof MigrationExecutionError
+      && (error.errorClass === "wall_clock_exceeded" || error.errorClass === "cancellation_unverified");
+    if (cancellationDriven) {
+      // An already-unverified cancellation destroyed the connection exactly
+      // once inside supervision; only a confirmed (wall_clock_exceeded)
+      // cancellation still needs this call.
+      if (error.errorClass !== "cancellation_unverified") context.destroyExecution();
+      await runLog.append(entry.id, "execution_failed", { execution_mode: "legacy-verbatim" }, {
+        sqlstate: errorSqlstate(error),
+        errorClass: "cancellation_unverified",
+        statementOrdinal: 1,
+      });
+      throw new MigrationExecutionError(
+        "cancellation_unverified",
+        "legacy payload wall-clock outcome could not be confirmed",
+        entry.id,
+        errorSqlstate(error),
+      );
+    }
+
     try {
       await execution.query("rollback");
       await runLog.append(entry.id, "transaction_rolled_back", { execution_mode: "legacy-verbatim" }, {
-        sqlstate: sqlstateOf(error),
+        sqlstate: errorSqlstate(error),
         errorClass: "sql_failed",
         statementOrdinal: 1,
       });
@@ -526,7 +394,7 @@ async function executeLegacyVerbatim(context: MigrationContext): Promise<void> {
       context.destroyExecution();
     }
     await runLog.append(entry.id, "execution_failed", { execution_mode: "legacy-verbatim" }, {
-      sqlstate: sqlstateOf(error),
+      sqlstate: errorSqlstate(error),
       errorClass: "sql_failed",
       statementOrdinal: 1,
     });
@@ -554,9 +422,17 @@ async function executeLegacyVerbatim(context: MigrationContext): Promise<void> {
 async function executeTransactional(context: MigrationContext): Promise<void> {
   const { entry, control, execution, runLog, bytes, checksum } = context;
   const startedAt = context.now();
+  // One absolute deadline for the whole migration, derived once, right where
+  // the started event/heartbeat deadline is established. Nothing below ever
+  // re-derives it from a fresh wallClockMs.
+  const deadlineMs = monotonicMs() + entry.timeouts.wallClockMs;
   await runLog.append(entry.id, "started", { execution_mode: "transactional" }, {
     heartbeatDeadline: new Date(Date.now() + entry.timeouts.wallClockMs),
   });
+
+  if (remainingBudgetMs(deadlineMs) <= 0) {
+    throw new MigrationExecutionError("wall_clock_exceeded", "no wall-clock budget remained before the transaction could begin", entry.id);
+  }
 
   try {
     await execution.query("begin");
@@ -564,19 +440,101 @@ async function executeTransactional(context: MigrationContext): Promise<void> {
     throw classify(error, "sql_failed", entry.id, "could not open the migration transaction");
   }
 
+  let commitStarted = false;
   try {
+    const budgetBeforeSql = remainingBudgetMs(deadlineMs);
+    if (budgetBeforeSql <= 0) {
+      throw new MigrationExecutionError("wall_clock_exceeded", "wall-clock budget was exhausted before the migration statement could begin", entry.id);
+    }
+    // PostgreSQL retains its independently declared ceilings. The
+    // control-side supervisor below enforces the smaller remaining migration
+    // budget without racing transaction_timeout, which terminates the session
+    // instead of following the accepted pg_cancel_backend/57014 contract.
     await applyTimeouts(execution, entry.timeouts, true);
-    await execution.query(bytes.toString("utf8"));
+    await superviseOperation(context, bytes.toString("utf8"), budgetBeforeSql);
+
+    const budgetBeforeInsert = remainingBudgetMs(deadlineMs);
+    if (budgetBeforeInsert <= 0) {
+      throw new MigrationExecutionError("wall_clock_exceeded", "wall-clock budget was exhausted before the applied-ledger insert; COMMIT was never sent", entry.id);
+    }
     await insertAppliedRow(execution, entry, context.ordinal, checksum, runLog.runId, context.identity);
+
+    const budgetBeforeCommit = remainingBudgetMs(deadlineMs);
+    if (budgetBeforeCommit <= 0) {
+      throw new MigrationExecutionError("wall_clock_exceeded", "wall-clock budget was exhausted before COMMIT was sent", entry.id);
+    }
+    // Once COMMIT is sent, its outcome can no longer be treated as ambiguous
+    // in our favour: any failure from here on must not claim rollback or
+    // sql_failed, and must not create retry eligibility. See the catch below.
+    commitStarted = true;
     await execution.query("commit");
   } catch (error) {
-    const sqlstate = sqlstateOf(error);
+    if (commitStarted) {
+      // Phase 2b temporary treatment: COMMIT was already sent and its
+      // outcome is unknown (it may have succeeded). Do not claim
+      // sql_failed, do not claim transaction_rolled_back, and do not create
+      // retry eligibility for an uncertain COMMIT — the execution
+      // connection is simply discarded, non-retryable. Phase 2c's full
+      // ambiguous-COMMIT ledger reconciliation will replace this.
+      context.destroyExecution();
+      await runLog.append(entry.id, "execution_failed", { execution_mode: "transactional" }, {
+        sqlstate: errorSqlstate(error),
+        errorClass: "cancellation_unverified",
+      });
+      throw new MigrationExecutionError(
+        "cancellation_unverified",
+        "COMMIT was sent and its outcome could not be confirmed; the connection was discarded without claiming success, rollback or sql_failed",
+        entry.id,
+      );
+    }
+
+    const sqlstate = errorSqlstate(error);
+    const causeClass = recordedErrorClass(error);
+    const wallClockDriven = causeClass === "wall_clock_exceeded" || causeClass === "cancellation_unverified";
+
+    if (wallClockDriven) {
+      // A cancellation that supervision already deemed unverified has
+      // already destroyed the connection exactly once and left it in an
+      // unknown state: attempting another query on it would not prove
+      // anything, so rollback is only attempted when the connection state
+      // actually permits it (a confirmed, not-yet-unverified cancellation),
+      // and this block must never call destroyExecution() a second time for
+      // the same outcome.
+      const alreadyUnverified = causeClass === "cancellation_unverified";
+      let rolledBack = false;
+      if (!alreadyUnverified) {
+        try {
+          await execution.query("rollback");
+          rolledBack = true;
+        } catch {
+          // Handled once, below, via the shared !rolledBack branch.
+        }
+      }
+
+      if (!rolledBack) {
+        if (!alreadyUnverified) context.destroyExecution();
+        await runLog.append(entry.id, "execution_failed", { execution_mode: "transactional" }, { sqlstate, errorClass: "cancellation_unverified" });
+        throw new MigrationExecutionError(
+          "cancellation_unverified",
+          "transactional migration rollback could not be confirmed",
+          entry.id,
+          sqlstate,
+        );
+      }
+
+      // Both events go to the control connection, so they survive the rollback.
+      await runLog.append(entry.id, "transaction_rolled_back", { execution_mode: "transactional" }, { sqlstate, errorClass: causeClass });
+      await runLog.append(entry.id, "execution_failed", { execution_mode: "transactional" }, { sqlstate, errorClass: causeClass });
+      throw classify(error, causeClass, entry.id, "transactional migration rolled back");
+    }
+
+    // A genuine (non-wall-clock) SQL failure: unchanged pre-Phase-2b
+    // behaviour, preserved exactly.
     try {
       await execution.query("rollback");
     } catch {
       context.destroyExecution();
     }
-    // Both events go to the control connection, so they survive the rollback.
     await runLog.append(entry.id, "transaction_rolled_back", { execution_mode: "transactional" }, { sqlstate, errorClass: "sql_failed" });
     await runLog.append(entry.id, "execution_failed", { execution_mode: "transactional" }, { sqlstate, errorClass: "sql_failed" });
     throw classify(error, "sql_failed", entry.id, "transactional migration rolled back");
@@ -670,82 +628,6 @@ async function executeNontransactional(context: MigrationContext): Promise<boole
 }
 
 /**
- * Mode boundary only. The runner hands the handler a bounded per-batch
- * transaction and demands an independent completion verifier; it never invents
- * a universal backfill executor and never degrades to another mode.
- */
-async function executeBatched(context: MigrationContext): Promise<void> {
-  const { entry, control, execution, runLog, checksum } = context;
-  const handler = context.handlers.batched.get(entry.id);
-  if (!handler) {
-    throw new MigrationExecutionError(
-      "unsupported_handler",
-      "batched execution requires a reviewed migration-specific handler; none is registered",
-      entry.id,
-    );
-  }
-
-  const startedAt = context.now();
-  await runLog.append(entry.id, "started", { execution_mode: "batched" }, {
-    heartbeatDeadline: new Date(Date.now() + entry.timeouts.wallClockMs),
-  });
-
-  let batchNumber = 0;
-  const batchContext: BatchedContext = {
-    migrationId: entry.id,
-    runBatch: async <T>(batch: (client: PoolClient) => Promise<T>): Promise<T> => {
-      batchNumber += 1;
-      const number = batchNumber;
-      await execution.query("begin");
-      try {
-        await applyTimeouts(execution, entry.timeouts, true);
-        const value = await batch(execution);
-        await execution.query("commit");
-        await runLog.append(entry.id, "operation_completed", { execution_mode: "batched", batch_number: number });
-        return value;
-      } catch (error) {
-        const sqlstate = sqlstateOf(error);
-        try {
-          await execution.query("rollback");
-        } catch {
-          context.destroyExecution();
-        }
-        await runLog.append(entry.id, "transaction_rolled_back", { execution_mode: "batched", batch_number: number }, {
-          sqlstate,
-          errorClass: "sql_failed",
-        });
-        throw classify(error, "sql_failed", entry.id, `batch ${number} rolled back`);
-      }
-    },
-  };
-
-  try {
-    await handler.execute(batchContext);
-  } catch (error) {
-    await runLog.append(entry.id, "execution_failed", { execution_mode: "batched", batch_number: batchNumber }, {
-      sqlstate: sqlstateOf(error),
-      errorClass: "sql_failed",
-    });
-    throw classify(error, "sql_failed", entry.id, "batched execution failed");
-  }
-
-  if (!(await handler.verifyComplete(execution))) {
-    await runLog.append(entry.id, "verification_failed", { execution_mode: "batched", verification: "failed" }, {
-      errorClass: "verification_failed",
-    });
-    throw new MigrationExecutionError("verification_failed", "the batched completion verifier reported remaining eligible work", entry.id);
-  }
-
-  await insertAppliedRow(control, entry, context.ordinal, checksum, runLog.runId, context.identity);
-  await runLog.append(entry.id, "applied_committed", { execution_mode: "batched", verification: "passed" });
-  await runLog.append(entry.id, "succeeded", {
-    execution_mode: "batched",
-    verification: "passed",
-    duration_ms: Math.max(0, Math.trunc(context.now() - startedAt)),
-  });
-}
-
-/**
  * Distinguishes the four recovery states a CREATE INDEX CONCURRENTLY can leave
  * behind, so a handler never has to guess: missing, live and usable, or present
  * but invalid/not-ready (which requires explicit recovery, not a blind retry).
@@ -780,7 +662,8 @@ async function executeVerifiedMigrations(
   identity: ExecutionIdentity,
 ): Promise<ExecutionReport> {
   identity = validateExecutionIdentity(identity);
-  const sleep = (milliseconds: number) => delay(milliseconds, undefined, { ref: false });
+  const sleep = (milliseconds: number, signal?: AbortSignal) =>
+    delay(milliseconds, undefined, { ref: false, signal });
   const now = Date.now;
   const runId = randomUUID();
   const migrationDirectory = path.join(repositoryRoot, "db", "migrations");

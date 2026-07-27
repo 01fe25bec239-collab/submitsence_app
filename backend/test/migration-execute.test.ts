@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test, { after } from "node:test";
+import test, { after, mock } from "node:test";
 import type { Pool, PoolClient } from "pg";
 import type { MigrationManifest, MigrationManifestEntry } from "../src/db/migrate/manifest";
 import type { AppliedMigrationRow } from "../src/db/migrate/runner";
@@ -301,22 +301,28 @@ class ControlClient extends FakeClient {
 class ExecutionClient extends FakeClient {
   failMigrationSql: Error | undefined;
   failRollback = false;
+  failCommit: Error | undefined;
   hangMigrationSql = false;
   readonly appliedInserts: unknown[][] = [];
-  private settleHang: (() => void) | undefined;
+  private settleHang: ((outcome: { error?: unknown }) => void) | undefined;
 
   constructor(log: Recorded[]) {
     super("execution", log);
   }
 
-  settlePendingOperation(): void {
-    this.settleHang?.();
+  /** Resolves a hung migration-SQL call; pass an error to reject it instead (e.g. simulating SQLSTATE 57014). */
+  settlePendingOperation(error?: unknown): void {
+    this.settleHang?.({ error });
   }
 
   async query(sql: string, values?: unknown[]): Promise<QueryResult> {
     this.record(sql, values);
     if (sql.includes("set_config")) return { rows: [{ set_config: String(values?.[1]) }], rowCount: 1 };
-    if (sql === "begin" || sql === "commit") return { rows: [], rowCount: null };
+    if (sql === "begin") return { rows: [], rowCount: null };
+    if (sql === "commit") {
+      if (this.failCommit) throw this.failCommit;
+      return { rows: [], rowCount: null };
+    }
     if (sql === "rollback") {
       if (this.failRollback) throw new Error("rollback failed");
       return { rows: [], rowCount: null };
@@ -329,8 +335,11 @@ class ExecutionClient extends FakeClient {
     // Anything else is migration SQL.
     if (this.failMigrationSql) throw this.failMigrationSql;
     if (this.hangMigrationSql) {
-      return new Promise<QueryResult>((resolve) => {
-        this.settleHang = () => resolve({ rows: [], rowCount: null });
+      return new Promise<QueryResult>((resolve, reject) => {
+        this.settleHang = (outcome) => {
+          if (outcome.error) reject(outcome.error);
+          else resolve({ rows: [], rowCount: null });
+        };
       });
     }
     return { rows: [], rowCount: null };
@@ -502,7 +511,7 @@ test("production source and build expose no injectable executor or mutable regis
     assert.match(declaration, /executeMigrations\(pool: Pool\): Promise<ExecutionReport>/);
     assert.doesNotMatch(
       declaration,
-      /executeVerifiedMigrations|registeredHandlers|InternalExecuteOptions|superviseOperation|SupervisedOperationContext/,
+      /executeVerifiedMigrations|registeredHandlers|InternalExecuteOptions|executeBatched|superviseCallback|superviseOperation|SupervisedOperationContext/,
     );
 
     const probe = spawnSync(process.execPath, ["-e", `
@@ -511,10 +520,12 @@ test("production source and build expose no injectable executor or mutable regis
       assert.equal(target.executeMigrations.length, 1);
       assert.equal("registeredHandlers" in target, false);
       assert.equal("executeVerifiedMigrations" in target, false);
+      assert.equal("executeBatched" in target, false);
       // The Phase 2a cancellation state machine lives in its own internal
       // module (supervision.ts); execute.ts imports it for internal use but
       // must never re-export it as an alternate execution entry point.
       assert.equal("superviseOperation" in target, false);
+      assert.equal("superviseCallback" in target, false);
       assert.equal("SupervisedOperationContext" in target, false);
       assert.ok(Object.values(target).every((value) =>
         typeof value !== "object" || value === null ||
@@ -534,7 +545,7 @@ test("production source and build expose no injectable executor or mutable regis
     const executeEmitted = readFileSync(path.join(migrationOutput, "execute.js"), "utf8");
     assert.doesNotMatch(
       executeEmitted,
-      /exports\.(?:executeVerifiedMigrations|registeredHandlers|identityFromEnvironment|superviseOperation|SupervisedOperationContext)\b/,
+      /exports\.(?:executeVerifiedMigrations|registeredHandlers|identityFromEnvironment|executeBatched|superviseCallback|superviseOperation|SupervisedOperationContext)\b/,
     );
   } finally {
     rmSync(buildRoot, { recursive: true, force: true });
@@ -1093,5 +1104,273 @@ test("event sequence starts at one and increases monotonically across a run", as
   // heartbeat_deadline is permitted only on started events.
   for (const event of pool.control.events) {
     assert.equal(event.values[5] === null, event.type !== "started");
+  }
+});
+
+/**
+ * PB-10 Step 3 Phase 2b: whole-migration wall-clock supervision.
+ *
+ * process.hrtime.bigint is mocked directly (the same technique Date.now
+ * already uses above) to drive the monotonic deadline deterministically;
+ * options.sleep replaces node:timers/promises' setTimeout inside execute.ts
+ * so superviseOperation/superviseCallback's Promise.race is driven by a
+ * controllable resolver queue instead of a real timer, exactly like
+ * migration-execute-supervision.test.ts already does for superviseOperation
+ * in isolation — these tests drive the exact same state machine end-to-end
+ * through executeMigrations(pool).
+ */
+const QUERY_CANCELED = Object.assign(new Error("canceling statement due to user request"), { code: "57014" });
+
+function mockMonotonic(...millisecondsSequence: number[]): { restore(): void } {
+  let call = 0;
+  const method = mock.method(process.hrtime, "bigint", () => {
+    const index = Math.min(call, millisecondsSequence.length - 1);
+    call += 1;
+    return BigInt(millisecondsSequence[index]) * 1_000_000n;
+  });
+  return { restore: () => method.mock.restore() };
+}
+
+function controllableSleep() {
+  const pending: Array<() => void> = [];
+  const durations: number[] = [];
+  let notifyFirstSleep: (() => void) | undefined;
+  const sleep = (milliseconds: number): Promise<void> => new Promise((resolve) => {
+    durations.push(milliseconds);
+    pending.push(resolve);
+    if (pending.length === 1) notifyFirstSleep?.();
+  });
+  return {
+    sleep,
+    durations,
+    callCount(): number {
+      return pending.length;
+    },
+    fire(index: number): void {
+      const resolve = pending[index];
+      assert.ok(resolve, `no sleep() call recorded at index ${index}`);
+      resolve();
+    },
+    /** Resolves as soon as the production code actually invokes sleep() for the first time. */
+    waitForFirstSleep(): Promise<void> {
+      if (pending.length > 0) return Promise.resolve();
+      return new Promise((resolve) => { notifyFirstSleep = resolve; });
+    },
+  };
+}
+
+function tick(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
+ * superviseOperation is reached via real fs.readFile calls and other awaits
+ * whose completion order is not deterministic under load, so this waits on
+ * the sleep controller's own barrier (resolved exactly when the production
+ * code invokes context.sleep) rather than polling a fixed number of event
+ * loop turns. The 10s timer is only a watchdog against a genuine hang, never
+ * the synchronization mechanism itself.
+ */
+async function tickUntilFirstSleep(sleepController: ReturnType<typeof controllableSleep>): Promise<void> {
+  let timedOut = false;
+  const watchdog = new Promise<void>((resolve) => {
+    setTimeout(() => { timedOut = true; resolve(); }, 10_000).unref();
+  });
+  await Promise.race([sleepController.waitForFirstSleep(), watchdog]);
+  assert.ok(!timedOut && sleepController.callCount() > 0, "the wall-clock supervision sleep was never reached");
+}
+
+async function withStrictUnhandledRejection<T>(action: () => Promise<T>): Promise<T> {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    return await action();
+  } finally {
+    await new Promise((resolve) => setImmediate(resolve));
+    process.removeListener("unhandledRejection", onUnhandled);
+    assert.deepEqual(unhandled, [], `unexpected unhandledRejection: ${String(unhandled[0])}`);
+  }
+}
+
+// 1 ────────────────────────────────────────────────────────────────────────────
+test("transactional migration completes within budget", async () => {
+  const pool = new FakePool();
+  const report = await run(pool, { manifest: manifestOf(entries.transactional) });
+  assert.equal(report.executedCount, 1);
+  assert.deepEqual(pool.control.eventTypes(), ["started", "applied_committed", "succeeded"]);
+  assert.equal(pool.execution.releaseCount, 1);
+  assert.equal(pool.execution.releasedWith, undefined, "a healthy connection is released without an error");
+});
+
+// 2, 16 ───────────────────────────────────────────────────────────────────────
+test("a wallClockMs budget smaller than the declared PostgreSQL ceilings becomes the effective control-side timeout", async () => {
+  const pool = new FakePool();
+  const sleepController = controllableSleep();
+  const tightEntry: MigrationManifestEntry = {
+    ...entries.transactional,
+    timeouts: { ...timeouts, wallClockMs: 1_000 },
+  };
+  const restore = mockMonotonic(0); // no real elapsed time between checks
+  try {
+    await run(pool, { manifest: manifestOf(tightEntry), sleep: sleepController.sleep });
+  } finally {
+    restore.restore();
+  }
+  const settings = pool.log
+    .filter(({ client, sql }) => client === "execution" && sql.includes("set_config"))
+    .map(({ values }) => (values as [string, string, boolean]).slice(0, 2));
+  assert.deepEqual(settings, [
+    ["lock_timeout", "5000"],
+    ["statement_timeout", "60000"],
+    ["transaction_timeout", "300000"],
+    ["idle_in_transaction_session_timeout", "60000"],
+  ]);
+  assert.equal(sleepController.durations[0], 1_000, "the smaller remaining migration budget is the effective supervisor timeout");
+});
+
+// 3 ────────────────────────────────────────────────────────────────────────────
+test("transactional budget expires before the migration statement begins: no statement runs, rollback is attempted and proven", async () => {
+  const pool = new FakePool();
+  const tightEntry: MigrationManifestEntry = {
+    ...entries.transactional,
+    timeouts: { ...timeouts, wallClockMs: 1_000 },
+  };
+  // call 1: deadline base (0ms) -> deadline = 1000ms
+  // call 2: pre-begin check (100ms) -> remaining 900ms, proceeds
+  // call 3: pre-statement check (2000ms) -> remaining -1000ms, fails closed
+  const restore = mockMonotonic(0, 100, 2_000);
+  try {
+    await assert.rejects(run(pool, { manifest: manifestOf(tightEntry) }), /wall_clock_exceeded/);
+  } finally {
+    restore.restore();
+  }
+  const executionSql = pool.log.filter(({ client }) => client === "execution").map(({ sql }) => sql);
+  assert.ok(executionSql.includes("begin"));
+  assert.ok(executionSql.includes("rollback"));
+  assert.ok(!executionSql.includes("commit"));
+  assert.ok(!executionSql.some((sql) => sql.includes("alter table demo")), "the migration statement never ran");
+  assert.deepEqual(pool.control.eventTypes(), ["started", "transaction_rolled_back", "execution_failed"]);
+  for (const event of pool.control.events.slice(1)) {
+    assert.equal(event.values[9], "wall_clock_exceeded");
+  }
+  assert.equal(pool.execution.releaseCount, 1);
+});
+
+// 4, 5 ────────────────────────────────────────────────────────────────────────
+test("transactional SQL cancelled and confirmed via 57014: confirmed rollback produces the established wall-clock failure", async () => {
+  await withStrictUnhandledRejection(async () => {
+    const pool = new FakePool();
+    pool.execution.hangMigrationSql = true;
+    const sleepController = controllableSleep();
+
+    const pending = run(pool, { manifest: manifestOf(entries.transactional), sleep: sleepController.sleep });
+    await tickUntilFirstSleep(sleepController);
+    sleepController.fire(0); // wall-clock budget expires, cancellation requested
+    await tick();
+    pool.execution.settlePendingOperation(QUERY_CANCELED); // confirmed within grace
+
+    await assert.rejects(pending, /wall_clock_exceeded/);
+    const executionSql = pool.log.filter(({ client }) => client === "execution").map(({ sql }) => sql);
+    assert.ok(executionSql.includes("rollback"));
+    assert.ok(!executionSql.includes("commit"));
+    assert.deepEqual(pool.control.eventTypes(), ["started", "transaction_rolled_back", "execution_failed"]);
+    assert.equal(pool.execution.releaseCount, 1);
+    assert.equal(pool.execution.releasedWith, undefined, "confirmed cancellation plus confirmed rollback leaves a healthy, reusable connection");
+  });
+});
+
+// 6 ────────────────────────────────────────────────────────────────────────────
+test("transactional rollback failure after confirmed cancellation: non-retryable, never claims rollback", async () => {
+  await withStrictUnhandledRejection(async () => {
+    const pool = new FakePool();
+    pool.execution.hangMigrationSql = true;
+    pool.execution.failRollback = true;
+    const sleepController = controllableSleep();
+
+    const pending = run(pool, { manifest: manifestOf(entries.transactional), sleep: sleepController.sleep });
+    await tickUntilFirstSleep(sleepController);
+    sleepController.fire(0);
+    await tick();
+    pool.execution.settlePendingOperation(QUERY_CANCELED);
+
+    await assert.rejects(pending, /cancellation_unverified/);
+    assert.deepEqual(pool.control.eventTypes(), ["started", "execution_failed"], "rollback is never claimed when it could not be confirmed");
+    assert.equal(pool.execution.releaseCount, 1);
+    assert.ok(pool.execution.releasedWith, "an unproven rollback destroys the connection rather than reusing it");
+  });
+});
+
+// 7 ────────────────────────────────────────────────────────────────────────────
+test("failure after COMMIT has been sent never claims sql_failed or rollback, and is never retryable", async () => {
+  const pool = new FakePool();
+  pool.execution.failCommit = new Error("connection reset by peer");
+  await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), /cancellation_unverified/);
+  const executionSql = pool.log.filter(({ client }) => client === "execution").map(({ sql }) => sql);
+  assert.ok(executionSql.includes("commit"), "COMMIT was actually sent");
+  assert.ok(!executionSql.includes("rollback"), "no rollback is attempted once COMMIT may have already succeeded");
+  assert.deepEqual(pool.control.eventTypes(), ["started", "execution_failed"]);
+  assert.equal(pool.control.events[1].values[9], "cancellation_unverified");
+  assert.notEqual(pool.control.events[1].values[9], "sql_failed");
+  assert.equal(pool.execution.releaseCount, 1);
+  assert.ok(pool.execution.releasedWith, "the connection is discarded, not reused, once COMMIT's outcome is unknown");
+});
+
+// 9 ────────────────────────────────────────────────────────────────────────────
+test("legacy-verbatim cancellation is never retryable and never claims rollback, confirmed or unverified", async () => {
+  await withStrictUnhandledRejection(async () => {
+    const pool = new FakePool();
+    pool.execution.hangMigrationSql = true;
+    const sleepController = controllableSleep();
+
+    const pending = run(pool, { sleep: sleepController.sleep });
+    await tickUntilFirstSleep(sleepController);
+    sleepController.fire(0);
+    await tick();
+    pool.execution.settlePendingOperation(QUERY_CANCELED); // confirmed cancellation
+
+    await assert.rejects(pending, /cancellation_unverified/);
+    const executionSql = pool.log.filter(({ client }) => client === "execution").map(({ sql }) => sql);
+    assert.ok(!executionSql.includes("rollback"), "the legacy payload's internal COMMIT boundary is opaque, so rollback is never claimed");
+    assert.deepEqual(pool.control.eventTypes(), ["started", "execution_failed"]);
+    assert.equal(pool.execution.releaseCount, 1);
+    assert.ok(pool.execution.releasedWith);
+  });
+});
+
+// 10 ───────────────────────────────────────────────────────────────────────────
+test("legacy-verbatim unverified cancellation (pg_cancel_backend rejected) destroys the connection immediately", async () => {
+  await withStrictUnhandledRejection(async () => {
+    const pool = new FakePool();
+    pool.execution.hangMigrationSql = true;
+    pool.control.onCancel = () => { throw new Error("should not reach onCancel success path"); };
+    // Make the control connection's cancel query fail outright.
+    const originalQuery = pool.control.query.bind(pool.control);
+    pool.control.query = async (sql: string, values?: unknown[]) => {
+      if (sql.includes("pg_cancel_backend")) throw new Error("control connection unavailable");
+      return originalQuery(sql, values);
+    };
+    const sleepController = controllableSleep();
+
+    const pending = run(pool, { sleep: sleepController.sleep });
+    await tickUntilFirstSleep(sleepController);
+    sleepController.fire(0);
+
+    await assert.rejects(pending, /cancellation_unverified/);
+    assert.deepEqual(pool.control.eventTypes(), ["started", "execution_failed"]);
+    assert.equal(pool.execution.releaseCount, 1);
+    assert.ok(pool.execution.releasedWith);
+  });
+});
+
+// 17 ───────────────────────────────────────────────────────────────────────────
+test("wall-clock enforcement is independent of Date.now(): mocking Date.now backwards does not disturb the deadline", async () => {
+  const pool = new FakePool();
+  const nowMock = mock.method(Date, "now", () => 0); // frozen/backwards calendar clock
+  try {
+    const report = await run(pool, { manifest: manifestOf(entries.transactional) });
+    assert.equal(report.executedCount, 1, "a frozen Date.now must not affect monotonic deadline enforcement");
+  } finally {
+    nowMock.mock.restore();
   }
 });
