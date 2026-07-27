@@ -22,6 +22,15 @@ export interface TestExecuteOptions {
   identity?: ExecutionIdentity;
   runId?: `${string}-${string}-${string}-${string}-${string}`;
   now?: () => number;
+  /**
+   * PB-10 Step 3 Phase 2b: deterministically controls the sleep used by
+   * superviseOperation/superviseCallback's Promise.race, so wall-clock and
+   * cancellation-confirmation timing can be driven by a test instead of a
+   * real timer. Stubs node:timers/promises the same way manifest checking
+   * is stubbed above: a Module._load interception scoped to execute.ts's own
+   * import, not a production-reachable hook.
+   */
+  sleep?: (milliseconds: number) => Promise<void>;
 }
 
 /**
@@ -42,6 +51,10 @@ export async function executeMigrationsForTest(pool: Pool, options: TestExecuteO
         ...manifestModule,
         checkManifest: async () => options.manifest ?? originalCheckManifest(options.repositoryRoot),
       };
+    }
+    if (options.sleep && request === "node:timers/promises" && parent?.filename === executePath) {
+      const real = originalLoad.call(this, request, parent, isMain) as typeof import("node:timers/promises");
+      return { ...real, setTimeout: options.sleep };
     }
     return originalLoad.call(this, request, parent, isMain);
   };

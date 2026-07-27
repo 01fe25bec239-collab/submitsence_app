@@ -176,32 +176,65 @@ control ledger.
 ### Modes
 
 - **legacy-verbatim** (at or below `0099`) — the file's exact raw bytes are sent as one unchanged
-  multi-statement payload. Its own `BEGIN`/`COMMIT` is the only transaction; the runner never wraps,
-  parses, splits or normalises it, and only session-level timeouts are set beforehand. The applied
-  row, carrying the observed checksum, is written afterwards on the control connection. The
-  commit-to-ledger crash window is accepted for legacy only. One exact prior history may retry:
-  confirmed SQL failure followed by confirmed rollback, where migration id, manifest ordinal,
-  execution mode, canonical filename, run id, source SHA, image digest, SQLSTATE, complete metadata,
-  event sequence and statement ordinal all agree. A renamed filename never inherits retry
-  permission. Historical events without filename identity, ambiguous or incomplete histories,
-  connection loss, an operation-completed event without an applied row, and unknown `COMMIT`
-  outcomes remain blocked for manual reconciliation.
+  multi-statement payload, supervised under the migration's whole wall-clock budget (see below). Its
+  own `BEGIN`/`COMMIT` is the only transaction; the runner never wraps, parses, splits or normalises
+  it, and only session-level timeouts are set beforehand. The applied row, carrying the observed
+  checksum, is written afterwards on the control connection. The commit-to-ledger crash window is
+  accepted for legacy only. One exact prior history may retry: confirmed SQL failure followed by
+  confirmed rollback, where migration id, manifest ordinal, execution mode, canonical filename, run
+  id, source SHA, image digest, SQLSTATE, complete metadata, event sequence and statement ordinal all
+  agree. A renamed filename never inherits retry permission. Historical events without filename
+  identity, ambiguous or incomplete histories, connection loss, an operation-completed event without
+  an applied row, and unknown `COMMIT` outcomes remain blocked for manual reconciliation. A
+  wall-clock cancellation (confirmed or unverified) is never one of those retryable histories either:
+  the payload's own internal `BEGIN`/`COMMIT` is opaque to the runner, so a cancellation can never be
+  proven to have landed before or after it — no rollback is ever claimed, and the connection is
+  always discarded rather than reused.
 - **transactional** — `BEGIN`, `SET LOCAL` timeouts, migration SQL, the `schema_migrations` insert,
-  `COMMIT`, all on the execution connection, so SQL and ledger row are atomic. Failure rolls back and
-  appends `transaction_rolled_back` and `execution_failed` on the control connection, where they
-  survive the rollback.
+  `COMMIT`, all on the execution connection, so SQL and ledger row are atomic. Each of those
+  operations receives only what remains of the migration's shared wall-clock budget, never a fresh
+  allowance. A wall-clock timeout while still executing the migration statement is supervised the
+  same way as nontransactional mode (see below): a confirmed cancellation is followed by an attempted
+  `ROLLBACK`, and only a *proven* rollback records `transaction_rolled_back`/`execution_failed` and
+  produces the wall-clock failure; an unproven rollback (it fails, or the cancellation itself was
+  never confirmed) destroys the connection and fails closed as `cancellation_unverified` instead,
+  never claiming rollback and never eligible for retry. A genuine (non-wall-clock) SQL failure keeps
+  its pre-Phase-2b behaviour unchanged. Once `COMMIT` has actually been sent, its outcome is no
+  longer treated as something the runner can safely resolve in either direction: no `sql_failed`, no
+  `transaction_rolled_back`, no retry eligibility — the connection is simply discarded and the run
+  fails closed as `cancellation_unverified`. This is a deliberate, narrower placeholder for full
+  ambiguous-`COMMIT` reconciliation, which remains future (Phase 2c) work.
 - **nontransactional** — one independently retry-safe operation, never wrapped in a transaction, with
   a migration-specific verifier that distinguishes absent / valid / invalid before and after.
   Absent executes; valid-but-unrecorded is adopted; invalid or partial requires explicit
   verifier-led recovery and is never blindly replayed. `inspectConcurrentIndex` provides that
-  distinction for `CREATE INDEX CONCURRENTLY`.
+  distinction for `CREATE INDEX CONCURRENTLY`. This is the mode the cancellation-confirmation state
+  machine (`superviseOperation`, `backend/src/db/migrate/supervision.ts`) was originally built for:
+  `pg_cancel_backend` returning `true` means only that PostgreSQL accepted the cancellation request,
+  never that it happened; only a rejection with SQLSTATE `57014` observed within a bounded grace
+  period after that request counts as confirmed. Every other outcome — the request itself failing,
+  the grace period elapsing with no settlement, or the operation completing anyway — is
+  `cancellation_unverified` and destroys the execution connection rather than reusing it.
 - **batched** — mode boundary only. The runner supplies a bounded per-batch transaction and demands
   an independent completion verifier; progress is owned by a reviewed migration-specific handler.
   There is deliberately no generic backfill executor and no `backfill_runs` table. With no registered
   handler, batched fails closed on an unsupported-handler error and never degrades to another mode.
+  One aggregate wall-clock budget is shared across every batch — no batch, however quickly it
+  individually finishes, ever receives a fresh allowance, and the total across every batch cannot
+  exceed the declared budget merely because each batch stayed under its own transaction ceiling. If
+  the budget is already exhausted between batches, the next batch never starts. A timeout during an
+  active batch uses the same cancellation-confirmation supervision as the other modes, applied to
+  that one active batch; earlier, already-committed batches are never described as rolled back.
 
 Both handler registries in `backend/src/db/migrate/execute.ts` are empty: no migration above `0099`
-exists yet.
+exists yet, so `executeMigrations(pool)` itself never reaches batched or nontransactional mode with a
+real handler. The batched-mode orchestration (`executeBatched`) lives in its own narrowly scoped
+internal module, `backend/src/db/migrate/batched.ts` — imported by `execute.ts` for its own internal
+use and never re-exported, exactly like `supervision.ts` — so it can still be exercised directly, with
+a real PostgreSQL connection and a test-authored handler, bypassing `executeMigrations` entirely; see
+`backend/test/migration-batched.test.ts` (deterministic) and `backend/test/migration-batched.pg.test.ts`
+(real PostgreSQL). Nontransactional wall-clock behaviour is proven the same way, directly against
+`superviseOperation` in `supervision.ts`.
 
 ### Events and timeouts
 
@@ -212,8 +245,28 @@ bodies, query parameters, secrets, customer data or tenant identifiers.
 Manifest timeouts are capped at the approved limits (`lock_timeout` 5 s, `statement_timeout` 60 s,
 `transaction_timeout` 5 min, `idle_in_transaction_session_timeout` 60 s, wall clock 15 min
 transactional / 30 min nontransactional). Phase 1 validates those declarations and configures the
-database-native timeouts; it does not claim the declared Phase 2 end-to-end wall-clock,
-cancellation-confirmation, COMMIT-ambiguity or pooled-session-reset guarantees.
+database-native timeouts.
+
+**Wall-clock budget (Phase 2b).** Each migration derives exactly one absolute deadline from its
+declared `wallClockMs`, using a monotonic clock (`process.hrtime.bigint()`), the moment that
+migration's `started` event is recorded — never Date/calendar time, and never reset by a later
+statement, batch, cancellation, inspection, transaction creation or COMMIT attempt. Before every
+database operation the runner computes what remains of that budget and passes only that remainder
+onward — an exhausted budget is never silently clamped back up to a positive timeout, and no further
+statement, batch or inspection query is started once it reaches zero. The effective timeout for any
+one operation is always the minimum of that remainder, the mode's own statement/transaction ceiling,
+and the run-level ceiling. Nontransactional mode's existing cancellation-confirmation state machine
+(`superviseOperation`) is reused unchanged for every mode's wall-clock enforcement — there is exactly
+one `Promise.race`-based supervision core (`superviseOperation`/`superviseCallback` in
+`supervision.ts`), never a second, independent implementation.
+
+Phase 2b intentionally does not implement, and this repository does not yet claim:
+- full ambiguous-`COMMIT` classification/reconciliation once a timeout or connection failure occurs
+  after `COMMIT` has actually been sent (transactional mode fails closed as `cancellation_unverified`
+  instead — see above) — Phase 2c;
+- pooled-session reset after a destroyed/discarded connection — Phase 2d;
+- broader error and diagnostic sanitization beyond the fixed error-class vocabulary already
+  enforced — Phase 2e.
 
 Nothing in this step adopts a baseline or installs the control schema anywhere new.
 

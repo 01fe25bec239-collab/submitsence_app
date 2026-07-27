@@ -17,11 +17,6 @@ export const CANCELLATION_GRACE_MS = 10_000;
 /** SQLSTATE PostgreSQL raises for a statement cancelled via pg_cancel_backend. */
 const QUERY_CANCELED_SQLSTATE = "57014";
 
-/** Settlement of the supervised operation, captured once and never re-observed. */
-type OperationSettlement =
-  | { readonly status: "resolved" }
-  | { readonly status: "rejected"; readonly error: unknown };
-
 /**
  * Explicit cancellation/supervision states. Exactly one terminal state
  * (settled-before-cancel, cancellation-confirmed, or cancellation-unverified)
@@ -46,14 +41,38 @@ export interface SupervisedOperationContext {
   entry: Pick<MigrationManifestEntry, "id">;
   control: PoolClient;
   execution: PoolClient;
-  sleep: (milliseconds: number) => Promise<void>;
+  sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   now: () => number;
   /** Set when the execution connection must be destroyed rather than returned to the pool. */
   destroyExecution: () => void;
 }
 
+type Settlement<T> =
+  | { readonly status: "resolved"; readonly value: T }
+  | { readonly status: "rejected"; readonly error: unknown };
+
+type RaceOutcome<T> =
+  | { readonly raced: "settled"; readonly settlement: Settlement<T> }
+  | { readonly raced: "expired" };
+
+async function raceSettlement<T>(
+  context: SupervisedOperationContext,
+  operation: Promise<Settlement<T>>,
+  milliseconds: number,
+): Promise<RaceOutcome<T>> {
+  const timer = new AbortController();
+  try {
+    return await Promise.race([
+      operation.then((settlement) => ({ raced: "settled" as const, settlement })),
+      context.sleep(milliseconds, timer.signal).then(() => ({ raced: "expired" as const })),
+    ]);
+  } finally {
+    timer.abort();
+  }
+}
+
 /**
- * Runs one statement under a wall-clock budget supervised by the control
+ * Runs one operation under a wall-clock budget supervised by the control
  * connection.
  *
  * Settlement observation is attached to the operation before any timeout or
@@ -78,8 +97,20 @@ export interface SupervisedOperationContext {
  * connection either; it only ever decides, via destroyExecution(), whether
  * the caller's eventual release of that connection must discard it rather
  * than return it to the pool.
+ *
+ * The one and only Promise.race-based cancellation-confirmation core.
+ * superviseOperation (SQL-text, Phase 2a's original public shape) and
+ * superviseCallback (Phase 2b: an arbitrary operation on the execution
+ * client, used where the supervised work is not a single SQL string — e.g.
+ * one batched-mode batch) both delegate here unchanged, so there is exactly
+ * one state machine and one Promise.race, never two competing ones.
  */
-export async function superviseOperation(context: SupervisedOperationContext, sql: string, budgetMs: number): Promise<void> {
+async function superviseSettlement<T>(
+  context: SupervisedOperationContext,
+  budgetMs: number,
+  run: () => Promise<T>,
+  failureDetail: string,
+): Promise<T> {
   const { entry, control, execution } = context;
   const pidResult = await execution.query<{ pid: number }>("select pg_backend_pid() as pid");
   const pid = pidResult.rows[0]?.pid;
@@ -90,15 +121,12 @@ export async function superviseOperation(context: SupervisedOperationContext, sq
   // Attached immediately: the operation promise is handled here exactly
   // once, so it can never surface as an unhandled rejection no matter which
   // race below it loses, and no matter how long supervision continues after.
-  const operation: Promise<OperationSettlement> = execution.query(sql).then(
-    () => ({ status: "resolved" }) as const,
+  const operation: Promise<Settlement<T>> = run().then(
+    (value) => ({ status: "resolved", value }) as const,
     (error: unknown) => ({ status: "rejected", error }) as const,
   );
 
-  const settledBeforeCancel = await Promise.race([
-    operation.then((settlement) => ({ raced: "settled" as const, settlement })),
-    context.sleep(budgetMs).then(() => ({ raced: "expired" as const })),
-  ]);
+  const settledBeforeCancel = await raceSettlement(context, operation, budgetMs);
 
   const unverified = (detail: string): never => {
     state = "cancellation-unverified";
@@ -110,9 +138,9 @@ export async function superviseOperation(context: SupervisedOperationContext, sq
     state = "settled-before-cancel";
     const { settlement } = settledBeforeCancel;
     if (settlement.status === "rejected") {
-      throw classify(settlement.error, "sql_failed", entry.id, "nontransactional operation failed");
+      throw classify(settlement.error, "sql_failed", entry.id, failureDetail);
     }
-    return;
+    return settlement.value;
   }
 
   // The budget expired before the operation settled. From this point on, any
@@ -138,10 +166,7 @@ export async function superviseOperation(context: SupervisedOperationContext, sq
     unverified(`cancellation request was not accepted by PostgreSQL for migration ${entry.id}`);
   }
 
-  const graceOutcome = await Promise.race([
-    operation.then((settlement) => ({ raced: "settled" as const, settlement })),
-    context.sleep(CANCELLATION_GRACE_MS).then(() => ({ raced: "expired" as const })),
-  ]);
+  const graceOutcome = await raceSettlement(context, operation, CANCELLATION_GRACE_MS);
 
   if (graceOutcome.raced === "expired") {
     unverified(`cancellation was not confirmed within ${CANCELLATION_GRACE_MS}ms; the execution connection was destroyed`);
@@ -154,16 +179,43 @@ export async function superviseOperation(context: SupervisedOperationContext, sq
 
   if (settlement.status === "rejected" && sqlstateOf(settlement.error) === QUERY_CANCELED_SQLSTATE) {
     state = "cancellation-confirmed";
-    throw new MigrationExecutionError("wall_clock_exceeded", `operation exceeded its ${budgetMs}ms wall-clock budget and was cancelled`, entry.id);
+    throw new MigrationExecutionError(
+      "wall_clock_exceeded",
+      `operation exceeded its ${budgetMs}ms wall-clock budget and was cancelled`,
+      entry.id,
+      QUERY_CANCELED_SQLSTATE,
+    );
   }
 
   // Either the operation resolved successfully after the cancellation
   // request was issued (an ambiguous cancel/complete race — never treated as
   // success), or it rejected with something other than query_canceled.
   // Neither proves the cancellation happened, so both are unverified.
-  unverified(
+  return unverified(
     settlement.status === "resolved"
       ? "the operation completed after a cancellation request was issued; the outcome is an unverifiable cancel/complete race"
       : `the operation rejected with an unexpected SQLSTATE after a cancellation request (expected ${QUERY_CANCELED_SQLSTATE})`,
   );
+}
+
+export async function superviseOperation(context: SupervisedOperationContext, sql: string, budgetMs: number): Promise<void> {
+  await superviseSettlement(context, budgetMs, () => context.execution.query(sql), "supervised SQL operation failed");
+}
+
+/**
+ * PB-10 Step 3 Phase 2b: the same state machine as superviseOperation, for
+ * operations that are not a single SQL string — a batched-mode batch is an
+ * opaque caller-supplied callback that may issue any number of statements on
+ * the execution client. Behaviourally identical to superviseOperation:
+ * confirmed cancellation, unverified cancellation and settled-before-cancel
+ * all follow the exact same rules, just returning the callback's value on
+ * success instead of void.
+ */
+export async function superviseCallback<T>(
+  context: SupervisedOperationContext,
+  budgetMs: number,
+  run: (client: PoolClient) => Promise<T>,
+  failureDetail: string,
+): Promise<T> {
+  return superviseSettlement(context, budgetMs, () => run(context.execution), failureDetail);
 }

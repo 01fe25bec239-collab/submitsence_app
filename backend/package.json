@@ -22,7 +22,9 @@
     "test:pg:migration": "node --import tsx --test test/migration-execute.pg.test.ts",
     "test:pg:identity": "node --import tsx --test test/database-identity.pg.test.ts",
     "test:pg:commercial": "node --import tsx --test test/commercial-webhook.integration.test.ts",
-    "test:pg:supervision": "node --import tsx --test test/migration-execute-supervision.pg.test.ts"
+    "test:pg:supervision": "node --import tsx --test test/migration-execute-supervision.pg.test.ts",
+    "test:pg:wallclock": "node --import tsx --test test/migration-execute-wallclock.pg.test.ts",
+    "test:pg:batched": "node --import tsx --test test/migration-batched.pg.test.ts"
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch": "^3.1086.0",

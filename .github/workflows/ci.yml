@@ -220,6 +220,24 @@ jobs:
           # application schema touched), so they need no TEST_DATABASE_URL.
           MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
         run: npm run test:pg:supervision --prefix backend
+      - name: Test whole-migration wall-clock supervision against real PostgreSQL
+        env:
+          # Both credentials, deliberately: like test:pg:migration, this
+          # suite installs and drops migration_control every case, so it
+          # requires the same distinct-database safety proof before any
+          # destructive statement runs.
+          MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
+        run: npm run test:pg:wallclock --prefix backend
+      - name: Test batched-mode wall-clock supervision against real PostgreSQL
+        env:
+          # Both credentials, deliberately: like test:pg:wallclock, this
+          # suite installs and drops migration_control every case, so it
+          # requires the same distinct-database safety proof before any
+          # destructive statement runs.
+          MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
+        run: npm run test:pg:batched --prefix backend
       - name: Test application/migration database identity guard
         env:
           # Both credentials, deliberately: this suite's entire purpose is to
