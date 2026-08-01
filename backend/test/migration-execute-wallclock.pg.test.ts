@@ -7,6 +7,7 @@ import test, { after, before, beforeEach } from "node:test";
 import { Client, Pool } from "pg";
 import type { MigrationManifest, MigrationManifestEntry } from "../src/db/migrate/manifest";
 import { assertDistinctDatabases } from "../src/db/migrate/database-identity";
+import { installControlSchema, type ControlSchemaInstall } from "./helpers/control-schema-install";
 import { executeMigrationsForTest } from "./helpers/migration-execute";
 
 /**
@@ -51,7 +52,17 @@ if (!databaseUrl) {
   }, () => undefined);
 } else {
   const repositoryRoot = path.resolve(__dirname, "../..");
-  const controlSchemaSql = readFileSync(path.join(repositoryRoot, "db", "control", "control-schema.sql"), "utf8");
+  /**
+   * PB-10 Step 3 Phase 2c: the control schema is installed through psql, not
+   * as one SQL blob over an ordinary connection. It now takes a required
+   * `-v migration_execution_role` variable and includes the two files shared
+   * with the upgrade path, and those are psql meta-commands the server never
+   * sees. `install` carries the credentials for the non-superuser role every
+   * pool below connects as — a superuser connection is refused by
+   * verifyControlSchema, because a superuser bypasses every privilege the
+   * commit-proof design relies on.
+   */
+  let install: ControlSchemaInstall;
 
   const identity = {
     sourceGitSha: "5324116250977b5e8ac24bc83b6cae89ebcbd990",
@@ -121,7 +132,7 @@ if (!databaseUrl) {
   let admin: Client;
   const pools: Pool[] = [];
   const newPool = (max = 3): Pool => {
-    const pool = new Pool({ connectionString: databaseUrl, max, application_name: "pb10-wallclock-contract" });
+    const pool = new Pool({ connectionString: install.executionUrl, max, application_name: "pb10-wallclock-contract" });
     pools.push(pool);
     return pool;
   };
@@ -135,7 +146,7 @@ if (!databaseUrl) {
     await admin.query("drop schema if exists migration_control cascade");
     await admin.query("drop schema if exists public cascade");
     await admin.query("create schema public");
-    await admin.query(controlSchemaSql);
+    install = await installControlSchema(admin, databaseUrl!);
   };
 
   before(async () => {
@@ -147,6 +158,10 @@ if (!databaseUrl) {
     );
     admin = new Client({ connectionString: databaseUrl, application_name: "pb10-wallclock-admin" });
     await admin.connect();
+    // The runner credential must exist before any pool is constructed: every
+    // pool below connects as the non-superuser execution role, and some cases
+    // build their pool before calling the per-case reset helper.
+    install = await installControlSchema(admin, databaseUrl!);
   });
 
   after(async () => {

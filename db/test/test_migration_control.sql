@@ -22,8 +22,13 @@ select pg_temp.migration_control_assert(
       from pg_class c
       join pg_namespace n on n.oid = c.relnamespace
      where n.nspname = 'migration_control' and c.relkind in ('r', 'p')
-  ) = array['migration_runs', 'schema_migrations'],
-  'exactly the two Step-2 permanent tables exist'
+  ) = array['migration_runs', 'proof_key', 'schema_migrations'],
+  -- PB-10 Step 3 Phase 2c, CRITICAL 1: proof_key joins the two Step-2 ledger
+  -- tables. It holds the key behind the transaction-binding receipt, is owned
+  -- by migration_control_owner and granted to no role at all, and its absence
+  -- would silently disable the protection that stops the execution role
+  -- computing a receipt the protected functions did not produce.
+  'exactly the two permanent ledger tables and the protected proof key exist'
 );
 select pg_temp.migration_control_assert(
   (
@@ -31,13 +36,13 @@ select pg_temp.migration_control_assert(
       from pg_attribute a
      where a.attrelid = 'migration_control.schema_migrations'::regclass
        and a.attnum > 0 and not a.attisdropped
-  ) = 13
+  ) = 14
   and (
     select count(*)
       from pg_attribute a
      where a.attrelid = 'migration_control.migration_runs'::regclass
        and a.attnum > 0 and not a.attisdropped
-  ) = 14,
+  ) = 16,
   'required column counts exist'
 );
 select pg_temp.migration_control_assert(
@@ -59,7 +64,11 @@ select pg_temp.migration_control_assert(
     'run_id:uuid:true',
     'baselined:boolean:true',
     'source_git_sha:text:true',
-    'executor_image_digest:text:true'
+    'executor_image_digest:text:true',
+    -- CRITICAL 1: how the database itself classified this row's provenance.
+    -- Appended by control-proof-path.sql, the single definition shared by the
+    -- fresh install and the upgrade, which is why it sits last on both.
+    'commit_proof:text:true'
   ],
   'schema_migrations column types and nullability match the contract'
 );
@@ -83,7 +92,9 @@ select pg_temp.migration_control_assert(
     'executor_image_digest:text:false',
     'sqlstate:text:false',
     'error_class:text:false',
-    'metadata:jsonb:true'
+    'metadata:jsonb:true',
+    'xact_id:xid8:false',
+    'attempt_token_sha256:bytea:false'
   ],
   'migration_runs column types and nullability match the contract'
 );
@@ -103,7 +114,12 @@ insert into migration_control.schema_migrations (
   run_id,
   baselined,
   source_git_sha,
-  executor_image_digest
+  executor_image_digest,
+  -- CRITICAL 1: NOT NULL and constrained by sm_commit_proof_mode_ck, which
+  -- pins which value each execution mode may carry. legacy-verbatim owns no
+  -- single migration transaction, so post_hoc_verified is the only value it
+  -- may claim — 'transaction_atomic' here would be rejected.
+  commit_proof
 ) values (
   '0001',
   1,
@@ -117,9 +133,31 @@ insert into migration_control.schema_migrations (
   '10000000-0000-4000-8000-000000000001',
   false,
   repeat('b', 40),
-  'sha256:' || repeat('c', 64)
+  'sha256:' || repeat('c', 64),
+  'post_hoc_verified'
 );
 select pg_temp.migration_control_assert(true, 'schema_migrations valid INSERT succeeds');
+
+do $$
+begin
+  begin
+    insert into migration_control.schema_migrations (
+      migration_id, ordinal, filename, manifest_checksum_sha256, applied_checksum_sha256,
+      lifecycle_phase, operation_categories, execution_mode, applied_at, run_id,
+      baselined, source_git_sha, executor_image_digest, commit_proof
+    ) values (
+      '0002', 2, '0002_atomic_claim.sql', repeat('a', 64), repeat('a', 64),
+      'expand', array['schema'], 'legacy-verbatim', clock_timestamp(),
+      '10000000-0000-4000-8000-000000000002', false, repeat('b', 40),
+      'sha256:' || repeat('c', 64), 'transaction_atomic'
+    );
+    raise exception 'a non-transactional row unexpectedly claimed atomic commit proof';
+  exception when check_violation then
+    null;
+  end;
+  raise notice 'PASS migration control: only a transactional row may claim transaction_atomic';
+end
+$$;
 
 do $$
 begin
@@ -233,7 +271,8 @@ begin
         run_id,
         baselined,
         source_git_sha,
-        executor_image_digest
+        executor_image_digest,
+        commit_proof
       ) values (
         '0002',
         2,
@@ -247,7 +286,11 @@ begin
         '10000000-0000-4000-8000-000000000002',
         test_case.baselined,
         repeat('b', 40),
-        'sha256:' || repeat('c', 64)
+        'sha256:' || repeat('c', 64),
+        -- The value sm_commit_proof_mode_ck requires for this row's mode, so
+        -- each case still fails on the constraint it is actually testing
+        -- rather than incidentally on commit_proof.
+        case when test_case.baselined then 'baseline' else 'post_hoc_verified' end
       );
       raise exception '% unexpectedly succeeded', test_case.label;
     exception when check_violation then null;
@@ -270,7 +313,11 @@ insert into migration_control.schema_migrations (
   run_id,
   baselined,
   source_git_sha,
-  executor_image_digest
+  executor_image_digest,
+  -- A baselined row is recorded history with no byte evidence and no outcome
+  -- evidence at all, so 'baseline' is the only value sm_commit_proof_mode_ck
+  -- permits it.
+  commit_proof
 ) values (
   '0002',
   2,
@@ -284,7 +331,8 @@ insert into migration_control.schema_migrations (
   '10000000-0000-4000-8000-000000000002',
   true,
   repeat('e', 40),
-  'sha256:' || repeat('f', 64)
+  'sha256:' || repeat('f', 64),
+  'baseline'
 );
 select pg_temp.migration_control_assert(true, 'valid baselined legacy null checksum succeeds');
 
@@ -326,11 +374,12 @@ $$;
 insert into migration_control.schema_migrations (
   migration_id, ordinal, filename, manifest_checksum_sha256, applied_checksum_sha256,
   lifecycle_phase, operation_categories, execution_mode, applied_at, run_id,
-  baselined, source_git_sha, executor_image_digest
+  baselined, source_git_sha, executor_image_digest, commit_proof
 ) values (
   '0003', 3, '0003_tenancy_iam.sql', repeat('a', 64), repeat('a', 64),
   'expand', array['schema', 'security-policy'], 'legacy-verbatim', clock_timestamp(),
-  '10000000-0000-4000-8000-000000000003', false, repeat('b', 40), 'sha256:' || repeat('c', 64)
+  '10000000-0000-4000-8000-000000000003', false, repeat('b', 40), 'sha256:' || repeat('c', 64),
+  'post_hoc_verified'
 );
 select pg_temp.migration_control_assert(true, 'canonical operation category order is accepted');
 

@@ -7,6 +7,10 @@ import test from "node:test";
 import type { Pool, PoolClient } from "pg";
 import type { MigrationManifest } from "../src/db/migrate/manifest";
 import {
+  answerControlSchemaQuery,
+  type ControlSchemaDrift,
+} from "./helpers/control-schema-fixture";
+import {
   SCHEMA_ADVISORY_LOCK,
   buildMigrationPlan,
   renderMigrationPlan,
@@ -301,14 +305,81 @@ test("contention diagnostics expose bounded classifications, never raw query tex
 test("control-connection loss aborts and destroys the client", async () => {
   const client = new LockClient();
   await assert.rejects(
+    // PB-10 Step 3 Phase 2c: a lost connection no longer cuts the action
+    // short — ownership cannot end while the action may still be performing
+    // mandatory durable persistence (see the ownership test below). The
+    // action here therefore completes on its own, without reporting a
+    // failure of its own, which is exactly the case where the connection
+    // failure is the outcome the caller must see.
     withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
-      setImmediate(() => client.emit("error", new Error("control connection lost")));
-      return new Promise<never>(() => undefined);
+      client.emit("error", new Error("control connection lost"));
+      await Promise.resolve();
     }),
     /control connection lost/,
   );
   assert.match(client.releasedWith?.message ?? "", /control connection lost/);
   assert.ok(!client.events.includes("unlock"));
+});
+
+/**
+ * PB-10 Step 3 Phase 2c final review, blocker 1. Losing the pinned control
+ * connection is exactly when the migration action performs its one mandatory
+ * durable step — arming the commit_outcome_unknown replay guard over an
+ * independent connection. Everything withSchemaAdvisoryLock owns (the
+ * advisory lock, the pinned client, and the caller's knowledge of the
+ * outcome) is what keeps a second execution from replaying a migration whose
+ * outcome is unknown, so none of it may be handed back while that append is
+ * still in flight. There is no deadline on that wait: a deadline that expired
+ * would abandon mandatory durability work and release ownership anyway.
+ *
+ * The hold below is gated on an explicit signal rather than a sleep, so it is
+ * unbounded by construction — longer than any grace period that could be
+ * reintroduced. PB10_OWNERSHIP_HOLD_MS additionally holds it for real wall
+ * clock (set it above a candidate grace, e.g. 35000, to prove the property
+ * against a real timer); the default keeps the suite fast, and the emitted-API
+ * assertions in migration-execute.test.ts are what permanently reject a
+ * reintroduced grace constant or option.
+ */
+const OWNERSHIP_HOLD_MS = Number(process.env.PB10_OWNERSHIP_HOLD_MS ?? 250);
+
+test("ownership: a lost connection never returns, unlocks, or releases while the action is still persisting", async () => {
+  await withStrictProcessErrors(async () => {
+    const client = new LockClient();
+    let persist!: () => void;
+    const persisted = new Promise<void>((resolve) => { persist = resolve; });
+    let settled = false;
+
+    const pending = withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
+      // The connection dies the moment the action starts; the durable append
+      // it must still complete does not depend on this connection.
+      client.emit("error", new Error("connection reset by peer"));
+      await persisted;
+      client.events.push("marker-persisted");
+      throw new Error("[commit_outcome_unknown] migration 0100: COMMIT outcome could not be confirmed");
+    });
+    pending.then(() => { settled = true; }, () => { settled = true; });
+
+    const heldUntil = Date.now() + OWNERSHIP_HOLD_MS;
+    do {
+      await new Promise((resolve) => setImmediate(resolve));
+    } while (Date.now() < heldUntil);
+
+    assert.equal(settled, false, "the call must still be pending while mandatory persistence is in flight");
+    assert.equal(client.releaseCount, 0, "the pinned client must not be released while persistence is in flight");
+    assert.ok(!client.events.includes("unlock"), "the advisory lock must not be released while persistence is in flight");
+    assert.ok(!client.events.includes("marker-persisted"), "the durable marker genuinely has not been written yet");
+
+    persist();
+    await assert.rejects(pending, /commit_outcome_unknown/, "the action's own outcome is what the caller sees");
+    assert.deepEqual(
+      client.events.slice(-2),
+      ["marker-persisted", "release-error"],
+      "the durable marker is written strictly before ownership of the connection ends",
+    );
+    assert.ok(!client.events.includes("unlock"), "an already-uncertain connection is never depended on for a healthy unlock");
+    assert.equal(client.releaseCount, 1, "released exactly once");
+    assert.equal(client.listenerCount("error"), 1, "a destroyed connection is never left with zero error listeners");
+  });
 });
 
 test("unlock false and unlock errors destroy the pinned client", async () => {
@@ -417,20 +488,22 @@ test("ownership: cancellation query rejects first, then the unlock attempt itsel
 test("ownership: a control 'error' event occurs before the cancellation query itself rejects", async () => {
   await withStrictProcessErrors(async () => {
     const client = new LockClient();
-    // The action never gets a chance to complete or throw its own
-    // cancellation_unverified error: connectionLost is actively raced
-    // against the action (pre-existing behaviour, unchanged by this fix),
-    // so an 'error' event fired synchronously as the action starts wins
-    // that race immediately, surfacing the deeper connection failure
-    // itself rather than a derived symptom of it — the more informative
-    // and, in this ordering, the only observable outcome.
+    // PB-10 Step 3 Phase 2c: connectionLost is still raced against the
+    // action, but winning that race no longer *returns* — it only stops
+    // waiting on a connection that can no longer answer. The action keeps
+    // running (this is exactly when it performs mandatory durable ambiguity
+    // persistence, over an independent connection the failure does not
+    // touch), and its own outcome is what surfaces: it, not the raw socket
+    // error, is what knows whether the replay guard was armed and what the
+    // run actually ended on. The connection failure is not discarded — it is
+    // what drives the destructive release asserted below.
     const pending = withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
       client.emit("error", new Error("connection reset by peer"));
       await Promise.resolve();
       throw new Error("[cancellation_unverified] migration 0101: cancellation request was not accepted by PostgreSQL");
     });
 
-    await assert.rejects(pending, /connection reset by peer/);
+    await assert.rejects(pending, /cancellation_unverified/);
     assert.ok(!client.events.includes("unlock"), "an already-uncertain connection must never be depended on for a healthy unlock");
     assert.equal(client.releaseCount, 1, "the control client must be released exactly once");
     assert.ok(client.releasedWith instanceof Error);
@@ -489,76 +562,15 @@ test("ownership: the healthy control path releases exactly once and leaks no lis
   });
 });
 
-const columnRows = [
-  ["schema_migrations", "migration_id", "text", true, null],
-  ["schema_migrations", "ordinal", "integer", true, null],
-  ["schema_migrations", "filename", "text", true, null],
-  ["schema_migrations", "manifest_checksum_sha256", "character(64)", true, null],
-  ["schema_migrations", "applied_checksum_sha256", "character(64)", false, null],
-  ["schema_migrations", "lifecycle_phase", "text", true, null],
-  ["schema_migrations", "operation_categories", "text[]", true, null],
-  ["schema_migrations", "execution_mode", "text", true, null],
-  ["schema_migrations", "applied_at", "timestamp with time zone", true, null],
-  ["schema_migrations", "run_id", "uuid", true, null],
-  ["schema_migrations", "baselined", "boolean", true, null],
-  ["schema_migrations", "source_git_sha", "text", true, null],
-  ["schema_migrations", "executor_image_digest", "text", true, null],
-  ["migration_runs", "event_id", "bigint", true, "nextval('migration_control.migration_runs_event_id_seq'::regclass)"],
-  ["migration_runs", "run_id", "uuid", true, null],
-  ["migration_runs", "migration_id", "text", true, null],
-  ["migration_runs", "event_sequence", "integer", true, null],
-  ["migration_runs", "event_type", "text", true, null],
-  ["migration_runs", "occurred_at", "timestamp with time zone", true, "clock_timestamp()"],
-  ["migration_runs", "runner_id", "text", false, null],
-  ["migration_runs", "heartbeat_deadline", "timestamp with time zone", false, null],
-  ["migration_runs", "statement_ordinal", "integer", false, null],
-  ["migration_runs", "source_git_sha", "text", false, null],
-  ["migration_runs", "executor_image_digest", "text", false, null],
-  ["migration_runs", "sqlstate", "text", false, null],
-  ["migration_runs", "error_class", "text", false, null],
-  ["migration_runs", "metadata", "jsonb", true, null],
-].map(([table_name, column_name, formatted_type, not_null, default_expression]) => ({
-  table_name, column_name, formatted_type, not_null, default_expression,
-}));
-
-const compatibleConstraintDefinition = [
-  readFileSync(path.join(repositoryRoot, "db", "control", "control-schema.sql"), "utf8"),
-  "operation_categories = migration_control.canonical_operation_categories(operation_categories)",
-  "PRIMARY KEY (migration_id)",
-  "PRIMARY KEY (event_id)",
-  "UNIQUE (ordinal)",
-  "UNIQUE (filename)",
-  "UNIQUE (run_id, event_sequence)",
-  "WHEN ('schema'::text = ANY (operation_categories))",
-  "WHEN ('data-correction'::text = ANY (operation_categories))",
-  "WHEN ('security-policy'::text = ANY (operation_categories))",
-  "WHEN ('function-replacement'::text = ANY (operation_categories))",
-  "WHEN ('index'::text = ANY (operation_categories))",
-  "WHEN ('seed-reference'::text = ANY (operation_categories))",
-].join("\n");
-
-const constraintRows = [
-  ["schema_migrations", "schema_migrations_pkey", "p"],
-  ["schema_migrations", "schema_migrations_ordinal_key", "u"],
-  ["schema_migrations", "schema_migrations_filename_key", "u"],
-  ...["sm_id_ck", "sm_ordinal_ck", "sm_filename_ck", "sm_manifest_sha_ck", "sm_applied_sha_ck", "sm_phase_ck", "sm_categories_ck", "sm_categories_order_ck", "sm_mode_ck", "sm_baseline_ck", "sm_source_sha_ck", "sm_image_digest_ck"]
-    .map((name) => ["schema_migrations", name, "c"]),
-  ["migration_runs", "migration_runs_pkey", "p"],
-  ["migration_runs", "migration_runs_run_id_event_sequence_key", "u"],
-  ...["mr_id_ck", "mr_sequence_ck", "mr_type_ck", "mr_heartbeat_ck", "mr_statement_ck", "mr_runner_ck", "mr_source_sha_ck", "mr_image_digest_ck", "mr_sqlstate_ck", "mr_error_class_ck", "mr_metadata_ck"]
-    .map((name) => ["migration_runs", name, "c"]),
-].map(([table_name, constraint_name, constraint_type]) => ({
-  table_name,
-  constraint_name,
-  constraint_type,
-  validated: true,
-  deferrable: false,
-  initially_deferred: false,
-  definition: compatibleConstraintDefinition,
-}));
-
 class PlanClient extends LockClient {
   drift = false;
+  /**
+   * CRITICAL 1 + CRITICAL 2: overlays onto the role-separation probe, so a
+   * case can present a runner that really is a superuser, really does own the
+   * control schema, or really can INSERT applied rows, and prove
+   * verifyControlSchema refuses it.
+   */
+  separation: ControlSchemaDrift["separation"];
   constraintDrift = false;
   schemaMissing = false;
   droppedTruncateTriggers = false;
@@ -593,59 +605,13 @@ class PlanClient extends LockClient {
       }));
       return { rows, rowCount: rows.length };
     }
-    if (sql.includes("c.relkind in ('r', 'p')")) {
-      return { rows: this.drift ? [{ table_name: "schema_migrations" }] : [{ table_name: "migration_runs" }, { table_name: "schema_migrations" }], rowCount: 2 };
-    }
-    if (sql.includes("pg_attribute")) return { rows: columnRows, rowCount: columnRows.length };
-    if (sql.includes("pg_constraint")) {
-      const rows = this.constraintDrift
-        ? constraintRows.map((row) => row.constraint_name === "sm_id_ck" ? { ...row, definition: "CHECK (true)" } : row)
-        : constraintRows;
-      return { rows, rowCount: rows.length };
-    }
-    if (sql.includes("pg_trigger")) {
-      const rows = [
-        { table_name: "migration_runs", trigger_name: "migration_runs_reject_mutation", enabled: "A", trigger_type: 27, function_name: "reject_ledger_mutation" },
-        { table_name: "migration_runs", trigger_name: "migration_runs_reject_truncate", enabled: "A", trigger_type: 34, function_name: "reject_ledger_mutation" },
-        { table_name: "schema_migrations", trigger_name: "schema_migrations_reject_mutation", enabled: "A", trigger_type: 27, function_name: "reject_ledger_mutation" },
-        { table_name: "schema_migrations", trigger_name: "schema_migrations_reject_truncate", enabled: "A", trigger_type: 34, function_name: "reject_ledger_mutation" },
-      ].filter((row) => !(this.droppedTruncateTriggers && row.trigger_name.endsWith("_reject_truncate")));
-      return { rows, rowCount: rows.length };
-    }
-    if (sql.includes("p.provolatile")) return {
-      rows: [
-        {
-          function_name: "canonical_operation_categories",
-          language_name: "sql",
-          volatility: "i",
-          security_definer: false,
-          config: ["search_path=pg_catalog, pg_temp"],
-          public_execute: false,
-          runtime_execute: false,
-        },
-        {
-          function_name: "reject_ledger_mutation",
-          language_name: "plpgsql",
-          volatility: "v",
-          security_definer: false,
-          config: ["search_path=pg_catalog, pg_temp"],
-          public_execute: false,
-          runtime_execute: false,
-        },
-      ],
-      rowCount: 2,
-    };
-    if (sql.includes("control_namespace")) return {
-      rows: [{
-        public_schema: false,
-        public_tables: false,
-        public_sequences: false,
-        runtime_schema: false,
-        runtime_tables: false,
-        runtime_sequences: false,
-      }],
-      rowCount: 1,
-    };
+    const controlSchema = answerControlSchemaQuery(sql, {
+      missingTables: this.drift,
+      constraintDrift: this.constraintDrift,
+      droppedTruncateTriggers: this.droppedTruncateTriggers,
+      separation: this.separation,
+    });
+    if (controlSchema) return controlSchema as QueryResult;
     if (sql.includes("from migration_control.schema_migrations")) {
       return { rows: this.ledgerRows, rowCount: this.ledgerRows.length };
     }
@@ -656,7 +622,10 @@ class PlanClient extends LockClient {
 test("strict control-schema verification rejects catalog drift", async () => {
   const client = new PlanClient();
   client.drift = true;
-  await assert.rejects(verifyControlSchema(client as unknown as PoolClient), /exactly the two Step-2 permanent tables/);
+  await assert.rejects(
+    verifyControlSchema(client as unknown as PoolClient),
+    /exactly the two permanent ledger tables and the protected proof key/,
+  );
 
   const constraintClient = new PlanClient();
   constraintClient.constraintDrift = true;
@@ -667,6 +636,50 @@ test("strict control-schema verification rejects catalog drift", async () => {
   await assert.rejects(
     verifyControlSchema(missingSchema as unknown as PoolClient),
     /Control schema migration_control does not exist/,
+  );
+});
+
+/**
+ * PB-10 Step 3 Phase 2c final review, CRITICAL 1 + CRITICAL 2.
+ *
+ * Every unforgeability property this design provides is a property of the
+ * *installation*, not of the SQL in this repository. An operator who installed
+ * the old single-owner way, granted the runner ownership back, or simply
+ * connects as a superuser has silently reinstated forgeable commit proof — and
+ * nothing else in the codebase would notice. So the ownership model is
+ * verified at runtime, against the connection the migration will actually run
+ * on, before a single byte of migration SQL is sent.
+ *
+ * Each case flips exactly one probe field, so a regression that drops one
+ * assertion cannot hide behind the others.
+ */
+test("verification rejects every installation whose ownership model would make commit proof forgeable", async () => {
+  const cases: Array<[ControlSchemaDrift["separation"], RegExp]> = [
+    [{ is_superuser: true }, /connected as a superuser/],
+    [{ owns_control_schema: true }, /owns \(or is a member of the owner of\) migration_control/],
+    [{ member_of_owner: true }, /owns \(or is a member of the owner of\) migration_control/],
+    [{ can_insert_applied: true }, /INSERT into migration_control\.schema_migrations directly/],
+    [{ can_write_binding: true }, /write migration_control\.migration_runs\.xact_id directly/],
+    [{ can_read_proof_key: true }, /read migration_control\.proof_key/],
+    [{ can_mutate_ledger: true }, /UPDATE, DELETE or TRUNCATE on a control ledger table/],
+  ];
+  for (const [separation, pattern] of cases) {
+    const client = new PlanClient();
+    client.separation = separation;
+    await assert.rejects(
+      verifyControlSchema(client as unknown as PoolClient),
+      pattern,
+      `${JSON.stringify(separation)} must fail closed`,
+    );
+  }
+
+  // The correctly separated installation — the only one that proceeds — and
+  // proof the verifier genuinely issued the probe rather than assuming it.
+  const separated = new PlanClient();
+  await verifyControlSchema(separated as unknown as PoolClient);
+  assert.ok(
+    separated.queries.some(({ sql }) => sql.includes("as is_superuser") && sql.includes("can_read_proof_key")),
+    "the role-separation probe must actually be issued against the migration connection",
   );
 });
 

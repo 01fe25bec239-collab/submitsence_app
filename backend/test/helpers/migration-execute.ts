@@ -4,7 +4,9 @@ import path from "node:path";
 import { mock } from "node:test";
 import type { Pool } from "pg";
 import type {
+  BatchedHandler,
   ExecutionIdentity,
+  NontransactionalHandler,
   ExecutionReport,
 } from "../../src/db/migrate/execute";
 import type { MigrationManifest } from "../../src/db/migrate/manifest";
@@ -31,7 +33,42 @@ export interface TestExecuteOptions {
    * import, not a production-reachable hook.
    */
   sleep?: (milliseconds: number) => Promise<void>;
+  /**
+   * PB-10 Step 3 Phase 2c final review, remediation 3: substitutes the
+   * production handler registry (src/db/migrate/handlers.ts) for the duration
+   * of one call, so batched-mode regression suites can drive the real
+   * batch-lifecycle state machine against real PostgreSQL *through
+   * executeMigrations(pool)* — never through a direct internal call, and
+   * never through anything the emitted build exposes. Same `Module._load`
+   * interception, scoped to execute.ts's own import, already used above for
+   * `./manifest`; production's own handlers.ts stays an inert pair of
+   * always-undefined lookups.
+   */
+  batchedHandlers?: ReadonlyMap<string, BatchedHandler>;
+  /**
+   * PB-10 Step 3 Phase 2c, H2: the same substitution for the reviewed
+   * nontransactional/legacy recovery-verifier registry, so the verifier-led
+   * Stage 2 evaluators can be driven through executeMigrations(pool). Test
+   * only, exactly as batchedHandlers above.
+   */
+  nontransactionalHandlers?: ReadonlyMap<string, NontransactionalHandler>;
 }
+
+/**
+ * Process-wide substitutions (the fs.readFile fixture redirect and the
+ * identity environment variables) are shared state, so overlapping calls must
+ * not tear each other's down. PB-10 Step 3 Phase 2c blocker 1's ownership
+ * regression deliberately runs two executions concurrently — a gated one
+ * holding ownership and a second one that must not reach BEGIN — and the
+ * first to finish would otherwise restore fs.readFile out from under the
+ * second. Installed on the transition from zero active calls, restored on the
+ * transition back to zero; per-call substitutions (runId, now, sleep,
+ * handlers) stay per-call because they are only ever used by single runs.
+ */
+const activeFixtureRoots: string[] = [];
+let sharedReadMock: ReturnType<typeof mock.method> | undefined;
+let sharedEnvironment: { source?: string; digest?: string; runner?: string } | undefined;
+let activeCalls = 0;
 
 /**
  * Test-side dependency substitution around the real production entry point.
@@ -52,6 +89,19 @@ export async function executeMigrationsForTest(pool: Pool, options: TestExecuteO
         checkManifest: async () => options.manifest ?? originalCheckManifest(options.repositoryRoot),
       };
     }
+    if ((options.batchedHandlers || options.nontransactionalHandlers)
+      && request === "./handlers" && parent?.filename === executePath) {
+      const real = originalLoad.call(this, request, parent, isMain) as typeof import("../../src/db/migrate/handlers");
+      return {
+        ...real,
+        ...(options.batchedHandlers
+          ? { batchedHandlerFor: (migrationId: string) => options.batchedHandlers!.get(migrationId) }
+          : {}),
+        ...(options.nontransactionalHandlers
+          ? { nontransactionalHandlerFor: (migrationId: string) => options.nontransactionalHandlers!.get(migrationId) }
+          : {}),
+      };
+    }
     if (options.sleep && request === "node:timers/promises" && parent?.filename === executePath) {
       const real = originalLoad.call(this, request, parent, isMain) as typeof import("node:timers/promises");
       return { ...real, setTimeout: options.sleep };
@@ -65,19 +115,24 @@ export async function executeMigrationsForTest(pool: Pool, options: TestExecuteO
   } finally {
     moduleLoader._load = originalLoad;
   }
-  const readMock = options.repositoryRoot
-    ? mock.method(fs, "readFile", async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
-      const fixture = path.join(options.repositoryRoot!, "db", "migrations", path.basename(String(target)));
+  activeCalls += 1;
+  if (options.repositoryRoot) activeFixtureRoots.push(options.repositoryRoot);
+  if (options.repositoryRoot && !sharedReadMock) {
+    sharedReadMock = mock.method(fs, "readFile", async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
+      const basename = path.basename(String(target));
+      const fixture = activeFixtureRoots
+        .map((root) => path.join(root, "db", "migrations", basename))
+        .find((candidate) => existsSync(candidate));
       return Reflect.apply(originalReadFile, fs, [
-        existsSync(fixture) ? fixture : target,
+        fixture ?? target,
         ...args,
       ]) as ReturnType<typeof fs.readFile>;
-    })
-    : undefined;
+    });
+  }
   const uuidMock = options.runId ? mock.method(cryptoModule, "randomUUID", () => options.runId!) : undefined;
   const nowMock = options.now ? mock.method(Date, "now", options.now) : undefined;
 
-  const previous = {
+  sharedEnvironment ??= {
     source: process.env.MIGRATION_SOURCE_GIT_SHA,
     digest: process.env.MIGRATION_EXECUTOR_IMAGE_DIGEST,
     runner: process.env.MIGRATION_RUNNER_ID,
@@ -92,15 +147,24 @@ export async function executeMigrationsForTest(pool: Pool, options: TestExecuteO
   try {
     return await executeMigrations(pool);
   } finally {
-    readMock?.mock.restore();
     uuidMock?.mock.restore();
     nowMock?.mock.restore();
-    delete require.cache[executePath];
-    if (previous.source === undefined) delete process.env.MIGRATION_SOURCE_GIT_SHA;
-    else process.env.MIGRATION_SOURCE_GIT_SHA = previous.source;
-    if (previous.digest === undefined) delete process.env.MIGRATION_EXECUTOR_IMAGE_DIGEST;
-    else process.env.MIGRATION_EXECUTOR_IMAGE_DIGEST = previous.digest;
-    if (previous.runner === undefined) delete process.env.MIGRATION_RUNNER_ID;
-    else process.env.MIGRATION_RUNNER_ID = previous.runner;
+    if (options.repositoryRoot) {
+      activeFixtureRoots.splice(activeFixtureRoots.indexOf(options.repositoryRoot), 1);
+    }
+    activeCalls -= 1;
+    if (activeCalls === 0) {
+      sharedReadMock?.mock.restore();
+      sharedReadMock = undefined;
+      delete require.cache[executePath];
+      const previous = sharedEnvironment!;
+      sharedEnvironment = undefined;
+      if (previous.source === undefined) delete process.env.MIGRATION_SOURCE_GIT_SHA;
+      else process.env.MIGRATION_SOURCE_GIT_SHA = previous.source;
+      if (previous.digest === undefined) delete process.env.MIGRATION_EXECUTOR_IMAGE_DIGEST;
+      else process.env.MIGRATION_EXECUTOR_IMAGE_DIGEST = previous.digest;
+      if (previous.runner === undefined) delete process.env.MIGRATION_RUNNER_ID;
+      else process.env.MIGRATION_RUNNER_ID = previous.runner;
+    }
   }
 }

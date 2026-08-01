@@ -18,7 +18,20 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 previous_def="$(cat "$script_dir/fixtures/mr_metadata_ck.previous.def")"
+phase2b_def="$(cat "$script_dir/fixtures/mr_metadata_ck.phase2b.def")"
 current_def="$(cat "$script_dir/fixtures/mr_metadata_ck.current.def")"
+
+# PB-10 Step 3 Phase 2c: the upgrade now also performs the role separation and
+# ownership transfer, so it needs the execution role to exist and to be named.
+: "${MIGRATION_EXECUTION_ROLE:=pb10_hostile_runner}"
+psql "$PGDATABASE_URL" -v ON_ERROR_STOP=1 -XAtq -c "
+  do \$\$
+  begin
+    if pg_catalog.to_regrole('$MIGRATION_EXECUTION_ROLE') is null then
+      execute format('create role %I login password %L', '$MIGRATION_EXECUTION_ROLE', 'hostile');
+    end if;
+  end
+  \$\$;" >/dev/null
 
 echo "installing the previous PB-10 control schema..." >&2
 psql "$PGDATABASE_URL" -v ON_ERROR_STOP=1 -q \
@@ -27,7 +40,9 @@ psql "$PGDATABASE_URL" -v ON_ERROR_STOP=1 -q \
 echo "running the real upgrade inside a session with hostile pg_temp shadows..." >&2
 psql "$PGDATABASE_URL" -v ON_ERROR_STOP=1 \
   -v script_dir="$script_dir" \
+  -v migration_execution_role="$MIGRATION_EXECUTION_ROLE" \
   -v previous_metadata_ck_def="$previous_def" \
+  -v phase2b_metadata_ck_def="$phase2b_def" \
   -v current_metadata_ck_def="$current_def" \
   -f "$script_dir/test-hostile-search-path.inner.sql"
 

@@ -10,12 +10,22 @@
 # environment variables already exported by the caller (see
 # infra/scripts/migrate.sh). DATABASE_URL is never required.
 #
-#   DATABASE_URL="postgres://owner@host:5432/db" \
+# Must be run as an ADMINISTRATIVE role — one that can CREATE ROLE and is not
+# the migration execution role. MIGRATION_EXECUTION_ROLE names the role the
+# migration runner logs in as; it is required, because both the fresh install
+# and the upgrade build that role's privilege set explicitly and neither can
+# guess it. See db/README.md.
+#
+#   MIGRATION_EXECUTION_ROLE=submitsense_migrate \
+#   DATABASE_URL="postgres://admin@host:5432/db" \
 #     db/control/install-or-upgrade-control-schema.sh
 #
-#   PGHOST=host PGPORT=5432 PGDATABASE=db PGUSER=owner PGPASSWORD=*** \
+#   MIGRATION_EXECUTION_ROLE=submitsense_migrate \
+#   PGHOST=host PGPORT=5432 PGDATABASE=db PGUSER=admin PGPASSWORD=*** \
 #     db/control/install-or-upgrade-control-schema.sh
 set -euo pipefail
+
+: "${MIGRATION_EXECUTION_ROLE:?MIGRATION_EXECUTION_ROLE is required (the role the migration runner logs in as); see db/README.md}"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -34,10 +44,14 @@ exists="$(psql ${psql_target[@]+"${psql_target[@]}"} -XAtq -v ON_ERROR_STOP=1 \
 if [[ "$exists" == "t" ]]; then
   echo "migration_control already present; applying idempotent upgrade" >&2
   psql ${psql_target[@]+"${psql_target[@]}"} -v ON_ERROR_STOP=1 \
+    -v migration_execution_role="$MIGRATION_EXECUTION_ROLE" \
     -v previous_metadata_ck_def="$(cat "$script_dir/fixtures/mr_metadata_ck.previous.def")" \
+    -v phase2b_metadata_ck_def="$(cat "$script_dir/fixtures/mr_metadata_ck.phase2b.def")" \
     -v current_metadata_ck_def="$(cat "$script_dir/fixtures/mr_metadata_ck.current.def")" \
     -f "$script_dir/control-schema-upgrade.sql"
 else
   echo "migration_control absent; installing fresh" >&2
-  psql ${psql_target[@]+"${psql_target[@]}"} -v ON_ERROR_STOP=1 -f "$script_dir/control-schema.sql"
+  psql ${psql_target[@]+"${psql_target[@]}"} -v ON_ERROR_STOP=1 \
+    -v migration_execution_role="$MIGRATION_EXECUTION_ROLE" \
+    -f "$script_dir/control-schema.sql"
 fi

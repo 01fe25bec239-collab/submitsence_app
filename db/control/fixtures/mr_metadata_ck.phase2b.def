@@ -1,4 +1,4 @@
-CHECK (((jsonb_typeof(metadata) = 'object'::text) AND ((metadata - ARRAY['duration_ms'::text, 'elapsed_ms'::text, 'rows_affected'::text, 'statement_count'::text, 'batch_number'::text, 'retry_count'::text, 'operation_category'::text, 'execution_mode'::text, 'migration_filename'::text, 'migration_ordinal'::text, 'verification'::text, 'reclaim_reason'::text, 'checksum_sha256'::text, 'resolved_event_id'::text, 'resolved_run_id'::text, 'resolved_runner_id'::text, 'resolved_checksum_sha256'::text]) = '{}'::jsonb) AND ((NOT (metadata ? 'duration_ms'::text)) OR
+CHECK (((jsonb_typeof(metadata) = 'object'::text) AND ((metadata - ARRAY['duration_ms'::text, 'elapsed_ms'::text, 'rows_affected'::text, 'statement_count'::text, 'batch_number'::text, 'retry_count'::text, 'operation_category'::text, 'execution_mode'::text, 'migration_filename'::text, 'migration_ordinal'::text, 'verification'::text, 'reclaim_reason'::text]) = '{}'::jsonb) AND ((NOT (metadata ? 'duration_ms'::text)) OR
 CASE
     WHEN (jsonb_typeof((metadata -> 'duration_ms'::text)) = 'number'::text) THEN (((((metadata ->> 'duration_ms'::text))::numeric >= (0)::numeric) AND (((metadata ->> 'duration_ms'::text))::numeric <= ('9007199254740991'::bigint)::numeric)) AND (((metadata ->> 'duration_ms'::text))::numeric = trunc(((metadata ->> 'duration_ms'::text))::numeric)))
     ELSE false
@@ -30,24 +30,4 @@ END) AND ((NOT (metadata ? 'migration_ordinal'::text)) OR
 CASE
     WHEN (jsonb_typeof((metadata -> 'migration_ordinal'::text)) = 'number'::text) THEN (((((metadata ->> 'migration_ordinal'::text))::numeric >= (1)::numeric) AND (((metadata ->> 'migration_ordinal'::text))::numeric <= ('9007199254740991'::bigint)::numeric)) AND (((metadata ->> 'migration_ordinal'::text))::numeric = trunc(((metadata ->> 'migration_ordinal'::text))::numeric)))
     ELSE false
-END) AND ((NOT (metadata ? 'verification'::text)) OR ((metadata ->> 'verification'::text) = ANY (ARRAY['passed'::text, 'failed'::text]))) AND ((NOT (metadata ? 'reclaim_reason'::text)) OR ((metadata ->> 'reclaim_reason'::text) = ANY (ARRAY['heartbeat_expired'::text, 'connection_lost'::text, 'operator_approved'::text]))) AND ((NOT (metadata ? 'checksum_sha256'::text)) OR
-CASE
-    WHEN (jsonb_typeof((metadata -> 'checksum_sha256'::text)) = 'string'::text) THEN ((metadata ->> 'checksum_sha256'::text) ~ '^[0-9a-f]{64}$'::text)
-    ELSE false
-END) AND ((NOT (metadata ? 'resolved_event_id'::text)) OR
-CASE
-    WHEN (jsonb_typeof((metadata -> 'resolved_event_id'::text)) = 'number'::text) THEN (((((metadata ->> 'resolved_event_id'::text))::numeric >= (1)::numeric) AND (((metadata ->> 'resolved_event_id'::text))::numeric <= ('9007199254740991'::bigint)::numeric)) AND (((metadata ->> 'resolved_event_id'::text))::numeric = trunc(((metadata ->> 'resolved_event_id'::text))::numeric)))
-    ELSE false
-END) AND ((NOT (metadata ? 'resolved_run_id'::text)) OR
-CASE
-    WHEN (jsonb_typeof((metadata -> 'resolved_run_id'::text)) = 'string'::text) THEN ((metadata ->> 'resolved_run_id'::text) ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'::text)
-    ELSE false
-END) AND ((NOT (metadata ? 'resolved_runner_id'::text)) OR
-CASE
-    WHEN (jsonb_typeof((metadata -> 'resolved_runner_id'::text)) = 'string'::text) THEN ((metadata ->> 'resolved_runner_id'::text) ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'::text)
-    ELSE false
-END) AND ((NOT (metadata ? 'resolved_checksum_sha256'::text)) OR
-CASE
-    WHEN (jsonb_typeof((metadata -> 'resolved_checksum_sha256'::text)) = 'string'::text) THEN ((metadata ->> 'resolved_checksum_sha256'::text) ~ '^[0-9a-f]{64}$'::text)
-    ELSE false
-END)))
+END) AND ((NOT (metadata ? 'verification'::text)) OR ((metadata ->> 'verification'::text) = ANY (ARRAY['passed'::text, 'failed'::text]))) AND ((NOT (metadata ? 'reclaim_reason'::text)) OR ((metadata ->> 'reclaim_reason'::text) = ANY (ARRAY['heartbeat_expired'::text, 'connection_lost'::text, 'operator_approved'::text])))))
