@@ -5,6 +5,7 @@ import {
   type MigrationManifest,
   type MigrationManifestEntry,
 } from "./manifest";
+import { reportSanitizedPoolError } from "./execution-errors";
 
 export const SCHEMA_ADVISORY_LOCK = [1398096461, 1] as const;
 export const SCHEMA_LOCK_POLL_MS = 5_000;
@@ -100,6 +101,11 @@ const expectedColumns = new Map<string, Map<string, { type: string; nullable: bo
     ["baselined", { type: "boolean", nullable: false }],
     ["source_git_sha", { type: "text", nullable: false }],
     ["executor_image_digest", { type: "text", nullable: false }],
+    // PB-10 Step 3 Phase 2c final review, CRITICAL 1: the database's own
+    // classification of how this applied row came to exist. Written only by
+    // migration_control.record_applied_migration; the execution role has no
+    // INSERT privilege on this table at all.
+    ["commit_proof", { type: "text", nullable: false }],
   ])],
   ["migration_runs", new Map([
     ["event_id", { type: "bigint", nullable: false, defaultIncludes: "nextval" }],
@@ -116,6 +122,13 @@ const expectedColumns = new Map<string, Map<string, { type: string; nullable: bo
     ["sqlstate", { type: "text", nullable: true }],
     ["error_class", { type: "text", nullable: true }],
     ["metadata", { type: "jsonb", nullable: false }],
+    // PB-10 Step 3 Phase 2c final review, CRITICAL 1: the transaction-outcome
+    // binding (see db/control/control-schema.sql).
+    ["xact_id", { type: "xid8", nullable: true }],
+    // CRITICAL 2: sha256 of the attempt's claim token. The token itself is
+    // never stored, so SELECT on this table does not confer the ability to
+    // reach the protected proof path for any attempt.
+    ["attempt_token_sha256", { type: "bytea", nullable: true }],
   ])],
 ]);
 
@@ -136,6 +149,8 @@ const expectedConstraints = new Map<string, Map<string, "p" | "u" | "c">>([
     ["sm_baseline_ck", "c"],
     ["sm_source_sha_ck", "c"],
     ["sm_image_digest_ck", "c"],
+    ["sm_commit_proof_ck", "c"],
+    ["sm_commit_proof_mode_ck", "c"],
   ])],
   ["migration_runs", new Map([
     ["migration_runs_pkey", "p"],
@@ -151,6 +166,9 @@ const expectedConstraints = new Map<string, Map<string, "p" | "u" | "c">>([
     ["mr_sqlstate_ck", "c"],
     ["mr_error_class_ck", "c"],
     ["mr_metadata_ck", "c"],
+    ["mr_xact_ck", "c"],
+    ["mr_attempt_token_ck", "c"],
+    ["mr_marker_ck", "c"],
   ])],
 ]);
 
@@ -181,6 +199,22 @@ const constraintDefinitionFragments = new Map<string, string[]>([
     "'seed-reference'::text = ANY (operation_categories)",
   ]],
   ["sm_categories_order_ck", ["operation_categories = migration_control.canonical_operation_categories(operation_categories)"]],
+  // PB-10 Step 3 Phase 2c final review, CRITICAL 1: the applied row's own
+  // record of how the database classified its provenance. Pinned here because
+  // the evaluator refuses a transactional attempt's applied row unless it says
+  // 'transaction_atomic' — a schema that silently permitted any other value on
+  // a transactional row would let a post-hoc row masquerade as atomic proof.
+  ["sm_commit_proof_ck", ["commit_proof", "'transaction_atomic'", "'post_hoc_verified'", "'baseline'"]],
+  ["sm_commit_proof_mode_ck", [
+    "commit_proof = 'transaction_atomic'",
+    "NOT baselined",
+    "execution_mode = 'transactional'",
+    "commit_proof = 'post_hoc_verified'",
+    "'nontransactional'",
+    "'batched'",
+    "'legacy-verbatim'",
+    "commit_proof = 'baseline'",
+  ]],
   ["sm_mode_ck", ["execution_mode", "'legacy-verbatim'", "'transactional'", "'nontransactional'", "'batched'"]],
   ["sm_baseline_ck", ["baselined", "applied_checksum_sha256 IS NULL", "execution_mode = 'legacy-verbatim'", "NOT baselined", "applied_checksum_sha256 IS NOT NULL"]],
   ["sm_source_sha_ck", ["source_git_sha ~ '^[0-9a-f]{7,64}$'"]],
@@ -192,6 +226,18 @@ const constraintDefinitionFragments = new Map<string, string[]>([
   ["mr_type_ck", ["event_type", "'started'", "'heartbeat'", "'transaction_rolled_back'", "'operation_completed'", "'execution_failed'", "'applied_committed'", "'verification_failed'", "'succeeded'", "'stale_reclaimed'"]],
   ["mr_heartbeat_ck", ["heartbeat_deadline IS NULL", "event_type", "'started'", "'heartbeat'"]],
   ["mr_statement_ck", ["statement_ordinal IS NULL", "statement_ordinal > 0"]],
+  ["mr_xact_ck", ["xact_id is null", "event_type = 'heartbeat'"]],
+  // CRITICAL 2: the attempt claim digest lives on the `started` row and
+  // nowhere else, and is a full sha256. A schema that allowed it on a later
+  // event would let a second row re-arm an attempt that was already armed.
+  ["mr_attempt_token_ck", ["attempt_token_sha256 IS NULL", "event_type = 'started'", "octet_length(attempt_token_sha256) = 32"]],
+  // PB-10 Step 3 Phase 2c final review, CRITICAL: an H2 progress marker is a
+  // `heartbeat` row carrying statement_ordinal 1 or 2 and no transaction
+  // binding, and nothing else in the ledger may take that shape. The privilege
+  // model (control-grants.sql withholds INSERT on statement_ordinal) is what
+  // makes markers unforgeable; this constraint is what stops another event type
+  // from impersonating one.
+  ["mr_marker_ck", ["event_type <> 'heartbeat'", "statement_ordinal IS NULL", "statement_ordinal = ANY (ARRAY[1, 2])", "xact_id IS NULL"]],
   ["mr_runner_ck", ["runner_id IS NULL", "runner_id ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'"]],
   ["mr_source_sha_ck", ["source_git_sha IS NULL", "source_git_sha ~ '^[0-9a-f]{7,64}$'"]],
   ["mr_image_digest_ck", ["executor_image_digest IS NULL", "executor_image_digest ~ '^sha256:[0-9a-f]{64}$'"]],
@@ -338,8 +384,15 @@ export async function verifyControlSchema(client: PoolClient): Promise<void> {
      order by c.relname
   `, ["migration_control"]);
   assertCondition(
-    sameStrings(objects.rows.map(({ table_name }) => table_name), ["migration_runs", "schema_migrations"]),
-    "migration_control must contain exactly the two Step-2 permanent tables",
+    // PB-10 Step 3 Phase 2c final review, CRITICAL 1: proof_key joins the two
+    // Step-2 ledger tables. It holds the key behind the transaction-binding
+    // receipt, is owned by migration_control_owner, and is granted to no
+    // role at all — the execution role cannot read it, which is what stops it
+    // computing a receipt for any (attempt, transaction) pair the protected
+    // functions did not themselves produce. Its absence would silently
+    // disable that protection, so it is required here, not merely tolerated.
+    sameStrings(objects.rows.map(({ table_name }) => table_name), ["migration_runs", "proof_key", "schema_migrations"]),
+    "migration_control must contain exactly the two permanent ledger tables and the protected proof key",
   );
 
   const columns = await client.query<{
@@ -469,6 +522,7 @@ export async function verifyControlSchema(client: PoolClient): Promise<void> {
     language_name: string;
     volatility: string;
     security_definer: boolean;
+    owner_role: string;
     config: string[] | null;
     public_execute: boolean;
     runtime_execute: boolean;
@@ -477,6 +531,7 @@ export async function verifyControlSchema(client: PoolClient): Promise<void> {
            l.lanname as language_name,
            p.provolatile::text as volatility,
            p.prosecdef as security_definer,
+           pg_catalog.pg_get_userbyid(p.proowner) as owner_role,
            p.proconfig as config,
            exists (
              select 1
@@ -498,27 +553,129 @@ export async function verifyControlSchema(client: PoolClient): Promise<void> {
   `, ["migration_control"]);
   // canonical_operation_categories backs sm_categories_order_ck, so its
   // contract is as load-bearing as the mutation-rejection function's.
+  //
+  // PB-10 Step 3 Phase 2c final review, CRITICAL 1 + CRITICAL 2: the last four
+  // are the protected proof path, and their SECURITY DEFINER flag is verified
+  // as *required* rather than merely permitted. If one of them were silently
+  // replaced by a SECURITY INVOKER function it would execute with the
+  // migration execution role's own (deliberately insufficient) privileges and
+  // every proof would fail — but a definer function owned by the *wrong* role
+  // would instead execute with whatever that role can do, which is why the
+  // owner is pinned here too. A fixed search_path is mandatory on all of them:
+  // a SECURITY DEFINER function without one is the classic privilege-
+  // escalation vector (CVE-2018-1058).
   const expectedFunctions = [
-    ["canonical_operation_categories", "sql", "i"],
-    ["reject_ledger_mutation", "plpgsql", "v"],
+    ["canonical_operation_categories", "sql", "i", false],
+    ["reject_ledger_mutation", "plpgsql", "v", false],
+    ["attempt_for_token", "plpgsql", "s", true],
+    ["claim_transaction", "plpgsql", "v", true],
+    ["record_transaction_binding", "plpgsql", "v", true],
+    ["record_applied_migration", "plpgsql", "v", true],
+    // PB-10 Step 3 Phase 2c final review, CRITICAL: the sole writer of an H2
+    // progress marker. A marker permits SAFE_TO_RETRY, so it needs the same
+    // protected provenance as commit proof and transaction bindings.
+    ["record_progress_marker", "plpgsql", "v", true],
   ] as const;
   assertCondition(
     functionContract.rows.length === expectedFunctions.length,
     `migration_control must contain exactly ${expectedFunctions.length} control functions`,
   );
-  for (const [name, language, volatility] of expectedFunctions) {
+  for (const [name, language, volatility, securityDefiner] of expectedFunctions) {
     const contract = functionContract.rows.find((row) => row.function_name === name);
     assertCondition(
       contract
       && contract.language_name === language
       && contract.volatility === volatility
-      && contract.security_definer === false
+      && contract.security_definer === securityDefiner
+      && contract.owner_role === "migration_control_owner"
       && contract.config?.includes("search_path=pg_catalog, pg_temp")
       && contract.public_execute === false
       && contract.runtime_execute === false,
       `Control function contract is incompatible for migration_control.${name}`,
     );
   }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // PB-10 Step 3 Phase 2c final review, CRITICAL 1 + CRITICAL 2: role
+  // separation, verified at runtime against the connection the migration will
+  // actually run on.
+  //
+  // Every unforgeability property this schema provides rests on one fact:
+  // the role executing migration SQL cannot write proof directly. That is a
+  // property of the *installation*, not of the SQL files in this repository —
+  // an operator who installed the old single-owner way, granted the runner
+  // ownership back, or simply runs migrations as a superuser has silently
+  // reinstated forgeable commit proof, and nothing else in this codebase
+  // would notice. So it is asserted here, before a single byte of migration
+  // SQL runs, and the run fails closed if it does not hold.
+  //
+  // Note this is checked with has_*_privilege against current_user, which
+  // accounts for privileges reached through role membership as well as direct
+  // grants — a runner that merely *inherits* the owner's rights fails just as
+  // a directly-granted one does.
+  const separation = await client.query<{
+    is_superuser: boolean;
+    owns_control_schema: boolean;
+    member_of_owner: boolean;
+    can_insert_applied: boolean;
+    can_write_binding: boolean;
+    can_write_marker: boolean;
+    can_read_proof_key: boolean;
+    can_mutate_ledger: boolean;
+  }>(`
+    select
+      (select rolsuper from pg_catalog.pg_roles where rolname = current_user) as is_superuser,
+      pg_catalog.pg_has_role(current_user, n.nspowner, 'USAGE') as owns_control_schema,
+      coalesce(
+        pg_catalog.pg_has_role(current_user, pg_catalog.to_regrole('migration_control_owner'), 'USAGE'),
+        false
+      ) as member_of_owner,
+      pg_catalog.has_table_privilege('migration_control.schema_migrations', 'INSERT') as can_insert_applied,
+      pg_catalog.has_column_privilege('migration_control.migration_runs', 'xact_id', 'INSERT') as can_write_binding,
+      pg_catalog.has_column_privilege('migration_control.migration_runs', 'statement_ordinal', 'INSERT') as can_write_marker,
+      coalesce(
+        pg_catalog.has_table_privilege('migration_control.proof_key', 'SELECT'),
+        false
+      ) as can_read_proof_key,
+      (pg_catalog.has_table_privilege('migration_control.schema_migrations', 'UPDATE')
+       or pg_catalog.has_table_privilege('migration_control.schema_migrations', 'DELETE')
+       or pg_catalog.has_table_privilege('migration_control.schema_migrations', 'TRUNCATE')
+       or pg_catalog.has_table_privilege('migration_control.migration_runs', 'UPDATE')
+       or pg_catalog.has_table_privilege('migration_control.migration_runs', 'DELETE')
+       or pg_catalog.has_table_privilege('migration_control.migration_runs', 'TRUNCATE')) as can_mutate_ledger
+      from pg_catalog.pg_namespace n
+     where n.nspname = 'migration_control'
+  `);
+  const roleModel = separation.rows[0];
+  assertCondition(roleModel, "Could not determine the migration_control ownership model");
+  assertCondition(
+    roleModel.is_superuser !== true,
+    "The migration runner is connected as a superuser, which bypasses every privilege the commit-proof design relies on; connect as the dedicated migration execution role (see db/README.md)",
+  );
+  assertCondition(
+    roleModel.owns_control_schema !== true && roleModel.member_of_owner !== true,
+    "The migration runner owns (or is a member of the owner of) migration_control, so it could forge commit proof directly; reinstall the control schema with role separation (see db/README.md)",
+  );
+  assertCondition(
+    roleModel.can_insert_applied !== true,
+    "The migration runner can INSERT into migration_control.schema_migrations directly, so an applied row is not authoritative commit proof; reinstall the control schema with role separation (see db/README.md)",
+  );
+  assertCondition(
+    roleModel.can_write_binding !== true,
+    "The migration runner can write migration_control.migration_runs.xact_id directly, so a transaction binding is not authoritative; reinstall the control schema with role separation (see db/README.md)",
+  );
+  assertCondition(
+    roleModel.can_write_marker !== true,
+    "The migration runner can write migration_control.migration_runs.statement_ordinal directly, so an H2 progress marker is not authoritative and replay could be authorized by forged evidence; reinstall the control schema with role separation (see db/README.md)",
+  );
+  assertCondition(
+    roleModel.can_read_proof_key !== true,
+    "The migration runner can read migration_control.proof_key, so it could forge a transaction-binding receipt; reinstall the control schema with role separation (see db/README.md)",
+  );
+  assertCondition(
+    roleModel.can_mutate_ledger !== true,
+    "The migration runner holds UPDATE, DELETE or TRUNCATE on a control ledger table; the ledger must be append-only for the execution role",
+  );
 
   const privileges = await client.query<{
     public_schema: boolean;
@@ -682,7 +839,39 @@ export async function withSchemaAdvisoryLock<T>(
       if (elapsed >= budgetMs) throw new Error(`Schema advisory lock was not acquired within ${budgetMs}ms`);
       await Promise.race([sleep(Math.min(pollMs, budgetMs - elapsed)), connectionLost]);
     }
-    value = await Promise.race([action(client), connectionLost]);
+    // PB-10 Step 3 Phase 2c: the migration action is *never* raced against
+    // connectionLost, and never abandoned on a timer.
+    //
+    // Losing the pinned control connection is precisely the moment the action
+    // is performing its one mandatory durable step: arming the
+    // commit_outcome_unknown replay guard, deliberately over an independent
+    // connection this failure does not touch. Everything this function owns —
+    // the advisory lock, the pinned client, and the caller's own knowledge of
+    // the outcome — is what keeps a *second* execution from replaying a
+    // migration whose real outcome is unknown. Returning, releasing, or
+    // unlocking while that append is still in flight hands ownership away
+    // before the durable marker exists, which is the replay window itself.
+    //
+    // A deadline cannot make that safe: expiring one would abandon mandatory
+    // durability work and release ownership anyway, only less predictably. So
+    // there is no deadline here at all. The wait is bounded instead by the
+    // things that genuinely bound it — every query still outstanding on a
+    // lost connection is rejected by the driver as soon as it emits 'error',
+    // and the durable fallback carries its own finite connect timeout and a
+    // fixed retry count — and if the database is truly unreachable the action
+    // fails closed on its own and rethrows here.
+    const running = action(client);
+    // Owned synchronously: `running` is the only object that can carry the
+    // action's outcome, and nothing else ever attaches a handler to it, so an
+    // inert observer is taken here rather than left to chance.
+    running.catch(() => undefined);
+    // The action's own outcome is authoritative whenever it produced one: it
+    // — not the raw socket error — knows whether the ambiguity was durably
+    // recorded and which error class the run actually ended on. A connection
+    // failure observed while it was running is only surfaced when the action
+    // itself completed without reporting a failure of its own.
+    value = await running;
+    if (connectionError) throw connectionError;
   } catch (error) {
     actionError = errorValue(error);
   } finally {
@@ -720,12 +909,15 @@ export async function withSchemaAdvisoryLock<T>(
       // (a query rejection and the raw socket's own event, both stemming
       // from one root termination, are not guaranteed to be the same
       // single event), and a connection nothing will ever touch again must
-      // never let that become an uncaught exception. Swapped for a no-op
-      // rather than left as onConnectionError itself, since connectionError
-      // and cleanupError have already been captured and there is nothing
-      // further for this specific handler to do.
+      // never let that become an uncaught exception. Swapped for the shared
+      // sanitized reporter rather than onConnectionError itself (its captured
+      // result is already final) and rather than a silent no-op: absorbing a
+      // delayed connection error without a trace leaves an operator no signal
+      // at all that the pinned control connection died. The reporter emits a
+      // process warning carrying only a whitelisted driver error code — never
+      // a message, stack, host, connection string, SQL or raw object.
       client.removeListener("error", onConnectionError);
-      client.on("error", () => undefined);
+      client.on("error", reportSanitizedPoolError);
       client.release(connectionError ?? cleanupError);
     } else {
       // Healthy release: ownership is handed back to the pool, which

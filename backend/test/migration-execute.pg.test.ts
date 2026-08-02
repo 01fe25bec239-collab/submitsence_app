@@ -9,6 +9,7 @@ import { Client, Pool } from "pg";
 import type { MigrationManifest, MigrationManifestEntry } from "../src/db/migrate/manifest";
 import { executeMigrations } from "../src/db/migrate/execute";
 import { assertDistinctDatabases } from "../src/db/migrate/database-identity";
+import { installControlSchema, type ControlSchemaInstall } from "./helpers/control-schema-install";
 import { SCHEMA_ADVISORY_LOCK } from "../src/db/migrate/runner";
 import { executeMigrationsForTest } from "./helpers/migration-execute";
 
@@ -33,7 +34,17 @@ if (!databaseUrl) {
   }, () => undefined);
 } else {
   const repositoryRoot = path.resolve(__dirname, "../..");
-  const controlSchemaSql = readFileSync(path.join(repositoryRoot, "db", "control", "control-schema.sql"), "utf8");
+  /**
+   * PB-10 Step 3 Phase 2c: the control schema is installed through psql, not
+   * as one SQL blob over an ordinary connection. It now takes a required
+   * `-v migration_execution_role` variable and includes the two files shared
+   * with the upgrade path, and those are psql meta-commands the server never
+   * sees. `install` carries the credentials for the non-superuser role every
+   * pool below connects as — a superuser connection is refused by
+   * verifyControlSchema, because a superuser bypasses every privilege the
+   * commit-proof design relies on.
+   */
+  let install: ControlSchemaInstall;
 
   const identity = {
     sourceGitSha: "5324116250977b5e8ac24bc83b6cae89ebcbd990",
@@ -92,7 +103,7 @@ if (!databaseUrl) {
   const pools: Pool[] = [];
 
   const newPool = (): Pool => {
-    const pool = new Pool({ connectionString: databaseUrl, max: 3, application_name: "pb10-step3-contract" });
+    const pool = new Pool({ connectionString: install.executionUrl, max: 3, application_name: "pb10-step3-contract" });
     pools.push(pool);
     return pool;
   };
@@ -116,23 +127,43 @@ if (!databaseUrl) {
       applied_rows: string;
       event_rows: string;
     }>(`
+      -- PB-10 Step 3 Phase 2c: objects owned by an extension are excluded from
+      -- every count below (pg_depend deptype 'e'). The untrusted extensions
+      -- this repository's baseline migration needs are now provisioned by the
+      -- administrative connection, because the migration execution role is
+      -- deliberately not a superuser and CREATE EXTENSION for an untrusted
+      -- extension requires one. They are therefore present before any
+      -- migration runs, and counting them would only prove that — not the
+      -- thing this assertion exists for, which is that no *application* object
+      -- survives a reset. The extensions themselves are still counted
+      -- separately below, against their known provisioned set.
       select pg_catalog.to_regnamespace('app') is null as app_absent,
              (select count(*) from pg_catalog.pg_class c
                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace
-               where n.nspname = 'public')::text as public_relations,
+               where n.nspname = 'public'
+                 and not exists (select 1 from pg_catalog.pg_depend d
+                                  where d.objid = c.oid and d.classid = 'pg_class'::regclass
+                                    and d.deptype = 'e'))::text as public_relations,
              (select count(*) from pg_catalog.pg_proc p
                 join pg_catalog.pg_namespace n on n.oid = p.pronamespace
-               where n.nspname in ('public', 'app'))::text as public_routines,
+               where n.nspname in ('public', 'app')
+                 and not exists (select 1 from pg_catalog.pg_depend d
+                                  where d.objid = p.oid and d.classid = 'pg_proc'::regclass
+                                    and d.deptype = 'e'))::text as public_routines,
              (select count(*) from pg_catalog.pg_type t
                 join pg_catalog.pg_namespace n on n.oid = t.typnamespace
-               where n.nspname in ('public', 'app'))::text as public_types,
+               where n.nspname in ('public', 'app')
+                 and not exists (select 1 from pg_catalog.pg_depend d
+                                  where d.objid = t.oid and d.classid = 'pg_type'::regclass
+                                    and d.deptype = 'e'))::text as public_types,
              (select count(*) from pg_catalog.pg_policy p
                 join pg_catalog.pg_class c on c.oid = p.polrelid
                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace
                where n.nspname in ('public', 'app'))::text as public_policies,
-             (select count(*) from pg_catalog.pg_extension e
+             (select coalesce(string_agg(e.extname, ',' order by e.extname), '')
+                from pg_catalog.pg_extension e
                 join pg_catalog.pg_namespace n on n.oid = e.extnamespace
-               where n.nspname in ('public', 'app'))::text as public_extensions,
+               where n.nspname in ('public', 'app')) as public_extensions,
              (select count(*) from migration_control.schema_migrations)::text as applied_rows,
              (select count(*) from migration_control.migration_runs)::text as event_rows
     `);
@@ -142,7 +173,7 @@ if (!databaseUrl) {
       public_routines: "0",
       public_types: "0",
       public_policies: "0",
-      public_extensions: "0",
+      public_extensions: "citext,pg_trgm,vector",
       applied_rows: "0",
       event_rows: "0",
     });
@@ -153,7 +184,7 @@ if (!databaseUrl) {
     await admin.query("drop schema if exists app cascade");
     await admin.query("drop schema if exists public cascade");
     await admin.query("create schema public");
-    await admin.query(controlSchemaSql);
+    install = await installControlSchema(admin, databaseUrl!);
   };
 
   const createLegacyLedger = async (
@@ -180,11 +211,18 @@ if (!databaseUrl) {
     overrides: { id?: string; filename?: string; manifestChecksum?: string } = {},
   ): Promise<void> => {
     await admin.query(
+      // Written by the administrative connection, which is the only way a
+      // pre-existing applied row can be staged at all: the execution role has
+      // no INSERT privilege here, which is exactly what CRITICAL 1 relies on.
+      // commit_proof is supplied explicitly because it is NOT NULL and
+      // sm_commit_proof_mode_ck pins which value each mode may carry — a
+      // transactional row is atomic proof, every other mode is post-hoc.
       `insert into migration_control.schema_migrations
          (migration_id, ordinal, filename, manifest_checksum_sha256, applied_checksum_sha256,
           lifecycle_phase, operation_categories, execution_mode, applied_at, run_id,
-          baselined, source_git_sha, executor_image_digest)
-       values ($1, $2, $3, $4, $4, $5, $6, $7, now(), $8, false, $9, $10)`,
+          baselined, source_git_sha, executor_image_digest, commit_proof)
+       values ($1, $2, $3, $4, $4, $5, $6, $7, now(), $8, false, $9, $10,
+               case when $7 = 'transactional' then 'transaction_atomic' else 'post_hoc_verified' end)`,
       [
         overrides.id ?? migration.id,
         ordinal,
@@ -262,6 +300,10 @@ if (!databaseUrl) {
     );
     admin = new Client({ connectionString: databaseUrl, application_name: "pb10-step3-admin" });
     await admin.connect();
+    // The runner credential must exist before any pool is constructed: every
+    // pool below connects as the non-superuser execution role, and some cases
+    // build their pool before calling the per-case reset helper.
+    install = await installControlSchema(admin, databaseUrl!);
   });
 
   after(async () => {
@@ -295,7 +337,13 @@ if (!databaseUrl) {
     await admin.query("create view public.cleanup_probe_view as select id from public.cleanup_probe");
     await admin.query("create function app.cleanup_probe_function() returns integer language sql as 'select 1'");
     await admin.query("create procedure app.cleanup_probe_procedure() language sql as 'select 1'");
-    await admin.query("create extension pg_trgm with schema public");
+    // Deliberately NOT one of the three the runner's database is provisioned
+    // with: those are created by the administrative connection before every
+    // run (an untrusted extension cannot be created by the non-superuser
+    // migration role), so their presence proves nothing about the reset. An
+    // extra extension does, and assertFreshDatabase pins the surviving set
+    // exactly, so this one must be gone afterwards.
+    await admin.query("create extension unaccent with schema public");
 
     await resetDatabase();
     await assertFreshDatabase();
@@ -515,12 +563,24 @@ if (!databaseUrl) {
     const events = await admin.query<{ event_type: string; sqlstate: string | null; error_class: string | null }>(
       "select event_type, sqlstate, error_class from migration_control.migration_runs where migration_id = '0100' order by event_sequence",
     );
-    assert.deepEqual(events.rows.map(({ event_type }) => event_type), ["started", "transaction_rolled_back", "execution_failed"]);
-    assert.equal(events.rows[1].sqlstate, "22012");
-    assert.equal(events.rows[1].error_class, "sql_failed");
+    assert.deepEqual(
+      events.rows.map(({ event_type }) => event_type),
+      ["started", "heartbeat", "transaction_rolled_back", "execution_failed"],
+      "the transaction binding is durable before the outcome it will later be asked about",
+    );
+    assert.equal(events.rows[2].sqlstate, "22012");
+    assert.equal(events.rows[2].error_class, "sql_failed");
   });
 
-  test("pg: a known legacy SQL failure with confirmed rollback may retry", async () => {
+  test("pg: a legacy SQL failure blocks every later attempt: the mode has no outcome proof", async () => {
+    // PB-10 Step 3 Phase 2c final review, CRITICAL 1 + CRITICAL 2: a legacy
+    // payload owns its own BEGIN/COMMIT, so this runner can bind no
+    // transaction for PostgreSQL to rule on and the applied row is written
+    // separately rather than atomically with it. Nothing in the database can
+    // prove what the payload did, so the confirmed-rollback *labels* it leaves
+    // behind are not a retry licence — the attempt blocks until an operator
+    // records a resolution. (The deleted legacy evaluator replayed exactly
+    // this history automatically.)
     const pool = newPool();
     const filename = "0002_retry_contract.sql";
     const failedBytes = Buffer.from(
@@ -533,32 +593,35 @@ if (!databaseUrl) {
 
     await assert.rejects(execute(pool, manifestOf(failed)), /sql_failed/);
     const absent = await admin.query("select pg_catalog.to_regclass('public.retry_demo') as relation");
-    assert.equal(absent.rows[0].relation, null);
+    assert.equal(absent.rows[0].relation, null, "the payload's own transaction rolled back");
 
+    const events = await admin.query<{ event_type: string }>(
+      "select event_type from migration_control.migration_runs where migration_id = '0002' order by event_id",
+    );
+    assert.deepEqual(events.rows.map(({ event_type }) => event_type), [
+      // H2: the `heartbeat` here is the durable-work marker, committed on the
+      // control connection before the payload was issued. It is what proves
+      // this attempt *did* reach durable work, and therefore why it stays
+      // blocked below rather than qualifying for the pre-work safe retry.
+      "started", "heartbeat", "heartbeat", "transaction_rolled_back", "execution_failed",
+    ], "legacy binds no transaction, so it records no binding event either");
+
+    // Fixing the file changes nothing: replay stays refused, and no second
+    // attempt's events are written.
     const retryBytes = Buffer.from("begin;\ncreate table retry_demo (id integer);\ncommit;\n", "utf8");
+    files[filename] = retryBytes;
+    writeFileSync(path.join(root, "db", "migrations", filename), retryBytes);
+    await assertBlockedWithoutWrites(pool, manifestOf(entry("0002", filename, "legacy-verbatim", ["schema"])), /commit_outcome_unknown/);
+
+    // Nor does renaming it.
     const renamedFilename = "0002_renamed_after_failure.sql";
     files[renamedFilename] = retryBytes;
     writeFileSync(path.join(root, "db", "migrations", renamedFilename), retryBytes);
-    const renamed = entry("0002", renamedFilename, "legacy-verbatim", ["schema"]);
-    await assertBlockedWithoutWrites(pool, manifestOf(renamed), /stale_legacy_attempt/);
-
-    files[filename] = retryBytes;
-    writeFileSync(path.join(root, "db", "migrations", filename), retryBytes);
-    const retry = entry("0002", filename, "legacy-verbatim", ["schema"]);
-    const report = await execute(pool, manifestOf(retry));
-    assert.equal(report.executedCount, 1);
-
-    const events = await admin.query<{ event_type: string; statement_ordinal: number | null }>(
-      "select event_type, statement_ordinal from migration_control.migration_runs where migration_id = '0002' order by occurred_at, event_sequence",
+    await assertBlockedWithoutWrites(
+      pool,
+      manifestOf(entry("0002", renamedFilename, "legacy-verbatim", ["schema"])),
+      /commit_outcome_unknown/,
     );
-    assert.deepEqual(events.rows.map(({ event_type }) => event_type), [
-      "started", "transaction_rolled_back", "execution_failed",
-      "started", "operation_completed", "applied_committed", "succeeded",
-    ]);
-    assert.deepEqual(events.rows.map(({ statement_ordinal }) => statement_ordinal), [
-      null, 1, 1, null, null, null, null,
-    ]);
-    await admin.query("drop table retry_demo");
   });
 
   test("pg: malformed legacy retry identities fail before SQL or ledger writes", async () => {
@@ -621,7 +684,7 @@ if (!databaseUrl) {
       await resetDatabase();
       await insertAttemptEvents("0001", "30000000-0000-4000-8000-000000000099", events);
       const pool = newPool();
-      await assertBlockedWithoutWrites(pool, manifestOf(legacy), /stale_legacy_attempt/);
+      await assertBlockedWithoutWrites(pool, manifestOf(legacy), /commit_outcome_unknown/);
       const relation = await admin.query("select pg_catalog.to_regclass('public.demo') as relation");
       assert.equal(relation.rows[0].relation, null, name);
     }
@@ -633,7 +696,7 @@ if (!databaseUrl) {
       { type: "started" },
       { type: "operation_completed" },
     ]);
-    await assertBlockedWithoutWrites(pool, manifestOf(legacy), /stale_legacy_attempt/);
+    await assertBlockedWithoutWrites(pool, manifestOf(legacy), /commit_outcome_unknown/);
   });
 
   test("pg: legacy connection loss remains blocked", async () => {
@@ -642,7 +705,7 @@ if (!databaseUrl) {
       { type: "started" },
       { type: "execution_failed", errorClass: "control_connection_lost" },
     ]);
-    await assertBlockedWithoutWrites(pool, manifestOf(legacy), /stale_legacy_attempt/);
+    await assertBlockedWithoutWrites(pool, manifestOf(legacy), /commit_outcome_unknown/);
   });
 
   test("pg: an unknown legacy COMMIT outcome remains blocked", async () => {
@@ -651,7 +714,7 @@ if (!databaseUrl) {
       { type: "started" },
       { type: "execution_failed", errorClass: "sql_failed" },
     ]);
-    await assertBlockedWithoutWrites(pool, manifestOf(legacy), /stale_legacy_attempt/);
+    await assertBlockedWithoutWrites(pool, manifestOf(legacy), /commit_outcome_unknown/);
   });
 
   test("pg: events for another run block automatic legacy retry", async () => {
@@ -663,7 +726,7 @@ if (!databaseUrl) {
     ];
     await insertAttemptEvents("0001", "30000000-0000-4000-8000-000000000004", safeFailure);
     await insertAttemptEvents("0001", "30000000-0000-4000-8000-000000000005", safeFailure);
-    await assertBlockedWithoutWrites(pool, manifestOf(legacy), /stale_legacy_attempt/);
+    await assertBlockedWithoutWrites(pool, manifestOf(legacy), /commit_outcome_unknown/);
   });
 
   test("pg: the attempt event stream is strictly append-only", async () => {
@@ -684,7 +747,9 @@ if (!databaseUrl) {
     const sequences = await admin.query<{ event_sequence: number }>(
       "select event_sequence from migration_control.migration_runs order by event_sequence",
     );
-    assert.deepEqual(sequences.rows.map(({ event_sequence }) => event_sequence), [1, 2, 3, 4]);
+    // H2 adds the durable-work marker, so a successful legacy attempt is five
+    // gapless events rather than four.
+    assert.deepEqual(sequences.rows.map(({ event_sequence }) => event_sequence), [1, 2, 3, 4, 5, 6]);
   });
 
   test("pg: losing the control connection aborts the run and records no applied row", async () => {
@@ -699,25 +764,50 @@ if (!databaseUrl) {
 
     await execute(pool, manifestOf(legacy));
 
+    // PB-10 Step 3 Phase 2c: the reported error is the run's own outcome, not
+    // the raw 57P01 termination. Killing the control backend destroys the
+    // execution connection mid-migration, so this migration's ROLLBACK cannot
+    // be confirmed — genuinely ambiguous, and the run says so instead of
+    // surfacing the underlying socket failure while its durable state already
+    // said something stricter. (Before this fix the connection error won the
+    // race and returned while that durable state was still being written.)
     const pending = assert.rejects(
       execute(pool, manifestOf(legacy, slow)),
-      (error: Error & { code?: string }) => error.code === "57P01",
+      /commit_outcome_unknown/,
     );
     // Terminate the control backend (the one holding the advisory lock) mid-run.
     await new Promise((resolve) => setTimeout(resolve, 250));
-    await admin.query(
-      `select pg_terminate_backend(pid)
-         from pg_stat_activity
-        where application_name = 'pb10-step3-contract'
-          and pid <> pg_backend_pid()
-          and query ilike '%migration_runs%'`,
+    // Targeted by the advisory lock it holds, not by its current query text.
+    // The control connection *is* "the session holding the schema advisory
+    // lock" — that is the property this test is about — whereas matching on
+    // query text silently stopped selecting anything once the control
+    // connection's writes moved behind migration_control.record_* function
+    // calls, which never mention migration_runs. A predicate that quietly
+    // matches nothing turns this into a test that kills no backend and
+    // asserts nothing.
+    const terminated = await admin.query(
+      `select pg_terminate_backend(l.pid)
+         from pg_locks l
+         join pg_stat_activity a on a.pid = l.pid
+        where l.locktype = 'advisory'
+          and l.objsubid = 2
+          and l.granted
+          and a.application_name = 'pb10-step3-contract'
+          and l.pid <> pg_backend_pid()`,
     );
+    assert.equal(terminated.rowCount, 1, "exactly one control backend must have been terminated");
     await pending;
 
     // Give any orphaned execution backend more than the migration's own runtime
     // to finish and try to commit; a correct run has already destroyed it.
     await new Promise((resolve) => setTimeout(resolve, 4_000));
     assert.equal(await count("migration_control.schema_migrations"), 1, "the interrupted migration recorded nothing");
+    const armed = await admin.query<{ total: string }>(
+      `select count(*)::text as total from migration_control.migration_runs
+        where migration_id = $1 and event_type = 'execution_failed' and error_class = 'commit_outcome_unknown'`,
+      [slow.id],
+    );
+    assert.equal(armed.rows[0].total, "1", "the replay guard the run reported was already durable when the call rejected — never written afterwards");
     const orphan = await admin.query(
       "select 1 from information_schema.columns where table_name = 'demo' and column_name = 'note'",
     );

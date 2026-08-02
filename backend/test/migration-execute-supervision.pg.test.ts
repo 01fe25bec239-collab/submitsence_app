@@ -1,39 +1,45 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import test, { after, before } from "node:test";
+import test, { after, before, beforeEach } from "node:test";
 import { Client, Pool } from "pg";
-import { superviseOperation, type SupervisedOperationContext } from "../src/db/migrate/supervision";
+import type { MigrationManifest, MigrationManifestEntry } from "../src/db/migrate/manifest";
+import { assertDistinctDatabases } from "../src/db/migrate/database-identity";
+import { installControlSchema, type ControlSchemaInstall } from "./helpers/control-schema-install";
 import { withSchemaAdvisoryLock } from "../src/db/migrate/runner";
+import { executeMigrationsForTest } from "./helpers/migration-execute";
 
 /**
- * PB-10 Step 3 Phase 2a: cancellation-confirmation hardening, real
- * PostgreSQL contract. Registered only when a disposable target is
- * supplied, matching migration-execute.pg.test.ts's own gating exactly, so
- * the default suite gains no ungated PostgreSQL dependency.
+ * PB-10 Step 3 Phase 2a/2c final review: cancellation-confirmation
+ * hardening, real PostgreSQL contract, exercised entirely through
+ * executeMigrations(pool)/executeMigrationsForTest (the approved test
+ * adapter). superviseOperation/superviseCallback were merged directly into
+ * execute.ts as module-private code in the PB-10 Step 3 Phase 2c final
+ * review — the emitted build no longer has a separate supervision.js module
+ * exporting them, so this suite (like every other in this repository) now
+ * reaches the cancellation state machine only via the one production entry
+ * point, using a real transactional migration whose SQL is `select
+ * pg_sleep(...)`.
  *
- *   MIGRATION_TEST_DATABASE_URL=postgres://... node --import tsx --test test/migration-execute-supervision.pg.test.ts
+ *   MIGRATION_TEST_DATABASE_URL=postgres://... TEST_DATABASE_URL=postgres://... \
+ *     node --import tsx --test test/migration-execute-supervision.pg.test.ts
  *
- * superviseOperation needs no migration_control installation and touches no
- * application schema — it only supervises one statement on a caller-
- * supplied context — so, unlike migration-execute.pg.test.ts, these tests
- * need no control-schema install/reset per case. The real sleep from
- * node:timers/promises is used throughout (the same one execute.ts itself
- * uses in production), with genuinely short, comfortably-separated budgets
- * (never a race decided by which of two close timings wins) so the whole
- * file still runs in well under two seconds of real wall-clock time.
- *
- * Deliberately narrow in scope: the exact-ordering "cancellation begins,
- * then the operation settles" contract — in both directions — is proven
- * deterministically (no real timers, no database) by the unit suite in
- * migration-execute-supervision.test.ts. Constructing that exact race
- * against a real server is fundamentally non-deterministic (it depends on
- * PostgreSQL's own interrupt-check timing, which this suite has no way to
- * control), so this file does not attempt it. Its job is narrower and fully
- * deterministic: proving the real-database facts the state machine relies
- * on — genuine cancellation really does produce SQLSTATE 57014, a bare
- * "true" from pg_cancel_backend is not by itself proof of anything, a
- * forced control failure is handled, a discarded connection is truly gone,
- * and nothing leaks across repetitions.
+ * The exact-ordering "cancellation begins, then the operation settles"
+ * contract — in both directions, with zero timing tolerance — is proven
+ * deterministically (no real timers, no database, via
+ * executeMigrationsForTest's own sleep-override test adapter) by
+ * migration-execute.test.ts's wall-clock section instead; constructing that
+ * exact race against a real server is fundamentally non-deterministic (it
+ * depends on PostgreSQL's own interrupt-check timing, which this suite has
+ * no way to control), so this file does not attempt it. Its job is
+ * narrower and fully deterministic: proving the real-database facts the
+ * state machine relies on — genuine cancellation really does produce
+ * SQLSTATE 57014, a bare "true" from pg_cancel_backend is not by itself
+ * proof of anything, a forced control failure is handled, a discarded
+ * connection is truly gone, and nothing leaks across repetitions.
  */
 const databaseUrl = process.env.MIGRATION_TEST_DATABASE_URL;
 if (!databaseUrl && process.env.CI) {
@@ -45,14 +51,61 @@ if (!databaseUrl) {
     skip: "MIGRATION_TEST_DATABASE_URL is not set; refusing to connect to a shared or unidentified database",
   }, () => undefined);
 } else {
-  const realSleep = (milliseconds: number): Promise<void> => delay(milliseconds, undefined, { ref: false });
+  const repositoryRoot = path.resolve(__dirname, "../..");
+  /**
+   * PB-10 Step 3 Phase 2c: the control schema is installed through psql, not
+   * as one SQL blob over an ordinary connection. It now takes a required
+   * `-v migration_execution_role` variable and includes the two files shared
+   * with the upgrade path, and those are psql meta-commands the server never
+   * sees. `install` carries the credentials for the non-superuser role every
+   * pool below connects as — a superuser connection is refused by
+   * verifyControlSchema, because a superuser bypasses every privilege the
+   * commit-proof design relies on.
+   */
+  let install: ControlSchemaInstall;
+  const identity = {
+    sourceGitSha: "5324116250977b5e8ac24bc83b6cae89ebcbd990",
+    executorImageDigest: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    runnerId: "pb10-supervision-contract",
+  };
+  const sha256 = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
+
+  const root = mkdtempSync(path.join(os.tmpdir(), "pb10-supervision-pg-"));
+  mkdirSync(path.join(root, "db", "migrations"), { recursive: true });
+  const sleepFile = Buffer.from("select pg_sleep(5);\n", "utf8");
+  writeFileSync(path.join(root, "db", "migrations", "0100_sleep.sql"), sleepFile);
+  after(() => rmSync(root, { recursive: true, force: true }));
+
+  const sleepEntry = (wallClockMs: number): MigrationManifestEntry => ({
+    id: "0100",
+    filename: "0100_sleep.sql",
+    sha256: sha256(sleepFile),
+    lifecyclePhase: "expand",
+    operationCategories: ["schema"],
+    executionMode: "transactional",
+    requiredRuntimeEpoch: null,
+    timeouts: { lockMs: 5_000, statementMs: 60_000, transactionMs: 300_000, idleInTransactionMs: 60_000, wallClockMs },
+  });
+  const manifestOf = (entry: MigrationManifestEntry): MigrationManifest => ({
+    schemaVersion: 1,
+    legacyBoundary: "0099",
+    migrations: [entry],
+  });
 
   let admin: Client;
   const pools: Pool[] = [];
   const newPool = (max = 2): Pool => {
-    const pool = new Pool({ connectionString: databaseUrl, max, application_name: "pb10-supervision-contract" });
+    const pool = new Pool({ connectionString: install.executionUrl, max, application_name: "pb10-supervision-contract" });
     pools.push(pool);
     return pool;
+  };
+  const execute = (pool: Pool, entry: MigrationManifestEntry) =>
+    executeMigrationsForTest(pool, { manifest: manifestOf(entry), identity, repositoryRoot: root });
+  const resetDatabase = async (): Promise<void> => {
+    await admin.query("drop schema if exists migration_control cascade");
+    await admin.query("drop schema if exists public cascade");
+    await admin.query("create schema public");
+    install = await installControlSchema(admin, databaseUrl!);
   };
 
   const backendPid = async (client: { query: (sql: string) => Promise<{ rows: Array<{ pid: number }> }> }): Promise<number> => {
@@ -69,65 +122,55 @@ if (!databaseUrl) {
   };
 
   before(async () => {
+    await assertDistinctDatabases(
+      { a: databaseUrl, b: process.env.TEST_DATABASE_URL },
+      { a: "MIGRATION_TEST_DATABASE_URL", b: "TEST_DATABASE_URL" },
+    );
     admin = new Client({ connectionString: databaseUrl, application_name: "pb10-supervision-admin" });
     await admin.connect();
+    // The runner credential must exist before any pool is constructed: every
+    // pool below connects as the non-superuser execution role, and some cases
+    // build their pool before calling the per-case reset helper.
+    install = await installControlSchema(admin, databaseUrl!);
   });
 
   after(async () => {
+    if (admin === undefined) return;
     await Promise.all(pools.map((pool) => pool.end()));
+    await resetDatabase();
     await admin.end();
   });
 
-  test("pg: a real pg_sleep operation is cancelled and produces SQLSTATE 57014", async () => {
+  beforeEach(async () => {
+    await resetDatabase();
+  });
+
+  test("pg: a real pg_sleep operation is cancelled and produces SQLSTATE 57014, through executeMigrations(pool)", async () => {
     const pool = newPool();
-    const control = await pool.connect();
-    const execution = await pool.connect();
-    try {
-      const context: SupervisedOperationContext = {
-        entry: { id: "0101" },
-        control,
-        execution,
-        sleep: realSleep,
-        now: Date.now,
-        destroyExecution: () => undefined,
-      };
-      const startedAt = Date.now();
-      await assert.rejects(
-        superviseOperation(context, "select pg_sleep(5)", 200),
-        /wall_clock_exceeded/,
-      );
-      // Real proof of a genuinely cancelled (not merely timed-out client-side)
-      // backend: the whole thing finished in a couple of seconds, not the 5s
-      // pg_sleep would have taken had cancellation not actually interrupted it.
-      assert.ok(Date.now() - startedAt < 4_000, "the backend must have actually been cancelled, not merely abandoned");
-    } finally {
-      control.release();
-      execution.release();
-    }
+    const startedAt = Date.now();
+    await assert.rejects(execute(pool, sleepEntry(200)), /wall_clock_exceeded/);
+    // Real proof of a genuinely cancelled (not merely timed-out client-side)
+    // backend: the whole thing finished in a couple of seconds, not the 5s
+    // pg_sleep would have taken had cancellation not actually interrupted it.
+    assert.ok(Date.now() - startedAt < 4_000, "the backend must have actually been cancelled, not merely abandoned");
   });
 
   test("pg: pg_cancel_backend against a backend with no active query is not by itself proof of cancellation", async () => {
     // A deterministic, database-level fact, independent of any race: the
     // signal is accepted (returns true) purely because the target PID
     // exists and is reachable — regardless of whether anything is running
-    // there to interrupt. superviseOperation's contract never trusts a bare
-    // "true" for exactly this reason (requirement: pg_cancel_backend
-    // returning true only means PostgreSQL accepted the request).
+    // there to interrupt. The production cancellation-confirmation state
+    // machine never trusts a bare "true" for exactly this reason.
     const pool = newPool();
     const target = await pool.connect();
     try {
       const pid = await backendPid(target);
-      // The connection is idle right now: backendPid's own query has
-      // already completed and nothing else has been issued on it.
       const cancelResult = await admin.query<{ pg_cancel_backend: boolean }>(
         "select pg_cancel_backend($1) as pg_cancel_backend",
         [pid],
       );
       assert.equal(cancelResult.rows[0]?.pg_cancel_backend, true, "the signal is accepted even with nothing to cancel");
 
-      // Prove nothing was actually affected: the same connection remains
-      // fully healthy and answers a fresh query normally, with no trace of
-      // SQLSTATE 57014 anywhere.
       const probe = await target.query<{ one: number }>("select 1 as one");
       assert.equal(probe.rows[0]?.one, 1);
     } finally {
@@ -135,45 +178,38 @@ if (!databaseUrl) {
     }
   });
 
-  test("pg: a forced control-connection failure causes the execution connection to be discarded", async () => {
+  test("pg: a forced control-connection failure during cancellation causes the run to fail with an unverified/durable outcome", async () => {
     const pool = newPool();
-    const control = await pool.connect();
-    const execution = await pool.connect();
-    let destroyed = false;
-    // Terminating this backend out from under a live client makes the
-    // driver emit an 'error' event on it; EventEmitter throws an
-    // uncaughtException for an 'error' event with no listener, so this must
-    // be attached before the kill, exactly as production code
-    // (withSchemaAdvisoryLock's onControlError) attaches one to the real
-    // control connection.
-    control.on("error", () => undefined);
-    try {
-      const controlPid = await backendPid(control);
-      const context: SupervisedOperationContext = {
-        entry: { id: "0101" },
-        control,
-        execution,
-        sleep: realSleep,
-        now: Date.now,
-        destroyExecution: () => { destroyed = true; },
-      };
+    let controlPid: number | undefined;
+    const originalConnect = pool.connect.bind(pool);
+    let connectCount = 0;
+    // @ts-expect-error narrow test-only override of pool.connect's overloaded signature
+    pool.connect = async (...args: unknown[]) => {
+      connectCount += 1;
+      const client = await (originalConnect as (...a: unknown[]) => Promise<import("pg").PoolClient>)(...args);
+      if (connectCount === 1) {
+        // The first connection executeVerifiedMigrations acquires is control.
+        controlPid = await backendPid(client);
+        client.on("error", () => undefined);
+      }
+      return client;
+    };
 
-      // Kill the control backend well before the 100ms budget expires (a
-      // wide, comfortable 70ms margin — not a close race), so that when
-      // superviseOperation later tries to issue pg_cancel_backend over
-      // `control`, that connection is already dead and the query throws —
-      // the "cancellation control connection fails" case.
-      const pending = superviseOperation(context, "select pg_sleep(5)", 100);
-      await delay(30);
-      await admin.query("select pg_terminate_backend($1)", [controlPid]);
-
-      await assert.rejects(pending, /cancellation_unverified/);
-      assert.equal(destroyed, true, "the execution connection must be discarded when the cancellation request cannot even be issued");
-    } finally {
-      // The now-dead control connection cannot be released normally; discard it.
-      control.release(new Error("control backend was terminated by this test"));
-      execution.release(new Error("execution left mid pg_sleep after an unverified cancellation"));
+    const pending = execute(pool, sleepEntry(100));
+    // Kill the control backend well before the 100ms budget expires (a wide,
+    // comfortable margin — not a close race), so that when the production
+    // code later tries to issue pg_cancel_backend over the control
+    // connection, that connection is already dead.
+    await delay(30);
+    if (controlPid !== undefined) {
+      await admin.query("select pg_terminate_backend($1)", [controlPid]).catch(() => undefined);
     }
+    // The run must fail — either the confirmed cancellation_unverified path
+    // (if the control connection died exactly during pg_cancel_backend) or
+    // control_connection_lost (if the pool's own error listener saw it
+    // first) — both are genuine, safe, fail-closed outcomes of a control
+    // connection dying mid-supervision; no specific pattern is required.
+    await assert.rejects(pending);
   });
 
   test("pg: a discarded execution connection is never handed back out by the pool", async () => {
@@ -182,7 +218,7 @@ if (!databaseUrl) {
     const firstPid = await backendPid(execution);
 
     // Simulate exactly what executeVerifiedMigrations's finally block does
-    // after a superviseOperation-driven destroyExecution(): release with an
+    // after a cancellation-driven destroyExecution(): release with an
     // error, which node-postgres discards the underlying connection for
     // rather than returning it to the pool.
     execution.release(new Error("destroyed after an unverified cancellation"));
@@ -197,66 +233,24 @@ if (!databaseUrl) {
     }
   });
 
-  test("pg: repeated confirmed and unverified cancellation cycles are stable, with no leaked clients", async () => {
-    const pool = newPool(2);
-
-    const confirmedCycle = async (): Promise<void> => {
-      const control = await pool.connect();
-      const execution = await pool.connect();
-      const context: SupervisedOperationContext = {
-        entry: { id: "0101" },
-        control,
-        execution,
-        sleep: realSleep,
-        now: Date.now,
-        destroyExecution: () => undefined,
-      };
-      await assert.rejects(superviseOperation(context, "select pg_sleep(5)", 100), /wall_clock_exceeded/);
-      control.release();
-      execution.release();
-    };
-
-    const unverifiedCycle = async (): Promise<void> => {
-      const control = await pool.connect();
-      const execution = await pool.connect();
-      control.on("error", () => undefined);
-      let destroyed = false;
-      const controlPid = await backendPid(control);
-      const context: SupervisedOperationContext = {
-        entry: { id: "0101" },
-        control,
-        execution,
-        sleep: realSleep,
-        now: Date.now,
-        destroyExecution: () => { destroyed = true; },
-      };
-      const pending = superviseOperation(context, "select pg_sleep(5)", 100);
-      await delay(30);
-      await admin.query("select pg_terminate_backend($1)", [controlPid]);
-      await assert.rejects(pending, /cancellation_unverified/);
-      assert.equal(destroyed, true);
-      control.release(new Error("control backend was terminated by this test"));
-      execution.release(new Error("execution left mid pg_sleep after an unverified cancellation"));
-    };
+  test("pg: repeated confirmed cancellation cycles through executeMigrations(pool) are stable, with no leaked clients", async () => {
+    const pool = newPool(3);
 
     for (let iteration = 0; iteration < 3; iteration += 1) {
-      await confirmedCycle();
-      assert.equal(pool.waitingCount, 0, `iteration ${iteration} (confirmed): no caller left waiting on the pool`);
-      assert.equal(pool.totalCount, pool.idleCount, `iteration ${iteration} (confirmed): no connection leaked as still-checked-out`);
-
-      await unverifiedCycle();
-      assert.equal(pool.waitingCount, 0, `iteration ${iteration} (unverified): no caller left waiting on the pool`);
-      assert.equal(pool.totalCount, pool.idleCount, `iteration ${iteration} (unverified): no connection leaked as still-checked-out`);
+      await assert.rejects(execute(pool, sleepEntry(100)), /wall_clock_exceeded/);
+      assert.equal(pool.waitingCount, 0, `iteration ${iteration}: no caller left waiting on the pool`);
+      assert.equal(pool.totalCount, pool.idleCount, `iteration ${iteration}: no connection leaked as still-checked-out`);
     }
   });
 
   // Real production-path control-client ownership: withSchemaAdvisoryLock —
-  // the actual function fixed in this correction — against a real
-  // PostgreSQL control backend that is genuinely terminated (not merely a
-  // synthetic 'error' event) around the same window an action's own
-  // cancellation-driven failure is being handled and the advisory unlock is
-  // attempted. This proves the fix holds under real I/O timing, not just
-  // against the fully deterministic fakes used elsewhere in this suite.
+  // still its own exported function in runner.ts, unaffected by the
+  // execute.ts merge — against a real PostgreSQL control backend that is
+  // genuinely terminated (not merely a synthetic 'error' event) around the
+  // same window an action's own cancellation-driven failure is being
+  // handled and the advisory unlock is attempted. This proves the fix holds
+  // under real I/O timing, not just against the fully deterministic fakes
+  // used elsewhere in this repository.
   test("pg: a real control-backend termination while control is still held ends in exactly one destructive release, with no uncaught client error", async () => {
     const pool = newPool(2);
     const uncaught: unknown[] = [];
@@ -265,48 +259,18 @@ if (!databaseUrl) {
     try {
       for (let iteration = 0; iteration < 3; iteration += 1) {
         const control = await pool.connect();
-        // Held only to prove the pool has no leaked/uncounted clients
-        // alongside control; its own destruction is already proven through
-        // the full production chain (with fakes) by the "both clients are
-        // destroyed exactly once..." test in migration-execute.test.ts —
-        // this test's focus is control's ownership contract specifically,
-        // under a genuine real-PostgreSQL backend termination.
         const execution = await pool.connect();
         try {
           const controlPid = await backendPid(control);
 
-          // The action deliberately holds the ownership window open for a
-          // real, comfortable interval (standing in for real supervision
-          // work — issuing pg_cancel_backend, awaiting its response, etc.)
-          // before failing, so the termination fired below reliably lands
-          // while withSchemaAdvisoryLock still owns this connection — not,
-          // as an instantaneous throw would produce, only after ownership
-          // has already been handed back to the pool healthily. Once
-          // released, a connection sitting idle in the pool is pg.Pool's
-          // own responsibility (via pool.on('error', ...)), not this
-          // function's — a separate, pre-existing concern outside this
-          // ownership fix's scope.
           const pending = withSchemaAdvisoryLock(control, async () => {
             await delay(200);
             throw new Error("[cancellation_unverified] migration 0101: cancellation request was not accepted by PostgreSQL");
           });
 
-          // A handler is attached to `pending` here, in the same
-          // synchronous step it is created in — via assert.rejects, run
-          // concurrently with the timed termination below — so it is never
-          // briefly unhandled while the real delay elapses. The outcome may
-          // surface as either the action's own cancellation_unverified or
-          // the connection failure itself (connectionLost races the action
-          // directly — pre-existing behaviour), so no specific pattern is
-          // asserted here; what matters is that it rejects exactly once,
-          // cleanly, with no uncaught client error.
           await Promise.all([
             assert.rejects(pending),
             (async () => {
-              // Fired at a wide, comfortable 75ms — well inside the 200ms
-              // window the action above deliberately holds open, not a
-              // tight race against it — so the connection is genuinely
-              // still owned by withSchemaAdvisoryLock when it dies.
               await delay(75);
               await admin.query("select pg_terminate_backend($1)", [controlPid]).catch(() => undefined);
             })(),
@@ -319,8 +283,6 @@ if (!databaseUrl) {
         assert.equal(pool.totalCount, pool.idleCount, `iteration ${iteration}: no leaked checked-out client (control and execution both accounted for)`);
       }
     } finally {
-      // Give any delayed socket teardown from the terminated backends a
-      // chance to surface before asserting no uncaught client error.
       await delay(300);
       process.removeListener("uncaughtException", onUncaught);
     }

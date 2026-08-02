@@ -120,25 +120,63 @@ jobs:
       - name: Apply PB-10 migration control schema
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/control/control-schema.sql
+        # PB-10 Step 3 Phase 2c: the control schema installs a two-role model
+        # and needs to be told which role the migration runner logs in as. The
+        # file also fails closed if that role does not already exist, or if it
+        # is a superuser, so the role is created first with no attributes.
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
+            do \$\$
+            begin
+              if pg_catalog.to_regrole('submitsense_migrate') is null then
+                create role submitsense_migrate login password 'submitsense_migrate';
+              end if;
+            end
+            \$\$;"
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+            -v migration_execution_role=submitsense_migrate \
+            -f db/control/control-schema.sql
+          # PB-10 Step 3 Phase 2c final review, HIGH: the one database-level
+          # privilege the migration execution role genuinely requires.
+          # db/migrations/0001_extensions_helpers.sql issues
+          # `create schema if not exists app`, and CREATE SCHEMA is authorized
+          # by CREATE on the *database* — there is no narrower grant. Omitting
+          # it is what made the canonical migration suite exit 1 under the
+          # committed environment. It conveys nothing over migration_control
+          # (owned by migration_control_owner) and does not make the role a
+          # superuser; db/README.md documents it as a deployment prerequisite,
+          # and migration-control-proof.pg.test.ts carries the negative control
+          # proving the suite fails clearly when it is absent.
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+            "grant create on database application_test to submitsense_migrate"
       - name: Verify control-schema re-application fails closed
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: |
-          if psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/control/control-schema.sql; then
+          if psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v migration_execution_role=submitsense_migrate -f db/control/control-schema.sql; then
             echo "re-application unexpectedly succeeded"
             exit 1
           fi
-          test "$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'migration_control' and c.relkind = 'r'")" = "2"
+          # Three now: the two Step-2 ledger tables plus the protected proof key.
+          test "$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'migration_control' and c.relkind = 'r'")" = "3"
       - name: Verify control-schema upgrade from the previous PB-10 installation
         run: |
           psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "create database control_schema_upgrade_test"
           UPGRADE_DB_URL="postgresql://postgres:postgres@localhost:5432/control_schema_upgrade_test"
           psql "$UPGRADE_DB_URL" -v ON_ERROR_STOP=1 -f db/control/fixtures/control-schema.pre-metadata-filename-ordinal.sql
+          psql "$UPGRADE_DB_URL" -v ON_ERROR_STOP=1 -c "
+            do \$\$
+            begin
+              if pg_catalog.to_regrole('submitsense_migrate') is null then
+                create role submitsense_migrate login password 'submitsense_migrate';
+              end if;
+            end
+            \$\$;"
           psql "$UPGRADE_DB_URL" -v ON_ERROR_STOP=1 -q \
             -c "insert into migration_control.schema_migrations (migration_id, ordinal, filename, manifest_checksum_sha256, applied_checksum_sha256, lifecycle_phase, operation_categories, execution_mode, applied_at, run_id, baselined, source_git_sha, executor_image_digest) values ('0001', 1, '0001_extensions_helpers.sql', repeat('a', 64), null, 'expand', array['schema'], 'legacy-verbatim', now(), gen_random_uuid(), true, '5324116250977b5e8ac24bc83b6cae89ebcbd990', 'sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08')" \
             -c "insert into migration_control.migration_runs (run_id, migration_id, event_sequence, event_type, metadata) values (gen_random_uuid(), '0001', 1, 'started', '{}'::jsonb)"
           before_rows="$(psql "$UPGRADE_DB_URL" -XAtq -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from migration_control.migration_runs)")"
+          export MIGRATION_EXECUTION_ROLE=submitsense_migrate
           DATABASE_URL="$UPGRADE_DB_URL" db/control/install-or-upgrade-control-schema.sh
           DATABASE_URL="$UPGRADE_DB_URL" db/control/install-or-upgrade-control-schema.sh
           DATABASE_URL="$UPGRADE_DB_URL" db/control/install-or-upgrade-control-schema.sh
@@ -153,9 +191,18 @@ jobs:
           fi
           grep -q "mr_metadata_ck" /tmp/upgrade-reject.err
           psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "drop database control_schema_upgrade_test with (force)"
+      - name: Verify install, upgrade, role model and fresh/upgraded parity
+        # PB-10 Step 3 Phase 2c: the durable regression for the two paths the
+        # review found diverging. Covers a fresh install, every fail-closed
+        # install case, a genuine pre-Phase-2c installation owned by the
+        # migration runner itself, three consecutive upgrades, one-for-one row
+        # preservation, and a full catalog comparison of fresh vs upgraded.
+        run: |
+          ADMIN_DATABASE_URL="$ADMIN_DATABASE_URL" db/control/test-install-upgrade-parity.sh
       - name: Verify the upgrade resists search_path spoofing
         run: |
           psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "create database search_path_spoof_test"
+          MIGRATION_EXECUTION_ROLE=submitsense_migrate \
           PGDATABASE_URL="postgresql://postgres:postgres@localhost:5432/search_path_spoof_test" \
             db/control/test-hostile-search-path.sh
           psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "drop database search_path_spoof_test with (force)"
@@ -169,6 +216,39 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/test/test_migration_control.sql
+      - name: Test commit-proof and transaction-binding contracts against real PostgreSQL
+        env:
+          # Both credentials: this suite reinstalls migration_control for every
+          # case, so its before() runs the same distinct-database guard as
+          # test:pg:migration before any destructive statement.
+          MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
+        # Counts asserted, not merely exit status: a suite that dies in
+        # before(), or silently skips, must fail this step rather than quietly
+        # removing the C1/C2 coverage it exists to provide.
+        run: |
+          set -o pipefail
+          npm run test:pg:proof --prefix backend 2>&1 | tee /tmp/pg-proof.log
+          grep -qx '# fail 0' /tmp/pg-proof.log
+          grep -qx '# skipped 0' /tmp/pg-proof.log
+          grep -qx '# pass 17' /tmp/pg-proof.log
+      - name: Test H2 mode-specific safe recovery against real PostgreSQL
+        env:
+          # Both credentials: this suite reinstalls migration_control for every
+          # case, so its before() runs the same distinct-database guard as
+          # test:pg:migration before any destructive statement.
+          MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
+        # PB-10 Step 3 Phase 2c HIGH 2. Counts asserted, not merely exit
+        # status: a suite that dies in before(), or silently skips, must fail
+        # this step rather than quietly removing the two-stage recovery
+        # coverage it exists to provide.
+        run: |
+          set -o pipefail
+          npm run test:pg:h2-recovery --prefix backend 2>&1 | tee /tmp/pg-h2.log
+          grep -qx '# fail 0' /tmp/pg-h2.log
+          grep -qx '# skipped 0' /tmp/pg-h2.log
+          grep -qx '# pass 22' /tmp/pg-h2.log
       - name: Test read-only migration plan
         # Pure unit test of runner.ts's plan-building logic; no database
         # credential of any kind reaches this step.
@@ -176,32 +256,53 @@ jobs:
         working-directory: backend
       - name: Verify real migration plan is read-only
         env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
+          # PB-10 Step 3 Phase 2c: the plan connects as the *migration
+          # execution role*, not as the superuser. runner.ts refuses a
+          # superuser connection outright — a superuser bypasses every
+          # privilege the commit-proof design relies on — so running this step
+          # with the admin credential would fail closed by design and would
+          # also prove nothing about the role migrations actually run as.
+          DATABASE_URL: postgresql://submitsense_migrate:submitsense_migrate@localhost:5432/application_test
+          ADMIN_PLAN_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: |
-          before="$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from migration_control.migration_runs)")"
+          before="$(psql "$ADMIN_PLAN_DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from migration_control.migration_runs)")"
           npm run --silent migrate:plan --prefix backend > /tmp/migration-plan.json
-          after="$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from migration_control.migration_runs)")"
+          after="$(psql "$ADMIN_PLAN_DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from migration_control.migration_runs)")"
           test "$before" = "0:0"
           test "$after" = "$before"
           node -e 'const plan = require("/tmp/migration-plan.json"); if (plan.pendingCount !== 24) process.exit(1)'
       - name: Verify plan fails closed on legacy ledger divergence
         env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
+          # As above: the plan runs as the migration execution role.
+          DATABASE_URL: postgresql://submitsense_migrate:submitsense_migrate@localhost:5432/application_test
+          ADMIN_PLAN_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: |
-          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
+          psql "$ADMIN_PLAN_DATABASE_URL" -v ON_ERROR_STOP=1 -q \
             -c "create table public.infrastructure_schema_migrations (filename text primary key, applied_at timestamptz not null default now())" \
-            -c "insert into public.infrastructure_schema_migrations(filename) values ('0001_extensions_helpers.sql')"
+            -c "insert into public.infrastructure_schema_migrations(filename) values ('0001_extensions_helpers.sql')" \
+            -c "grant select on public.infrastructure_schema_migrations to submitsense_migrate"
           if npm run --silent migrate:plan --prefix backend > /tmp/divergence.json 2>/tmp/divergence.err; then
             echo "plan unexpectedly succeeded against an unbaselined legacy ledger"
             exit 1
           fi
           grep -q "Legacy migration ledger public.infrastructure_schema_migrations" /tmp/divergence.err
-          test "$(psql "$DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from public.infrastructure_schema_migrations)")" = "0:1"
-          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c "drop table public.infrastructure_schema_migrations"
+          test "$(psql "$ADMIN_PLAN_DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from public.infrastructure_schema_migrations)")" = "0:1"
+          psql "$ADMIN_PLAN_DATABASE_URL" -v ON_ERROR_STOP=1 -q -c "drop table public.infrastructure_schema_migrations"
       - name: Test migration execution modes
         # Pure unit test of execute.ts against an in-memory fake pool; no
         # database credential of any kind reaches this step.
         run: node --import tsx --test test/migration-execute.test.ts
+        working-directory: backend
+      - name: Test H1 ERROR_CLASSES runtime and declaration compatibility
+        # PB-10 Step 3 Phase 2c HIGH 1. Pure unit test, including against the
+        # emitted execute.d.ts; no database credential reaches this step.
+        # Counted, so a suite that silently stops running fails CI.
+        run: |
+          set -o pipefail
+          node --import tsx --test test/migration-error-class-compatibility.test.ts 2>&1 | tee /tmp/h1.log
+          grep -qx '# fail 0' /tmp/h1.log
+          grep -qx '# skipped 0' /tmp/h1.log
+          grep -qx '# pass 3' /tmp/h1.log
         working-directory: backend
       - name: Test migration execution against real PostgreSQL
         env:
@@ -215,11 +316,23 @@ jobs:
         run: npm run test:pg:migration --prefix backend
       - name: Test cancellation-confirmation hardening against real PostgreSQL
         env:
-          # Only the migration credential: these tests supervise a single
-          # statement in isolation (no migration_control install, no
-          # application schema touched), so they need no TEST_DATABASE_URL.
+          # Both credentials, deliberately: this suite drops and reinstalls
+          # migration_control (and drops/recreates public) before every case,
+          # so its before() runs the same database-identity guard as
+          # test:pg:migration — which must see both URLs to prove they name
+          # different physical databases. Supplying only the migration
+          # credential makes every case fail in before/setup.
           MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
-        run: npm run test:pg:supervision --prefix backend
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
+        # The counts are asserted, not merely the exit status: a suite that
+        # dies in before(), or silently skips, must fail this step rather than
+        # quietly removing its own coverage.
+        run: |
+          set -o pipefail
+          npm run test:pg:supervision --prefix backend 2>&1 | tee /tmp/pg-supervision.log
+          grep -qx '# pass 6' /tmp/pg-supervision.log
+          grep -qx '# fail 0' /tmp/pg-supervision.log
+          grep -qx '# skipped 0' /tmp/pg-supervision.log
       - name: Test whole-migration wall-clock supervision against real PostgreSQL
         env:
           # Both credentials, deliberately: like test:pg:migration, this
@@ -238,6 +351,32 @@ jobs:
           MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
           TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: npm run test:pg:batched --prefix backend
+      - name: Test ambiguous post-COMMIT connection failure against real PostgreSQL
+        env:
+          # Both credentials, deliberately: like test:pg:migration, this
+          # suite installs and drops migration_control every case, so it
+          # requires the same distinct-database safety proof before any
+          # destructive statement runs.
+          MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
+          # The explicit-password credential-preservation regression only runs
+          # when this is supplied, and it needs a role whose pg_hba.conf rule
+          # genuinely enforces password authentication — otherwise a dropped
+          # password would silently "work" under trust auth and the case would
+          # prove nothing. This service container sets POSTGRES_PASSWORD and
+          # leaves POSTGRES_HOST_AUTH_METHOD unset, so every host (TCP)
+          # connection is scram-sha-256 authenticated; the test itself proves
+          # that by asserting a password-stripped connect is rejected.
+          PB10_PASSWORD_AUTH_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
+        # Zero skips asserted explicitly: a missing/renamed variable would
+        # otherwise silently downgrade the password-authentication regression
+        # to a skip while the step still went green.
+        run: |
+          set -o pipefail
+          npm run test:pg:commit-ambiguity --prefix backend 2>&1 | tee /tmp/pg-commit-ambiguity.log
+          grep -qx '# fail 0' /tmp/pg-commit-ambiguity.log
+          grep -qx '# skipped 0' /tmp/pg-commit-ambiguity.log
+          grep -q 'explicit host/user/password credentials' /tmp/pg-commit-ambiguity.log
       - name: Test application/migration database identity guard
         env:
           # Both credentials, deliberately: this suite's entire purpose is to
