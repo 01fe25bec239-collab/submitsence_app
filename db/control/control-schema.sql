@@ -67,10 +67,23 @@
 -- exists to prevent.
 -- ══════════════════════════════════════════════════════════════════════════
 
+-- `\quit 1` looks like it exits 1; it does not. psql's \quit has never taken
+-- an argument in any supported version — it warns "extra argument \"1\"
+-- ignored" and exits **0**. A caller that forgot -v migration_execution_role
+-- therefore saw a successful exit and an uninstalled schema. The failure has
+-- to come from the server, which ON_ERROR_STOP turns into a non-zero exit on
+-- every psql version; ON_ERROR_STOP is forced here so the guard holds even if
+-- the caller omitted it.
 \if :{?migration_execution_role}
 \else
-\echo 'ERROR: -v migration_execution_role=<role> is required; see db/README.md'
-\quit 1
+\set ON_ERROR_STOP on
+do $missing_execution_role$
+begin
+  raise exception using
+    errcode = '22023',
+    message = '-v migration_execution_role=<role> is required; see db/README.md';
+end
+$missing_execution_role$;
 \endif
 
 begin;

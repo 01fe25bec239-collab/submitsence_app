@@ -44,6 +44,30 @@ ROLLBACK_DB=pb10_parity_rollback
 RUNNER=pb10_parity_runner
 SUPER_RUNNER=pb10_parity_superrunner
 ADMIN=pb10_parity_admin
+# A role with no relationship to the control schema at all, used only to prove
+# the historical-ownership assertion rejects a third-party owner and not just
+# the administrator.
+OUTSIDER=pb10_parity_outsider
+
+# The historical (pre-Phase-2c) control schema, pinned by commit exactly like
+# test-fixture-integrity.sh pins its own frozen fixture.
+#
+# This used to be extracted from HEAD. That silently stopped being a
+# *historical* schema the moment Phase 2c was committed: HEAD then was the
+# Phase 2c schema, which refuses to install without -v
+# migration_execution_role — and refused via `\quit 1`, which exits 0. So the
+# fixture installed nothing, the install appeared to succeed, and every
+# ownership assertion below ran against an empty database. Pinning the sha
+# makes the fixture independent of whichever commit the test runs from.
+PHASE2B_COMMIT=edd14b63fb44b2880630ddecf575df005176d529
+
+# Object count of that pinned schema: the schema, both ledger tables, the
+# bigserial sequence owned by migration_runs, and its two functions (one of
+# them the trigger function). Pinned like the fixture is: a fixture frozen at
+# a commit cannot grow objects, so a mismatch means the fixture is not what
+# this test thinks it is.
+PHASE2B_OBJECT_COUNT=6
+
 work="$(mktemp -d)"
 
 admin() { psql "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -XAtq "$@"; }
@@ -84,7 +108,7 @@ cleanup() {
   # migration_control_owner is deliberately NOT dropped: it is cluster-wide and
   # may own control schemas in databases this script never touched, so dropping
   # it would break unrelated installations on a shared cluster.
-  for role in "$RUNNER" "$SUPER_RUNNER" "$ADMIN"; do
+  for role in "$RUNNER" "$SUPER_RUNNER" "$ADMIN" "$OUTSIDER"; do
     psql "$ADMIN_DATABASE_URL" -XAtq -c "revoke all on function pg_catalog.pg_xact_status(xid8) from $role" >/dev/null 2>&1
     psql "$ADMIN_DATABASE_URL" -XAtq -c "drop role if exists $role" >/dev/null 2>&1
   done
@@ -95,6 +119,54 @@ trap cleanup EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "  ok: $*" >&2; }
+
+# Owner of every object the Phase 2b recognition logic considers — the schema,
+# both ledger tables, every sequence (linked or free) and every function,
+# which includes the trigger function. Returns "<total>:<non-conforming>".
+#
+# :expected is interpolated by psql, which quotes the role name safely
+# whatever characters it contains. It has to be read from a file: psql
+# performs variable interpolation on -f input but NOT on -c strings.
+cat > "$work/owners-of.sql" <<'OWNEDBY'
+select count(*) || ':' ||
+       coalesce(string_agg(ident || '=' || owner, ',' order by ident)
+                  filter (where owner is distinct from :'expected'), '')
+  from (
+    select 'schema migration_control' as ident,
+           pg_catalog.pg_get_userbyid(nspowner) as owner
+      from pg_catalog.pg_namespace where nspname = 'migration_control'
+    union all
+    select c.relkind::text || ' ' || c.relname, pg_catalog.pg_get_userbyid(c.relowner)
+      from pg_catalog.pg_class c
+      join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'migration_control' and c.relkind in ('r', 'p', 'S')
+    union all
+    select 'function ' || p.proname, pg_catalog.pg_get_userbyid(p.proowner)
+      from pg_catalog.pg_proc p
+      join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'migration_control'
+  ) s
+OWNEDBY
+
+control_object_count() { local s; s="$(admin_db "$1" -v expected='' -f "$work/owners-of.sql")"; echo "${s%%:*}"; }
+
+# Assert every control-schema object is owned by $2, and that there are as
+# many of them as there should be — without an expected count, an empty
+# database (nothing installed) reports zero strays and would pass.
+#
+# The comparison is deliberately made in the shell from `psql -At` output.
+# psql's \quit accepts no argument on any supported version — `\quit 1` warns
+# and exits 0 — so an in-SQL quit could not fail this check at all.
+assert_control_owned_by() { # database role context expected_count
+  local snapshot total strays
+  snapshot="$(admin_db "$1" -v expected="$2" -f "$work/owners-of.sql")"
+  total="${snapshot%%:*}"
+  strays="${snapshot#*:}"
+  test "$total" = "$4" \
+    || fail "$3: migration_control holds $total objects, expected $4 — nothing, or not everything, was installed"
+  test -z "$strays" \
+    || fail "$3: not owned by $2: $strays"
+}
 
 # ── roles and databases ───────────────────────────────────────────────────
 echo "preparing disposable roles and databases..." >&2
@@ -119,6 +191,7 @@ done
 admin -c "create role $RUNNER login password 'runner'" >/dev/null
 admin -c "create role $SUPER_RUNNER login superuser password 'runner'" >/dev/null
 admin -c "create role $ADMIN login createrole password 'admin'" >/dev/null
+admin -c "create role $OUTSIDER nologin" >/dev/null
 
 # On a cluster where migration_control_owner already exists — because another
 # database here already has a control schema — a CREATEROLE installer has no
@@ -185,6 +258,26 @@ grep -q "GRANT EXECUTE ON FUNCTION pg_catalog.pg_xact_status" "$work/noxact.log"
   || fail "the refusal must name the exact superuser remedy"
 ok "an unsatisfiable pg_xact_status grant fails closed with an actionable remedy"
 
+# The missing-variable guard must exit NON-ZERO. It used to be `\quit 1`,
+# which no supported psql version accepts an argument to: psql warns "extra
+# argument \"1\" ignored" and exits 0, so a caller that forgot the variable
+# saw a successful install that had created nothing. Both files are checked,
+# with and without ON_ERROR_STOP, since the guard now forces it on itself.
+for guarded in control-schema.sql control-schema-upgrade.sql; do
+  for stop in 1 0; do
+    if as_admin "$GUARD_DB" -q -v ON_ERROR_STOP="$stop" -f "$script_dir/$guarded" \
+         >"$work/norole.log" 2>&1; then
+      fail "$guarded without -v migration_execution_role exited 0 (ON_ERROR_STOP=$stop); it must fail closed"
+    fi
+    grep -q "migration_execution_role=<role> is required" "$work/norole.log" \
+      || fail "$guarded gave the wrong refusal for a missing execution role: $(tail -2 "$work/norole.log")"
+    if grep -qi "extra argument" "$work/norole.log"; then
+      fail "$guarded still refuses through a psql meta-command argument psql ignores"
+    fi
+  done
+done
+ok "both schema files refuse a missing migration_execution_role with a non-zero exit, not an ignored \\quit argument"
+
 # ── 3. the fresh installation's role model ────────────────────────────────
 echo "3. the execution role's actual capabilities on a fresh install" >&2
 separation="$(as_runner "$FRESH_DB" -Atq -c "
@@ -202,12 +295,45 @@ ok "not a superuser, not an owner, no applied INSERT, no binding write, no proof
 
 # ── 4. a genuine pre-Phase-2c installation, owned by the runner ───────────
 echo "4. historical installation, owned by the migration runner itself" >&2
-git -C "$repo_root" show HEAD:db/control/control-schema.sql > "$work/historical.sql" \
-  || fail "could not extract the historical control schema from HEAD"
+git -C "$repo_root" show "$PHASE2B_COMMIT:db/control/control-schema.sql" > "$work/historical.sql" \
+  || fail "could not extract the pinned historical control schema from $PHASE2B_COMMIT"
+# The pinned file must genuinely predate role separation. Without this, a
+# fixture that quietly became the *current* schema would install nothing (the
+# current schema refuses to install without -v migration_execution_role) and
+# leave the assertions below looking at an empty database.
+if grep -q 'migration_execution_role' "$work/historical.sql"; then
+  fail "$PHASE2B_COMMIT:db/control/control-schema.sql is not a pre-role-separation schema; the historical fixture is pinned to the wrong commit"
+fi
+
+# Created through an authenticated connection AS the migration runner, so its
+# ownership comes from the connected role and not from the administrative
+# connection, the shell environment or whichever role happens to be the
+# default login.
 as_runner "$UPGRADED_DB" -q -f "$work/historical.sql" >/dev/null
-test "$(admin_db "$UPGRADED_DB" -c "select pg_get_userbyid(nspowner) from pg_namespace where nspname='migration_control'")" = "$RUNNER" \
-  || fail "the historical installation should be owned by the migration runner"
-ok "historical schema installed and owned by the runner (the forgeable model)"
+assert_control_owned_by "$UPGRADED_DB" "$RUNNER" "the historical installation" "$PHASE2B_OBJECT_COUNT"
+ok "all $PHASE2B_OBJECT_COUNT historical objects — schema, both ledger tables, the linked sequence and both functions — are owned by the runner (the forgeable model)"
+
+# The assertion itself, proven rather than trusted: it must reject an object
+# owned by the administrator, and one owned by a role with no relationship to
+# the schema at all. Each is moved and moved straight back, so the fixture the
+# upgrade below runs against is exactly the one just asserted.
+for usurper in "$(admin -c 'select current_user')" "$OUTSIDER"; do
+  admin_db "$UPGRADED_DB" -c "alter table migration_control.schema_migrations owner to $usurper" >/dev/null
+  if (assert_control_owned_by "$UPGRADED_DB" "$RUNNER" "negative case" "$PHASE2B_OBJECT_COUNT") 2>/dev/null; then
+    fail "the ownership assertion accepted schema_migrations owned by $usurper"
+  fi
+  admin_db "$UPGRADED_DB" -c "alter table migration_control.schema_migrations owner to $RUNNER" >/dev/null
+done
+# And it must reject an installation that is not there at all. GUARD_DB has no
+# control schema — every install into it above was refused — which is the
+# exact shape of the failure `\quit 1` used to hide: a fixture that installed
+# nothing, exited 0, and left an empty schema no ownership query could object
+# to.
+if (assert_control_owned_by "$GUARD_DB" "$RUNNER" "negative case" "$PHASE2B_OBJECT_COUNT") 2>/dev/null; then
+  fail "the ownership assertion accepted a database with no historical installation"
+fi
+assert_control_owned_by "$UPGRADED_DB" "$RUNNER" "the restored historical installation" "$PHASE2B_OBJECT_COUNT"
+ok "the assertion rejects an administrator-owned, third-party-owned or absent installation, and exits non-zero doing it"
 
 as_runner "$UPGRADED_DB" -q -c "
 insert into migration_control.schema_migrations
@@ -300,6 +426,15 @@ upgraded_separation="$(as_runner "$UPGRADED_DB" -Atq -c "
 test "$upgraded_separation" = "$separation" \
   || fail "upgraded role model differs from fresh: $upgraded_separation vs $separation"
 ok "the runner that used to own this schema now has exactly the fresh-install privilege set"
+
+# Ownership, not merely privileges: every object the runner owned before the
+# upgrade — including the linked sequence and the trigger function — now
+# belongs to migration_control_owner, and the runner owns none of them. The
+# expected count comes from the fresh install rather than a second pinned
+# constant; case 8 below proves the two schemas are identical anyway.
+assert_control_owned_by "$UPGRADED_DB" migration_control_owner \
+  "after the upgrade" "$(control_object_count "$FRESH_DB")"
+ok "every object transferred to migration_control_owner; the runner owns none of them"
 
 # ── 8. full catalog parity ────────────────────────────────────────────────
 echo "8. fresh and upgraded schemas are identical" >&2

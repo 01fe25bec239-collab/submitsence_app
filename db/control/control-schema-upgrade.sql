@@ -58,10 +58,19 @@
 -- Everything needing the role name inside a body reads it from a
 -- transaction-local GUC set at top level instead.
 
+-- See the identical guard in control-schema.sql: `\quit 1` warns and exits 0
+-- on every supported psql, so the refusal has to be a server-side error that
+-- ON_ERROR_STOP turns into a non-zero exit.
 \if :{?migration_execution_role}
 \else
-\echo 'ERROR: -v migration_execution_role=<role> is required; see db/README.md'
-\quit 1
+\set ON_ERROR_STOP on
+do $missing_execution_role$
+begin
+  raise exception using
+    errcode = '22023',
+    message = '-v migration_execution_role=<role> is required; see db/README.md';
+end
+$missing_execution_role$;
 \endif
 
 begin;
