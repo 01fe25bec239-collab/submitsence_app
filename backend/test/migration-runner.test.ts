@@ -16,7 +16,6 @@ import {
   renderMigrationPlan,
   runMigrationPlan,
   verifyControlSchema,
-  withSchemaAdvisoryLock,
   type AppliedMigrationRow,
 } from "../src/db/migrate/runner";
 
@@ -134,6 +133,8 @@ test("rendered plans contain operational metadata but no SQL or connection secre
 type QueryResult = { rows: unknown[]; rowCount: number | null };
 
 class LockClient extends EventEmitter {
+  /** Real node-postgres exposes this plain-object named-query cache. */
+  readonly connection = { parsedStatements: {} as Record<string, string> };
   readonly events: string[] = [];
   readonly queries: Array<{ sql: string; values?: unknown[] }> = [];
   probes: boolean[] = [true];
@@ -189,6 +190,28 @@ class LockClient extends EventEmitter {
         if (this.unlockError) throw this.unlockError;
         return { rows: [{ unlocked: this.unlockResult }], rowCount: 1 };
       }
+      // PB-10 Step 3 Phase 2d: the terminal lifecycle boundary's reset
+      // sequence. Recorded as events in its own right so every ordering
+      // assertion below reads the reset relative to `unlock` and `release`
+      // rather than having it filtered out of sight — the whole point is that
+      // it lands *after* the advisory unlock (DISCARD ALL would otherwise drop
+      // this run's schema lock through pg_advisory_unlock_all(), replacing
+      // Phase 2c's asserted unlock with an unproven one) and *before* release.
+      if (sql === "rollback") {
+        this.events.push("reset-rollback");
+        if (this.failResetRollback) throw this.failResetRollback;
+        return { rows: [], rowCount: null };
+      }
+      if (sql === "discard all") {
+        this.events.push("reset-discard");
+        if (this.failReset) throw this.failReset;
+        if (this.hangReset) return new Promise<QueryResult>(() => undefined);
+        return { rows: [], rowCount: null };
+      }
+      if (sql.includes("dirty_settings")) {
+        this.events.push("reset-proof");
+        return { rows: [this.resetBaseline], rowCount: 1 };
+      }
       throw new Error(`unexpected query: ${sql}`);
     } finally {
       this.activeQueries -= 1;
@@ -197,11 +220,56 @@ class LockClient extends EventEmitter {
 
   gateUnlock = false;
 
+  /**
+   * PB-10 Step 3 Phase 2d: drives the reset-versus-destroy decision. Any of
+   * these must produce a destructive release — a session whose reset could not
+   * be completed and proven is never handed to another borrower.
+   */
+  failResetRollback: Error | undefined;
+  failReset: Error | undefined;
+  hangReset = false;
+  resetBaseline: Record<string, string | boolean> = {
+    dirty_settings: "0",
+    advisory_locks: "0",
+    listens: "0",
+    prepared_statements: "0",
+    cursors: "0",
+    temp_objects: "0",
+    role_baseline: true,
+  };
+
   release(error?: Error): void {
+    // pg-pool throws on a second release; the fake must too, or "exactly one
+    // terminal disposition" would be an assertion about nothing.
+    assert.equal(this.releaseCount, 0, "the client was released twice");
     this.releasedWith = error;
     this.releaseCount += 1;
     this.events.push(error ? "release-error" : "release");
   }
+}
+
+/**
+ * PB-10 Step 3 Phase 2d, HIGH 1: the schema-lock lifecycle boundary and the
+ * client disposer it owns are module-private implementation details of
+ * execute.ts — no runtime export and no emitted declaration hands either of
+ * them to a caller. Every scenario below therefore reaches the boundary the
+ * only way production can: through `runMigrationPlan(pool)`, the approved
+ * read-only plan entry point, whose action runs inside the lock exactly as the
+ * executor's does.
+ *
+ * The behavior a case used to supply as its own action callback is injected at
+ * `PlanClient.actionHook` instead — fired at the precise point inside the real
+ * plan action where the old callback ran, once the lock is held and the
+ * control schema has verified. Injection point changed; every assertion did
+ * not.
+ */
+function poolOf(client: LockClient): Pool {
+  return { connect: async () => client as unknown as PoolClient } as unknown as Pool;
+}
+
+/** Runs the real plan path under the real lifecycle boundary. */
+function plan(client: LockClient, options: Record<string, unknown> = {}): Promise<unknown> {
+  return runMigrationPlan(poolOf(client), { manifest, ...options });
 }
 
 /** Fails if an uncaughtException or unhandledRejection fires while `run` executes. */
@@ -224,25 +292,24 @@ async function withStrictProcessErrors<T>(run: () => Promise<T>): Promise<T> {
 }
 
 test("schema lock uses exact keys and unlocks before normal release", async () => {
-  const client = new LockClient();
-  const result = await withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
-    client.events.push("action");
-    return 7;
-  });
-  assert.equal(result, 7);
-  assert.deepEqual(client.events, ["probe", "action", "unlock", "release"]);
+  const client = new PlanClient();
+  client.actionHook = () => { client.events.push("action"); };
+  const result = await plan(client);
+  assert.equal((result as { pendingCount: number }).pendingCount, 24);
+  assert.deepEqual(client.events, ["probe", "action", "unlock", "reset-rollback", "reset-discard", "reset-proof", "release"],
+    "PB-10 Step 3 Phase 2d: the reset runs after the advisory unlock and before the client is returned");
 });
 
 test("lock contention retries sequentially with bounded injectable timing", async () => {
-  const client = new LockClient();
+  const client = new PlanClient();
   client.probes = [false, false, true];
   let clock = 0;
   const sleeps: number[] = [];
-  await withSchemaAdvisoryLock(client as unknown as PoolClient, async () => undefined, {
+  await plan(client, {
     pollMs: 5,
     budgetMs: 20,
     now: () => clock,
-    sleep: async (milliseconds) => {
+    sleep: async (milliseconds: number) => {
       sleeps.push(milliseconds);
       clock += milliseconds;
     },
@@ -254,15 +321,15 @@ test("lock contention retries sequentially with bounded injectable timing", asyn
 });
 
 test("lock timeout is bounded and still releases a non-lock-bearing client", async () => {
-  const client = new LockClient();
+  const client = new PlanClient();
   client.probes = [false, false, false, false];
   let clock = 0;
   await assert.rejects(
-    withSchemaAdvisoryLock(client as unknown as PoolClient, async () => undefined, {
+    plan(client, {
       pollMs: 5,
       budgetMs: 12,
       now: () => clock,
-      sleep: async (milliseconds) => { clock += milliseconds; },
+      sleep: async (milliseconds: number) => { clock += milliseconds; },
       diagnose: () => undefined,
     }),
     /within 12ms/,
@@ -273,7 +340,7 @@ test("lock timeout is bounded and still releases a non-lock-bearing client", asy
 });
 
 test("contention diagnostics expose bounded classifications, never raw query text", async () => {
-  const client = new LockClient();
+  const client = new PlanClient();
   client.probes = [false, true];
   client.diagnostics = [{
     holder_pid: 42,
@@ -286,7 +353,7 @@ test("contention diagnostics expose bounded classifications, never raw query tex
     command_summary: "database command",
   }];
   const seen: unknown[] = [];
-  await withSchemaAdvisoryLock(client as unknown as PoolClient, async () => undefined, {
+  await plan(client, {
     pollMs: 1,
     budgetMs: 2,
     now: (() => {
@@ -294,7 +361,7 @@ test("contention diagnostics expose bounded classifications, never raw query tex
       return () => clock++;
     })(),
     sleep: async () => undefined,
-    diagnose: (holders) => seen.push(holders),
+    diagnose: (holders: unknown) => seen.push(holders),
   });
   const rendered = JSON.stringify(seen);
   assert.match(rendered, /holder_pid/);
@@ -303,20 +370,15 @@ test("contention diagnostics expose bounded classifications, never raw query tex
 });
 
 test("control-connection loss aborts and destroys the client", async () => {
-  const client = new LockClient();
-  await assert.rejects(
-    // PB-10 Step 3 Phase 2c: a lost connection no longer cuts the action
-    // short — ownership cannot end while the action may still be performing
-    // mandatory durable persistence (see the ownership test below). The
-    // action here therefore completes on its own, without reporting a
-    // failure of its own, which is exactly the case where the connection
-    // failure is the outcome the caller must see.
-    withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
-      client.emit("error", new Error("control connection lost"));
-      await Promise.resolve();
-    }),
-    /control connection lost/,
-  );
+  const client = new PlanClient();
+  // PB-10 Step 3 Phase 2c: a lost connection no longer cuts the action
+  // short — ownership cannot end while the action may still be performing
+  // mandatory durable persistence (see the ownership test below). The
+  // action here therefore completes on its own, without reporting a
+  // failure of its own, which is exactly the case where the connection
+  // failure is the outcome the caller must see.
+  client.actionHook = () => { client.emit("error", new Error("control connection lost")); };
+  await assert.rejects(plan(client), /control connection lost/);
   assert.match(client.releasedWith?.message ?? "", /control connection lost/);
   assert.ok(!client.events.includes("unlock"));
 });
@@ -344,19 +406,20 @@ const OWNERSHIP_HOLD_MS = Number(process.env.PB10_OWNERSHIP_HOLD_MS ?? 250);
 
 test("ownership: a lost connection never returns, unlocks, or releases while the action is still persisting", async () => {
   await withStrictProcessErrors(async () => {
-    const client = new LockClient();
+    const client = new PlanClient();
     let persist!: () => void;
     const persisted = new Promise<void>((resolve) => { persist = resolve; });
     let settled = false;
 
-    const pending = withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
+    client.actionHook = async () => {
       // The connection dies the moment the action starts; the durable append
       // it must still complete does not depend on this connection.
       client.emit("error", new Error("connection reset by peer"));
       await persisted;
       client.events.push("marker-persisted");
       throw new Error("[commit_outcome_unknown] migration 0100: COMMIT outcome could not be confirmed");
-    });
+    };
+    const pending = plan(client);
     pending.then(() => { settled = true; }, () => { settled = true; });
 
     const heldUntil = Date.now() + OWNERSHIP_HOLD_MS;
@@ -384,11 +447,11 @@ test("ownership: a lost connection never returns, unlocks, or releases while the
 
 test("unlock false and unlock errors destroy the pinned client", async () => {
   for (const failure of ["false", "error"] as const) {
-    const client = new LockClient();
+    const client = new PlanClient();
     if (failure === "false") client.unlockResult = false;
     else client.unlockError = new Error("unlock query failed");
     await assert.rejects(
-      withSchemaAdvisoryLock(client as unknown as PoolClient, async () => undefined),
+      plan(client),
       failure === "false" ? /returned false/ : /unlock query failed/,
     );
     assert.ok(client.releasedWith instanceof Error);
@@ -397,15 +460,13 @@ test("unlock false and unlock errors destroy the pinned client", async () => {
 });
 
 test("plan action failures still unlock before release", async () => {
-  const client = new LockClient();
-  await assert.rejects(
-    withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
-      client.events.push("plan-failed");
-      throw new Error("catalog drift");
-    }),
-    /catalog drift/,
-  );
-  assert.deepEqual(client.events, ["probe", "plan-failed", "unlock", "release"]);
+  const client = new PlanClient();
+  client.actionHook = () => {
+    client.events.push("plan-failed");
+    throw new Error("catalog drift");
+  };
+  await assert.rejects(plan(client), /catalog drift/);
+  assert.deepEqual(client.events, ["probe", "plan-failed", "unlock", "reset-rollback", "reset-discard", "reset-proof", "release"]);
 });
 
 async function waitUntil(predicate: () => boolean, description: string): Promise<void> {
@@ -430,13 +491,12 @@ async function waitUntil(predicate: () => boolean, description: string): Promise
 // that withSchemaAdvisoryLock performs afterward.
 test("ownership: cancellation query rejects first, then a late client 'error' event during a still-pending unlock", async () => {
   await withStrictProcessErrors(async () => {
-    const client = new LockClient();
+    const client = new PlanClient();
     client.gateUnlock = true;
     const queryFailure = new Error("[cancellation_unverified] migration 0101: cancellation request was not accepted by PostgreSQL");
 
-    const pending = withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
-      throw queryFailure;
-    });
+    client.actionHook = () => { throw queryFailure; };
+    const pending = plan(client);
 
     await waitUntil(() => client.unlockStarted, "unlock query to be issued");
     client.emit("error", new Error("terminating connection due to administrator command"));
@@ -456,14 +516,13 @@ test("ownership: cancellation query rejects first, then a late client 'error' ev
 
 test("ownership: cancellation query rejects first, then the unlock attempt itself fails from socket termination", async () => {
   await withStrictProcessErrors(async () => {
-    const client = new LockClient();
+    const client = new PlanClient();
     client.gateUnlock = true;
     client.unlockError = new Error("Connection terminated unexpectedly");
     const queryFailure = new Error("[cancellation_unverified] migration 0101: cancellation request was not accepted by PostgreSQL");
 
-    const pending = withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
-      throw queryFailure;
-    });
+    client.actionHook = () => { throw queryFailure; };
+    const pending = plan(client);
 
     await waitUntil(() => client.unlockStarted, "unlock query to be issued");
     client.emit("error", new Error("terminating connection due to administrator command"));
@@ -487,7 +546,7 @@ test("ownership: cancellation query rejects first, then the unlock attempt itsel
 
 test("ownership: a control 'error' event occurs before the cancellation query itself rejects", async () => {
   await withStrictProcessErrors(async () => {
-    const client = new LockClient();
+    const client = new PlanClient();
     // PB-10 Step 3 Phase 2c: connectionLost is still raced against the
     // action, but winning that race no longer *returns* — it only stops
     // waiting on a connection that can no longer answer. The action keeps
@@ -497,11 +556,12 @@ test("ownership: a control 'error' event occurs before the cancellation query it
     // error, is what knows whether the replay guard was armed and what the
     // run actually ended on. The connection failure is not discarded — it is
     // what drives the destructive release asserted below.
-    const pending = withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
+    client.actionHook = async () => {
       client.emit("error", new Error("connection reset by peer"));
       await Promise.resolve();
       throw new Error("[cancellation_unverified] migration 0101: cancellation request was not accepted by PostgreSQL");
-    });
+    };
+    const pending = plan(client);
 
     await assert.rejects(pending, /cancellation_unverified/);
     assert.ok(!client.events.includes("unlock"), "an already-uncertain connection must never be depended on for a healthy unlock");
@@ -513,13 +573,14 @@ test("ownership: a control 'error' event occurs before the cancellation query it
 
 test("ownership: an ordinary non-connection cancellation-query error still allows a healthy subsequent unlock", async () => {
   await withStrictProcessErrors(async () => {
-    const client = new LockClient(); // no 'error' event anywhere in this scenario
-    const pending = withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
+    const client = new PlanClient(); // no 'error' event anywhere in this scenario
+    client.actionHook = () => {
       throw new Error("cancellation query failed: permission denied for function pg_cancel_backend");
-    });
+    };
+    const pending = plan(client);
 
     await assert.rejects(pending, /permission denied/);
-    assert.deepEqual(client.events, ["probe", "unlock", "release"], "an ordinary SQL-level failure, with no connection-level signal, must still unlock and release healthily");
+    assert.deepEqual(client.events, ["probe", "unlock", "reset-rollback", "reset-discard", "reset-proof", "release"], "an ordinary SQL-level failure, with no connection-level signal, must still unlock and release healthily");
     assert.equal(client.releaseCount, 1);
     assert.equal(client.releasedWith, undefined, "a merely logical failure must never destroy a healthy connection");
     assert.equal(client.listenerCount("error"), 0);
@@ -528,11 +589,12 @@ test("ownership: an ordinary non-connection cancellation-query error still allow
 
 test("ownership: advisory unlock fails after the action has already failed, with no connection-level signal", async () => {
   await withStrictProcessErrors(async () => {
-    const client = new LockClient();
+    const client = new PlanClient();
     client.unlockError = new Error("could not send data to server");
-    const pending = withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
+    client.actionHook = () => {
       throw new Error("cancellation query failed: syntax error");
-    });
+    };
+    const pending = plan(client);
 
     await assert.rejects(pending, (error: Error) => {
       assert.ok(error instanceof AggregateError);
@@ -549,13 +611,12 @@ test("ownership: advisory unlock fails after the action has already failed, with
 
 test("ownership: the healthy control path releases exactly once and leaks no listener", async () => {
   await withStrictProcessErrors(async () => {
-    const client = new LockClient();
-    const result = await withSchemaAdvisoryLock(client as unknown as PoolClient, async () => {
-      client.events.push("action");
-      return "ok";
-    });
-    assert.equal(result, "ok");
-    assert.deepEqual(client.events, ["probe", "action", "unlock", "release"]);
+    const client = new PlanClient();
+    client.actionHook = () => { client.events.push("action"); };
+    const result = await plan(client);
+    assert.equal((result as { pendingCount: number }).pendingCount, 24);
+    assert.deepEqual(client.events, ["probe", "action", "unlock", "reset-rollback", "reset-discard", "reset-proof", "release"],
+    "PB-10 Step 3 Phase 2d: the reset runs after the advisory unlock and before the client is returned");
     assert.equal(client.releaseCount, 1);
     assert.equal(client.releasedWith, undefined);
     assert.equal(client.listenerCount("error"), 0);
@@ -578,6 +639,14 @@ class PlanClient extends LockClient {
   legacyLedgerRows: string[] = [];
   legacyLedgerTimestamps: unknown[] = [];
   readonly ledgerRows: AppliedMigrationRow[];
+  /**
+   * PB-10 Step 3 Phase 2d, HIGH 1: fired from inside the real plan action, at
+   * the applied-ledger read — after the advisory lock is held and the control
+   * schema has verified, and before the plan is built. This is where a case
+   * makes the action fail, hang, or lose its connection, now that the boundary
+   * can no longer be invoked with a hand-written callback from outside.
+   */
+  actionHook: (() => Promise<void> | void) | undefined;
 
   constructor(ledgerRows: AppliedMigrationRow[] = []) {
     super();
@@ -585,7 +654,12 @@ class PlanClient extends LockClient {
   }
 
   override async query(sql: string, values?: unknown[]): Promise<QueryResult> {
-    if (sql.includes("pg_try_advisory_lock") || sql.includes("pg_advisory_unlock") || sql.includes("pg_stat_activity")) {
+    if (sql.includes("pg_try_advisory_lock") || sql.includes("pg_advisory_unlock") || sql.includes("pg_stat_activity")
+      // PB-10 Step 3 Phase 2d: the terminal reset sequence belongs to the
+      // lifecycle boundary, not to the plan, so it is answered by the base
+      // class — the read-only plan path is disposed through exactly the same
+      // boundary as the execution path.
+      || sql === "rollback" || sql === "discard all" || sql.includes("dirty_settings")) {
       return super.query(sql, values);
     }
     this.queries.push({ sql, values });
@@ -613,6 +687,7 @@ class PlanClient extends LockClient {
     });
     if (controlSchema) return controlSchema as QueryResult;
     if (sql.includes("from migration_control.schema_migrations")) {
+      await this.actionHook?.();
       return { rows: this.ledgerRows, rowCount: this.ledgerRows.length };
     }
     throw new Error(`unexpected query: ${sql}`);
@@ -726,7 +801,7 @@ test("plan fails closed when the legacy ledger diverges from an empty control le
     /incompatible.*legacy rows: 24, control rows: 0/,
   );
   assert.ok(diverged.queries.some(({ sql }) => /select\s+filename/i.test(sql)));
-  assert.deepEqual(diverged.events.slice(-2), ["unlock", "release"]);
+  assert.deepEqual(diverged.events.slice(-5), ["unlock", "reset-rollback", "reset-discard", "reset-proof", "release"]);
 
   const emptyLegacy = new PlanClient();
   emptyLegacy.legacyLedgerPresent = true;
@@ -835,8 +910,8 @@ test("legacy applied_at values must be valid, finite, distinct timestamps", asyn
 });
 
 test("statement and lock timeouts are issued on the pinned client before the first probe", async () => {
-  const client = new LockClient();
-  await withSchemaAdvisoryLock(client as unknown as PoolClient, async () => undefined);
+  const client = new PlanClient();
+  await plan(client);
   const settings = client.queries
     .filter(({ sql }) => sql.includes("set_config"))
     .map(({ values }) => values as [string, string]);
@@ -855,7 +930,16 @@ test("run plan issues only read-only catalog and ledger queries", async () => {
   const pool = { connect: async () => client as unknown as PoolClient } as unknown as Pool;
   const plan = await runMigrationPlan(pool, { manifest });
   assert.equal(plan.pendingCount, 24);
-  const statements = client.queries.map(({ sql }) => sql.trim());
+  // PB-10 Step 3 Phase 2d: the plan itself must still read and write nothing,
+  // but the terminal lifecycle boundary's own reset is not a plan statement —
+  // it is what stops this connection from handing the schema lock path's
+  // session-level statement_timeout/lock_timeout to the next borrower. Asserted
+  // separately, in order, rather than folded into the read-only claim.
+  const reset = ["rollback", "discard all"];
+  const all = client.queries.map(({ sql }) => sql.trim());
+  assert.deepEqual(all.slice(-3, -1), reset, "the reset is the last thing issued before the baseline proof");
+  assert.ok(all.at(-1)!.includes("dirty_settings"));
+  const statements = all.filter((sql) => !reset.includes(sql) && !sql.includes("dirty_settings"));
   assert.ok(statements.some((sql) => sql.includes("from migration_control.schema_migrations")));
   assert.ok(statements.every((sql) => /^(select|with)/i.test(sql)));
   assert.ok(statements.every((sql) =>

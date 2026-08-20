@@ -115,6 +115,23 @@ export async function executeMigrationsForTest(pool: Pool, options: TestExecuteO
   } finally {
     moduleLoader._load = originalLoad;
   }
+  // PB-10 Step 3 Phase 2d: a defect of *this harness*, corrected here rather
+  // than suppressed. execute.ts installs exactly one pool-'error' guard per
+  // pool object, keyed by the identity of its own module-level onPoolError —
+  // idempotent in production, where the module is loaded once for the life of
+  // the process. This helper deletes execute.ts from the require cache and
+  // reloads it on every call (that is how the manifest/handler/timer
+  // substitutions above are scoped to execute.ts's own imports), so every call
+  // brings a *different* onPoolError object and the identity check cannot
+  // recognise the previous one. A suite that reuses one pool across a dozen
+  // runs therefore accumulated a listener per run and tripped Node's
+  // MaxListenersExceededWarning at eleven — noise produced entirely by the
+  // reload, never by the code under test. Listeners left behind by a previous
+  // reload are dropped here, matched by name so nothing else on the pool is
+  // touched; the run under test still installs, and still owns, its own guard.
+  for (const listener of pool.listeners("error")) {
+    if (listener.name === "onPoolError") pool.removeListener("error", listener as (...args: unknown[]) => void);
+  }
   activeCalls += 1;
   if (options.repositoryRoot) activeFixtureRoots.push(options.repositoryRoot);
   if (options.repositoryRoot && !sharedReadMock) {

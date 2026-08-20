@@ -29,6 +29,155 @@ jobs:
       # them explicitly; they run in their own steps in the database job
       # below, each with exactly the credential it needs.
       - run: npm run test:application --prefix backend
+      # PB-10 Step 3 Phase 2d, HIGH 2 / final review, HIGH 1: a dedicated,
+      # counted, name-asserted, PROVENANCE-BOUND gate for the client-ownership
+      # boundary's unit contracts.
+      #
+      # The step above runs these files too, but only as part of a 350-test
+      # aggregate whose totals say nothing about *which* cases ran: a lifecycle
+      # scenario could be renamed, skipped or deleted outright and that step
+      # would still go green. This one enforces the mandatory set explicitly —
+      # zero failures, zero skips, an exact pass count, and every mandatory
+      # scenario present by name — and it is deliberately distinct from (and
+      # additional to) the real-PostgreSQL Phase 2d step in the database job
+      # below, which proves the same contract against sessions handed to a real
+      # next borrower.
+      #
+      # PROVENANCE (final review, HIGH 1). The previous shape of this gate ran
+      # `npm run test:unit:phase2d` and asserted only the *aggregate* TAP
+      # output. Node's test runner emits one flat, ungrouped stream for a
+      # multi-file invocation, so nothing in that output tied a name or a count
+      # to the file that produced it: the independent review pointed the npm
+      # script at a single wholly unrelated file that merely declared the same
+      # test names and the same total, and the gate passed. Aggregate evidence
+      # is not provenance.
+      #
+      # The binding is now structural, in three parts:
+      #
+      #  1. The file list is an immutable literal *in this workflow*, not in
+      #     backend/package.json. Redirecting the npm script can no longer
+      #     change what this gate executes.
+      #  2. Each required file is invoked on its own and its own totals are
+      #     asserted, so every count is bound to the path that produced it. A
+      #     different file cannot supply another file's passes, and a file that
+      #     runs zero tests fails on its own count rather than being absorbed
+      #     into a correct-looking total.
+      #  3. Every mandatory scenario is required to appear in the log of the
+      #     specific file that must contain it, so a name migrating between
+      #     files — or into an unrelated one — fails closed.
+      #
+      # The developer-facing `test:unit:phase2d` script is additionally asserted
+      # to name exactly the same files, so local runs and CI cannot drift; a
+      # required file renamed without updating this gate fails on the missing
+      # path before a single test runs.
+      #
+      # Nothing here prints a credential or a database URL: neither suite
+      # connects to a database at all.
+      #
+      # Two of the mandatory scenarios (duplicate finalization from two
+      # independent owners, and the refusal to reset while registered
+      # client-owned work is unsettled) inherently need the second migration
+      # connection an execution run holds, so they live in the execution
+      # suite's own two-connection harness.
+      - name: Enforce the Phase 2d client-ownership unit contracts
+        run: |
+          set -u -o pipefail
+          fail() { echo "PHASE 2D GATE FAILED: $*" >&2; exit 1; }
+
+          # (1) The immutable file list, and the structural assertion that the
+          # developer-facing script names exactly it.
+          expected_script='node --import tsx --test test/migration-session-reset.test.ts test/migration-execute.test.ts'
+          actual_script=$(node -p 'require("./backend/package.json").scripts["test:unit:phase2d"] || ""')
+          [ "$actual_script" = "$expected_script" ] \
+            || fail "backend test:unit:phase2d is '$actual_script'; this gate requires '$expected_script'"
+
+          cat > /tmp/pb10-phase2d-control.txt <<'CONTROL_SCENARIOS'
+          a healthy client is reset in order and released, never destroyed
+          an absent driver cache shape fails closed and destroys the client
+          an unexpected driver cache shape fails closed and destroys the client
+          an unprovable driver cache clear fails closed and destroys the client
+          a client checked out again by a later run is disposed of again, not silently kept
+          a failed reset statement destroys the client
+          a reset that never answers is abandoned on its budget, and the client is destroyed
+          connection loss during the reset destroys the client and raises no unhandled rejection
+          a failed ROLLBACK destroys the client rather than resetting or returning it
+          no normal release ever follows a destructive release
+          invalid plan lock options are rejected before any client is acquired, and never leak one
+          a lock option that can only fail after acquisition still reaches exactly one terminal disposition
+          a control client whose error-listener registration always throws still reaches exactly one terminal disposition
+          primary and cleanup failures compose: the migration's own error is never replaced by a cleanup error
+          a reset-success baseline is verified, not assumed: a proof returning no row at all is refused
+          a reset that succeeds but leaves the session dirty is still refused
+          cleanup failure never replaces a primary execution failure
+          the control client's own reset runs after the advisory unlock, never before it
+          an owner that already knows the session is unusable destroys it without issuing any reset
+          the disposer is reachable only through an approved entry point, never as a module export
+          phase2d: a control listener throwing a null-prototype object with no primitive conversion at all still reaches exactly one terminal disposition
+          phase2d: a control listener throwing an object whose Symbol.toPrimitive throws still reaches exactly one terminal disposition
+          phase2d: a control listener throwing a null-prototype object whose own toString and valueOf both throw still reaches exactly one terminal disposition
+          phase2d: a control listener throwing a Proxy whose getPrototypeOf trap throws, defeating the instanceof probe itself still reaches exactly one terminal disposition
+          phase2d: a control listener throwing a revoked Proxy, where every operation but typeof throws still reaches exactly one terminal disposition
+          phase2d: a hostile primary throw value composes deterministically with an ordinary cleanup failure
+          phase2d: an ordinary primary failure survives a hostile cleanup throw value
+          phase2d: a native newListener handler firing inside the control disposer cannot start a second disposition
+          phase2d: the same client checked out by a later episode is still disposed of independently after a reentrant one
+          CONTROL_SCENARIOS
+
+          cat > /tmp/pb10-phase2d-execution.txt <<'EXECUTION_SCENARIOS'
+          phase2d: duplicate finalization of one execution client is exactly once
+          phase2d: no release while registered client-owned work remains unsettled
+          a synchronous throw while installing the execution client's 'error' listener still yields exactly one terminal disposition
+          an execution client whose error-listener registration always throws still reaches exactly one terminal disposition
+          a failure removing the control listener never skips the execution client's terminal disposition
+          a control-listener removal failure is composed with a primary migration failure, never in place of it
+          an execution-client release failure is composed with a primary migration failure, never in place of it
+          per-episode lifecycle bookkeeping that fails synchronously still yields exactly one disposition per client
+          production build exposes exactly the approved public surface, and no other migrate module provides an alternate entry point
+          phase2d: an execution listener throwing a null-prototype object with no primitive conversion at all still reaches exactly one terminal disposition
+          phase2d: an execution listener throwing an object whose Symbol.toPrimitive throws still reaches exactly one terminal disposition
+          phase2d: an execution listener throwing a null-prototype object whose own toString and valueOf both throw still reaches exactly one terminal disposition
+          phase2d: an execution listener throwing a Proxy whose getPrototypeOf trap throws, defeating the instanceof probe itself still reaches exactly one terminal disposition
+          phase2d: an execution listener throwing a revoked Proxy, where every operation but typeof throws still reaches exactly one terminal disposition
+          phase2d: a hostile cleanup throw value never displaces a primary migration failure
+          phase2d: a hostile throw from release() itself is still exactly one attempt, composed rather than raw
+          phase2d: a native newListener handler firing inside the execution disposer cannot start a second disposition
+          phase2d: repeated native newListener re-entry cannot accumulate terminal actions
+          phase2d: re-entering disposal while the terminal reset is in flight joins the disposition already claimed
+          phase2d: re-entering disposal from inside release() itself cannot produce a second terminal action
+          phase2d: two concurrent disposition callers share one terminal action
+          EXECUTION_SCENARIOS
+
+          # (2)+(3) Per-file execution, per-file counts, per-file names. The
+          # `file:passes:manifest` triples below are the gate's own record of
+          # which suite owes which evidence.
+          for required in \
+            "test/migration-session-reset.test.ts:41:/tmp/pb10-phase2d-control.txt" \
+            "test/migration-execute.test.ts:164:/tmp/pb10-phase2d-execution.txt"
+          do
+            file=${required%%:*}
+            rest=${required#*:}
+            passes=${rest%%:*}
+            manifest=${rest#*:}
+            [ -f "backend/$file" ] || fail "required Phase 2d test file is missing: $file"
+            # A file that does not import the migration lifecycle module cannot
+            # be exercising the boundary, whatever it declares its tests to be
+            # called. This is what stops a same-name, same-count decoy from
+            # standing in for a required suite.
+            grep -q 'src/db/migrate/' "backend/$file" \
+              || fail "$file does not import the migration lifecycle module it is supposed to exercise"
+            log="/tmp/pb10-phase2d-$(basename "$file").log"
+            ( cd backend && node --import tsx --test "$file" ) 2>&1 | tee "$log"
+            grep -qx '# fail 0' "$log" || fail "$file reported a failing test"
+            grep -qx '# skipped 0' "$log" || fail "$file skipped a test"
+            grep -qx "# pass $passes" "$log" \
+              || fail "$file did not report exactly $passes passing tests"
+            while IFS= read -r scenario; do
+              scenario=$(echo "$scenario" | sed -e 's/^[[:space:]]*//')
+              [ -n "$scenario" ] || continue
+              grep -qF -- "- $scenario" "$log" \
+                || fail "$file is missing mandatory Phase 2d scenario: $scenario"
+            done < "$manifest"
+          done
       - run: npm run build --prefix backend
       - run: npm audit --prefix backend --omit=dev --audit-level=high
       - run: npm ci --prefix web
@@ -249,6 +398,23 @@ jobs:
           grep -qx '# fail 0' /tmp/pg-h2.log
           grep -qx '# skipped 0' /tmp/pg-h2.log
           grep -qx '# pass 22' /tmp/pg-h2.log
+      - name: Test pooled session reset and safe connection return against real PostgreSQL
+        env:
+          # Both credentials: this suite reinstalls migration_control for every
+          # case, so its before() runs the same distinct-database guard as
+          # test:pg:migration before any destructive statement.
+          MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
+        # PB-10 Step 3 Phase 2d. Counts asserted, not merely exit status: every
+        # case here is a claim about what the *next borrower* of a pooled
+        # connection receives, and a suite that dies in before() or silently
+        # skips would remove that coverage while the step still went green.
+        run: |
+          set -o pipefail
+          npm run test:pg:session-reset --prefix backend 2>&1 | tee /tmp/pg-session-reset.log
+          grep -qx '# fail 0' /tmp/pg-session-reset.log
+          grep -qx '# skipped 0' /tmp/pg-session-reset.log
+          grep -qx '# pass 18' /tmp/pg-session-reset.log
       - name: Test read-only migration plan
         # Pure unit test of runner.ts's plan-building logic; no database
         # credential of any kind reaches this step.

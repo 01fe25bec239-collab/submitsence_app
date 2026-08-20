@@ -12,11 +12,18 @@ import {
 import {
   GIT_SHA,
   IMAGE_DIGEST,
+  SCHEMA_ADVISORY_LOCK,
+  SCHEMA_LOCK_BUDGET_MS,
+  SCHEMA_LOCK_POLL_MS,
+  SCHEMA_LOCK_TIMEOUT_MS,
+  SCHEMA_STATEMENT_TIMEOUT_MS,
   assertNoLegacyLedgerDivergence,
   buildMigrationPlan,
   readAppliedRows,
   verifyControlSchema,
-  withSchemaAdvisoryLock,
+  type LockDiagnostic,
+  type MigrationPlan,
+  type SchemaLockOptions,
 } from "./runner";
 import { ERROR_CLASSES, MigrationExecutionError, SQLSTATE, assertCondition, classify, reportSanitizedPoolError, safePoolErrorCode, sqlstateOf, type ErrorClass } from "./execution-errors";
 
@@ -165,6 +172,15 @@ interface MigrationContext {
   now: () => number;
   /** Set when the execution connection must be destroyed rather than returned to the pool. */
   destroyExecution: () => void;
+  /**
+   * PB-10 Step 3 Phase 2d: registers one operation that owns the execution
+   * client, so the terminal lifecycle boundary can prove — never assume — that
+   * nothing is still using the session before it issues a reset statement on
+   * it. Takes the promise that carries the operation's own settlement; the
+   * boundary only ever *reads* whether everything registered has settled, and
+   * destroys the client rather than waiting when anything has not.
+   */
+  noteExecutionWork: (work: Promise<unknown>) => void;
   /**
    * PB-10 Step 3 Phase 2c: acquires an independent connection outside the
    * pool's own capacity accounting (see independentControlAcquirer below —
@@ -2085,7 +2101,11 @@ async function appendAmbiguityDurably(
       return;
     } catch (error) {
       lastErrorCode = safePoolErrorCode(error);
-      failure = error instanceof Error ? error : new Error(String(error));
+      // PB-10 Step 3 Phase 2d final review, CRITICAL 1: the total conversion,
+      // not an inline `String(error)`. A hostile thrown value here would
+      // otherwise abort this retry loop from inside its own `catch`, before the
+      // ad hoc connection below could be released.
+      failure = errorValue(error);
     } finally {
       // Exactly one destructive/healthy release per attempt, always awaited
       // here so this function never returns (successfully or by throwing)
@@ -2216,6 +2236,14 @@ async function superviseSettlement<T>(
     (value) => ({ status: "resolved", value }) as const,
     (error: unknown) => ({ status: "rejected", error }) as const,
   );
+  // PB-10 Step 3 Phase 2d: this is the one place in the executor where an
+  // operation holding the execution session can outlive the `await` that
+  // started it — an unconfirmed cancellation abandons `operation` still
+  // pending, by design, because nothing can prove what it is doing. The
+  // terminal boundary must never issue `rollback`/`discard all` on a session
+  // in that state, so it is told about the operation here rather than left to
+  // infer quiescence from the call stack having unwound.
+  context.noteExecutionWork(operation);
 
   const settledBeforeCancel = await raceSettlement(context, operation, budgetMs);
 
@@ -2625,9 +2653,21 @@ async function executeBatched(context: MigrationContext): Promise<void> {
         // here and re-thrown by proveBatchesConsumed() at the next settle
         // point. First failure wins — it is the one that caused everything
         // after it, and runOneBatch has already written its own ledger event.
-        if (!unconsumedFailure) unconsumedFailure = error instanceof Error ? error : new Error(String(error));
+        // The total conversion (final review, CRITICAL 1): this runs inside a
+        // rejection handler, where a throw would become an unhandled rejection
+        // rather than a recorded batch failure.
+        if (!unconsumedFailure) unconsumedFailure = errorValue(error);
       });
       pending.add(tracked);
+      // PB-10 Step 3 Phase 2d: a batch owns the execution session for its whole
+      // BEGIN/…/COMMIT, not merely for the supervised callback inside it, so
+      // the terminal boundary is told about the whole batch rather than relying
+      // on superviseSettlement's own registration. settlePending() normally
+      // drains every one of these long before disposal — this is what makes the
+      // one path where it cannot (the structural-invariant violation
+      // proveBatchesConsumed() throws on) destroy the client instead of
+      // resetting a session a batch may still be committing on.
+      context.noteExecutionWork(tracked);
       return tracked;
     },
   };
@@ -3415,6 +3455,890 @@ function guardPoolErrors(pool: Pool): void {
   if (!pool.listeners("error").includes(onPoolError)) pool.on("error", onPoolError);
 }
 
+/**
+ * PB-10 Step 3 Phase 2d final review, CRITICAL 1: the one *total* conversion
+ * from an arbitrary thrown value to an Error. It is called from inside the
+ * terminal lifecycle boundary, so it may not itself be the operation that
+ * prevents a disposition — for every JavaScript value, including every value
+ * chosen specifically to be hostile, it returns an Error and does not throw.
+ *
+ * The previous shape was `error instanceof Error ? error : new Error(String(error))`,
+ * and both halves of it are fallible:
+ *
+ *  - `String(x)` performs ToPrimitive on an object, which runs
+ *    `Symbol.toPrimitive`, `valueOf` and `toString` — user code that may throw,
+ *    and which is *absent altogether* on a null-prototype object like
+ *    `Object.create(null)`, where the language then throws a TypeError of its
+ *    own ("Cannot convert object to primitive value").
+ *  - `x instanceof Error` is not a safe pre-check either: for a Proxy it walks
+ *    the prototype chain through the `getPrototypeOf` trap, which can throw
+ *    before any conversion is even attempted.
+ *
+ * The independent review demonstrated the consequence: a listener/setup call
+ * that threw such a value made the disposer's own `catch` throw, and the client
+ * — already checked out — reached its `release()` zero times. One occurrence
+ * permanently consumes a slot of a bounded production pool.
+ *
+ * Totality here is structural rather than argued:
+ *
+ *  1. every step, including the `instanceof` probe, runs inside the guard;
+ *  2. `String()` is applied *only* to values whose `typeof` already proves they
+ *    are primitives (or to `null`), where the language guarantees the
+ *    conversion runs no user code at all — this is what keeps an ordinary
+ *    thrown string, number, bigint, boolean, symbol, `undefined` or `null`
+ *    diagnostically useful;
+ *  3. objects and functions — the only values that can carry a hostile
+ *    conversion — are described by a fixed literal, never coerced;
+ *  4. the fallback message is a constant, so producing it needs nothing from
+ *    the value it is describing.
+ *
+ * Deliberately *not* used: `JSON.stringify` (calls `toJSON`, throws on cycles
+ * and on bigint), `util.inspect` (honours `Symbol.for("nodejs.util.inspect.custom")`,
+ * i.e. arbitrary user code), and `Object.prototype.toString.call` (reads
+ * `Symbol.toStringTag`, which may be a throwing getter or a Proxy trap). Each
+ * would reintroduce exactly the class of failure this exists to remove.
+ *
+ * Identity is preserved wherever the error contract depends on it: a real Error
+ * is returned unchanged, which is what keeps `assert.equal(error, original)`
+ * and the AggregateError ordering contract meaningful.
+ */
+const UNREPRESENTABLE_THROWN_VALUE =
+  "the migration runner caught a thrown value that is not an Error and cannot be safely converted to text";
+
+function errorValue(error: unknown): Error {
+  try {
+    if (error instanceof Error) return error;
+    // `typeof` cannot throw for any value, and every branch it admits here is a
+    // primitive whose String() conversion is defined by the language itself.
+    const kind = typeof error;
+    if (error === null || (kind !== "object" && kind !== "function")) {
+      return new Error(String(error as null | undefined | boolean | number | bigint | string | symbol));
+    }
+  } catch {
+    // Intentionally ignored: a value that resists inspection is described by
+    // the constant below rather than allowed to abort a disposition.
+  }
+  return new Error(UNREPRESENTABLE_THROWN_VALUE);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// PB-10 Step 3 Phase 2d: the single terminal lifecycle boundary for every
+// migration-owned pooled PostgreSQL client.
+//
+// Module-private on purpose, and deliberately *not* exported: `executeMigrations
+// (pool)` remains the sole production migration-execution entry point, and a
+// reachable reset coordinator / client disposer / connection acquirer would be
+// exactly the alternate boundary Phase 2c's public-surface regression exists to
+// forbid. The migration executor reaches this function the only way anything
+// can — as an argument handed to the callback that already runs *inside* the
+// schema advisory lock (see withSchemaAdvisoryLock below), so it is reachable
+// only from code the lock owner itself invoked, never by name and never by a
+// deep require of the emitted build.
+// ════════════════════════════════════════════════════════════════════════
+
+/**
+ * The whole terminal sequence — ROLLBACK, DISCARD ALL and the baseline proof —
+ * is three trivial round trips (measured at well under a millisecond each
+ * against a local PostgreSQL 17). This is not a tuning knob: it is the point
+ * past which a session that will not answer is treated as unusable rather than
+ * waited on. Expiry is proof of *failure*, never proof of completion — the
+ * client is destroyed, never returned.
+ *
+ * A client-side deadline is the only mechanism that survives the case it exists
+ * for. `statement_timeout` cannot bound this: nontransactional mode sets
+ * `statement_timeout = 0` at *session* level on the execution connection, and
+ * raising it again would itself be a round trip that can hang for the same
+ * reason. A dead-but-not-closed socket answers nothing at all.
+ */
+const SESSION_RESET_BUDGET_MS = 5_000;
+
+/**
+ * PB-10 Step 3 Phase 2d: the reusable-session baseline, proven rather than
+ * assumed.
+ *
+ * `source = 'session'` is the authoritative, complete test for "this session
+ * changed a setting", and it is exactly zero on a freshly connected client —
+ * verified empirically against PostgreSQL 17. It is deliberately used in place
+ * of `setting is distinct from reset_val`, which reports eight permanent false
+ * positives on any fresh connection (archive_command, data_directory_mode,
+ * external_pid_file, log_file_mode, the three tcp_keepalives_* settings and
+ * unix_socket_permissions all render differently from their reset value without
+ * anything having touched them), and would therefore have condemned every
+ * healthy client. It covers `search_path`, `statement_timeout`, `lock_timeout`,
+ * `transaction_timeout`, `idle_in_transaction_session_timeout` and
+ * `application_name` uniformly, because all of them are ordinary enumerable
+ * GUCs.
+ *
+ * `role` (SET ROLE) and `session_authorization` (SET SESSION AUTHORIZATION) are
+ * deliberately *not* among them, and this is the reason the role cross-check
+ * below is not redundant with the GUC accounting: PostgreSQL marks both
+ * GUC_NO_SHOW_ALL, so neither is a row in pg_settings at all and the
+ * `source = 'session'` count can never see either one (verified empirically
+ * against PostgreSQL 17.10, and pinned by an assertion in
+ * migration-session-reset.pg.test.ts so a future server change fails a test
+ * rather than silently narrowing this contract). SET ROLE is caught by
+ * `current_user = session_user`; SET SESSION AUTHORIZATION moves session_user
+ * with it and so is caught by neither — it is superuser-only, and the
+ * migration execution role is required not to be a superuser (a superuser
+ * connection is refused outright by verifyControlSchema), so no migration this
+ * runner can legally execute can produce it. DISCARD ALL restores it in any
+ * case, which the same suite proves administratively.
+ *
+ * The remaining columns cover the session resources no GUC records: advisory
+ * locks this backend still holds, LISTEN subscriptions, server-side prepared
+ * statements, open (including WITH HOLD) cursors, and temporary objects in this
+ * backend's own temp schema. `pg_my_temp_schema()` returns 0 when the session
+ * never created one, which matches no row.
+ *
+ * `current_user = session_user` is an independent cross-check on the role
+ * baseline: it does not rely on the GUC accounting above being complete.
+ *
+ * A custom session GUC set through `set_config('some.key', …, false)` is not
+ * enumerable here — PostgreSQL does not list an unregistered placeholder in
+ * pg_settings — but DISCARD ALL's RESET ALL does clear it, which the real
+ * PostgreSQL suite proves from the *next borrower* rather than from this query.
+ */
+const SESSION_BASELINE_SQL = `
+  select (select count(*) from pg_catalog.pg_settings where source = 'session') as dirty_settings,
+         (select count(*) from pg_catalog.pg_locks
+           where locktype = 'advisory' and pid = pg_catalog.pg_backend_pid()) as advisory_locks,
+         (select count(*) from pg_catalog.pg_listening_channels()) as listens,
+         (select count(*) from pg_catalog.pg_prepared_statements) as prepared_statements,
+         (select count(*) from pg_catalog.pg_cursors) as cursors,
+         (select count(*) from pg_catalog.pg_class
+           where relnamespace = pg_catalog.pg_my_temp_schema()) as temp_objects,
+         (current_user = session_user) as role_baseline
+`;
+
+interface SessionBaselineRow {
+  dirty_settings: string;
+  advisory_locks: string;
+  listens: string;
+  prepared_statements: string;
+  cursors: string;
+  temp_objects: string;
+  role_baseline: boolean;
+}
+
+/**
+ * Restores one pooled session to the baseline a freshly connected client would
+ * have, and *proves* it. Throws — which the caller always turns into
+ * destruction, never into a healthy release — the moment any step fails or the
+ * proof comes back short.
+ *
+ * Order is not incidental:
+ *
+ * 1. `ROLLBACK` first, unconditionally. DISCARD ALL is rejected outright inside
+ *    an open transaction block (SQLSTATE 25001) and inside a failed one
+ *    (25P02), both confirmed against PostgreSQL 17, so it can never be the
+ *    first statement. Outside a transaction, ROLLBACK is a documented no-op
+ *    that emits a warning and succeeds, so no transaction-state probe is
+ *    needed — and no probe would be trustworthy anyway, since the answer could
+ *    change between the probe and the statement it guarded.
+ *
+ * 2. `DISCARD ALL` second, and *alone in its own round trip*. It may not be
+ *    concatenated with the ROLLBACK above: PostgreSQL wraps a multi-statement
+ *    simple-query message in an implicit transaction block, which makes DISCARD
+ *    ALL fail with the very 25001 the ROLLBACK was there to prevent (confirmed
+ *    empirically). Its success is therefore also the proof that no transaction
+ *    block remains — a property no separate query could establish as reliably.
+ *
+ *    DISCARD ALL is chosen over a hand-rolled reset sequence because it is the
+ *    one mechanism whose coverage is defined by the server rather than by this
+ *    file: CLOSE ALL, SET SESSION AUTHORIZATION DEFAULT, RESET ALL, DEALLOCATE
+ *    ALL, UNLISTEN *, pg_advisory_unlock_all(), DISCARD PLANS, DISCARD TEMP and
+ *    DISCARD SEQUENCES. An explicit list would have to be revisited every time
+ *    a migration file learns to dirty something new; this cannot fall behind.
+ *    It needs no privilege beyond being the session's own owner.
+ *
+ * 3. The baseline proof last. DISCARD ALL reporting success is not on its own
+ *    evidence that the session is reusable — a returned session is only ever
+ *    trusted because it was inspected.
+ */
+/**
+ * PB-10 Step 3 Phase 2d, A4 final review: `DISCARD ALL` resets the *server's*
+ * view of the session, but node-postgres keeps its own driver-side cache of
+ * which named prepared statements it believes this physical connection
+ * already has — `connection.parsedStatements`, a plain object keyed by
+ * statement name (see node_modules/pg/lib/connection.js and query.js's
+ * `hasBeenParsed`). Nothing in `DISCARD ALL` reaches that cache, because it is
+ * client-side state the driver never round-trips to the server to invalidate.
+ *
+ * The failure this produces is not this migration run's own: this codebase
+ * issues no named queries. It is the *next* borrower's, on whatever pool this
+ * client belongs to. If any consumer of that pool ever issued a named query
+ * on this same physical connection — before this migration run borrowed it,
+ * or after it is handed back — node-postgres skips re-parsing a name it
+ * believes is already prepared and sends only a Bind for it. The server has
+ * no such prepared statement any more (DISCARD ALL removed it), so the Bind
+ * fails with SQLSTATE 26000. A client returned as "reusable" must not carry
+ * that landmine forward.
+ *
+ * The cache is a plain object, not a class instance, so replacing it with an
+ * empty one is the correct clear, and matches what a fresh connection starts
+ * with. It is reached through `client.connection`, which `@types/pg` types on
+ * every real `Client`/`PoolClient`. Any missing, inaccessible or unexpected
+ * shape is a reset failure: a PoolClient-compatible wrapper may still delegate
+ * named-query handling to node-postgres while hiding these internals, so the
+ * absence of observable driver state cannot prove that state synchronized.
+ */
+function clearDriverPreparedStatementCache(client: PoolClient): void {
+  const connection = (client as unknown as { connection?: unknown }).connection;
+  assertCondition(
+    typeof connection === "object" && connection !== null,
+    "Session-reset could not inspect the driver's prepared-statement cache",
+  );
+  const record = connection as { parsedStatements?: unknown };
+  const cache = record.parsedStatements;
+  assertCondition(
+    typeof cache === "object"
+      && cache !== null
+      && !Array.isArray(cache)
+      && [Object.prototype, null].includes(Object.getPrototypeOf(cache)),
+    "Session-reset could not prove the driver's prepared-statement cache clearable",
+  );
+  const cleared = {};
+  record.parsedStatements = cleared;
+  assertCondition(
+    record.parsedStatements === cleared,
+    "Session-reset could not prove the driver's prepared-statement cache cleared",
+  );
+}
+
+async function resetPooledSession(client: PoolClient): Promise<void> {
+  await client.query("rollback");
+  await client.query("discard all");
+  clearDriverPreparedStatementCache(client);
+  const result = await client.query<SessionBaselineRow>(SESSION_BASELINE_SQL);
+  const row = result.rows[0];
+  assertCondition(row !== undefined, "Session-reset baseline proof returned no row");
+  for (const column of ["dirty_settings", "advisory_locks", "listens", "prepared_statements", "cursors", "temp_objects"] as const) {
+    assertCondition(row[column] === "0", `Session-reset baseline proof failed: ${column} is not clean`);
+  }
+  assertCondition(row.role_baseline === true, "Session-reset baseline proof failed: the session role is not at its baseline");
+}
+
+/**
+ * PB-10 Step 3 Phase 2d: the one place any migration-owned pooled client is
+ * ever handed back or thrown away, and the only place that decides which.
+ *
+ * Exactly-once is enforced by the latch `withSchemaAdvisoryLock` wraps around
+ * this function (see disposeOnce below), never by this function itself, and the
+ * distinction is not cosmetic. A latch keyed by the client object and held for
+ * the process's lifetime looks stronger and is in fact unsound: pg-pool hands
+ * out *the same PoolClient object* on a later checkout, so the second migration
+ * run through one pool would find the first run's finished disposition, return
+ * it unchanged, and thereby issue no reset and — the part that bites — no
+ * `release()` at all. The client is then checked out forever; two such runs
+ * exhaust a `max: 2` production pool and the third blocks indefinitely.
+ *
+ * The latch therefore lives for exactly one ownership episode, which is also
+ * precisely the scope over which "exactly once" is the correct rule: while a
+ * client is held, any number of owners, error handlers and finally blocks may
+ * reach for it and only the first decides; once it has been handed back, it is
+ * no longer this run's client to dispose of at all.
+ *
+ * Fail closed, without exception: a client is returned to the pool only when
+ * every step above completed and proved the baseline. Every other outcome —
+ * a caller that already knows the session is unusable, work that cannot be
+ * proven settled, a reset statement that failed, a baseline proof that came
+ * back short, a socket that died mid-reset, or a reset that did not answer
+ * within its budget — destroys it instead. "Uncertain" is never "reusable".
+ */
+type ClientDisposition = "reused" | "destroyed";
+
+interface DisposeClientRequest {
+  /** Set when the owner already knows this session must never be reused. */
+  destroy?: Error;
+  /** The owner's own connection-'error' listener, removed exactly once, here. */
+  ownerListener?: (error: Error) => void;
+  /**
+   * Returns false when any work this client owns cannot be proven to have
+   * settled. A reset statement must never race an operation still using the
+   * same session, and waiting on work that may never settle is not an option
+   * either — so unsettled work destroys rather than delays.
+   */
+  workSettled?: () => boolean;
+}
+
+type DisposeClient = (client: PoolClient, request?: DisposeClientRequest) => Promise<ClientDisposition>;
+
+/**
+ * PB-10 Step 3 Phase 2d: the exactly-once latch, scoped to one ownership
+ * episode — see disposeMigrationClient's own doc for why a process-lifetime
+ * latch keyed by the client object silently leaks the client instead.
+ *
+ * One of these is created per `withSchemaAdvisoryLock` call and covers every
+ * client that call owns: the pinned control connection it disposes of itself,
+ * and the execution connection the action disposes of through the same
+ * function. Its record is discarded with the episode itself, so nothing here
+ * keeps a client alive beyond the run that borrowed it.
+ */
+function disposeOnce(): DisposeClient {
+  // PB-10 Step 3 Phase 2d final review, CRITICAL 2: bookkeeping that *cannot*
+  // fail, rather than bookkeeping that is merely expected not to.
+  //
+  // This was a `WeakMap`, and its `get`/`set` sat between an already-acquired
+  // client and its terminal disposition: a lookup that throws means the client
+  // is never disposed of at all, which is precisely the zero-disposition escape
+  // the boundary exists to make impossible. "A native WeakMap does not throw"
+  // is an argument about the environment, not a property of this code — and the
+  // independent review demonstrated the escape by breaking exactly that
+  // assumption.
+  //
+  // What replaces it is a plain array literal this function creates itself,
+  // read and written by index only. No prototype method (not `push`, not
+  // `find`, not `includes`), no keyed collection and no property of any object
+  // this module did not construct is on the path: `length`, indexed access,
+  // indexed assignment and `===` are the whole mechanism. The claim is not that
+  // array mutation is universally infallible; it is that none of the
+  // replaceable, user-reachable functions a keyed collection would have called
+  // is on this path any more.
+  //
+  // Strong references are correct here where a WeakMap's were merely tidy: the
+  // array's own lifetime is one `withSchemaAdvisoryLock` call, it holds at most
+  // the two clients that call has checked out, and those clients are held by
+  // the pool for at least that long anyway. Nothing outlives the episode.
+  const disposed: { client: PoolClient; running: Promise<ClientDisposition> }[] = [];
+  return (client, request) => {
+    for (let index = 0; index < disposed.length; index += 1) {
+      const entry = disposed[index];
+      if (entry !== undefined && entry.client === client) return entry.running;
+    }
+    // PB-10 Step 3 Phase 2d final review, CRITICAL 2: CLAIM, then EXECUTE, then
+    // SETTLE — in that order, and the claim becomes observable before a single
+    // byte of disposition work runs.
+    //
+    // The previous shape ran the disposal body first and recorded the claim
+    // afterwards:
+    //
+    //     const running = (async () => disposeMigrationClient(client, request))();
+    //     disposed[disposed.length] = { client, running };
+    //
+    // An `async` IIFE executes synchronously up to its first `await`, and
+    // `disposeMigrationClient`'s first statement installs an 'error' listener.
+    // Node's EventEmitter emits `newListener` *synchronously, before the
+    // listener is added*, so a real `newListener` handler on the client re-enters
+    // this function while `disposed` is still empty — no claim exists yet, the
+    // loop above finds nothing, and a second, competing disposition of the same
+    // client begins. One ownership episode, two `release()` attempts. The
+    // independent review demonstrated exactly this against a native emitter.
+    //
+    // The claim is now a bare deferred: constructing it runs no lifecycle work,
+    // touches nothing the caller supplied and cannot re-enter anything, so
+    // publishing it into `disposed` is safe to do *first*. `resolve` adopts the
+    // disposal promise handed to it, so the published handle settles with the
+    // real outcome — success or rejection — for every joiner, including a
+    // synchronous reentrant one that arrives before the body has yielded.
+    let claim!: (outcome: Promise<ClientDisposition>) => void;
+    const running = new Promise<ClientDisposition>((resolve) => { claim = resolve; });
+    // Owned synchronously, because a reentrant joiner may drop the handle it is
+    // given. Every real awaiter still observes the rejection.
+    running.catch(() => undefined);
+    // The publication itself. Not a claim that array mutation is universally
+    // infallible — a claim that this path calls no `WeakMap.get`, `Map.set`,
+    // `Set.has` or `Array.prototype` method, each of which is a real,
+    // replaceable, user-reachable function, and one of which (`WeakMap`) was
+    // demonstrably able to throw between an acquired client and its disposal.
+    disposed[disposed.length] = { client, running };
+    // Only now, with ownership already visible, does anything fallible or
+    // reentrant run. The async wrapper additionally turns a *synchronous* throw
+    // from `disposeMigrationClient` into this episode's settled outcome rather
+    // than an escape past the claim.
+    claim((async () => disposeMigrationClient(client, request))());
+    return running;
+  };
+}
+
+function disposeMigrationClient(client: PoolClient, request: DisposeClientRequest = {}): Promise<ClientDisposition> {
+  return (async (): Promise<ClientDisposition> => {
+    // PB-10 Step 3 Phase 2d final review, CRITICAL 1: this function is the
+    // terminal disposition, so *it* may not be the thing that fails before one
+    // happens. Everything fallible — absorber installation, the settled-work
+    // interrogation, the reset and its baseline proof, listener removal — runs
+    // inside the guarded region below; the release itself sits after it,
+    // unguarded and unconditional, and is reached from every state this client
+    // can be in. A failure inside the region is not swallowed: it becomes the
+    // destroy reason, which is the fail-closed answer the reset-versus-destroy
+    // model already gives every other uncertain outcome.
+    //
+    // The previous shape opened with a bare `client.on("error", …)`. A client
+    // whose EventEmitter contract itself fails (a wrapping proxy, a replaced
+    // max-listeners handler, a non-function listener guard) rejected the whole
+    // disposal from that first line, and *nothing* released the client —
+    // exactly the leak the boundary exists to prevent, reached through the
+    // boundary. One such failure permanently consumes a pool slot.
+    let destroy: Error | undefined;
+    let absorbing = false;
+    try {
+      // Read inside the guarded region, never ahead of it (final review,
+      // CRITICAL 2): `request` is an object the owner supplied, and once a
+      // client is already held even a property read on it is a fallible
+      // operation that must not be able to stand between that client and its
+      // terminal action. A read that fails becomes the destroy reason, like
+      // every other uncertain outcome.
+      destroy = request.destroy;
+      // The boundary owns this client's connection-level errors for the whole
+      // of its own disposal, rather than depending on the caller having
+      // attached a listener that survives long enough. pg-pool removes its own
+      // idle-error listener the moment a client is checked out, so a socket
+      // that fails while the reset below is in flight can otherwise reach an
+      // EventEmitter with zero 'error' listeners — which is an uncaught
+      // exception, not a caught failure. Attached before any statement is
+      // issued, removed again only on the healthy path (where the pool
+      // re-attaches its own); on the destructive path it deliberately stays, so
+      // a second, delayed notification for the same root failure still lands
+      // somewhere.
+      client.on("error", reportSanitizedPoolError);
+      absorbing = true;
+      destroy = await decideDisposition(client, request, destroy);
+      // Removed inside the guarded region, before the terminal action: the
+      // owner's listener must not outlive the client's disposal, and a
+      // removal that throws must condemn the session rather than strand it.
+      if (request.ownerListener) client.removeListener("error", request.ownerListener);
+    } catch (error) {
+      destroy ??= errorValue(error);
+    }
+    if (!destroy) {
+      // Healthy release: ownership goes back to the pool, which attaches its
+      // own idle-error listener and resumes managing this client entirely, so
+      // the boundary's own absorber is handed back too rather than left behind
+      // to accumulate across reuses. Fallible, and therefore still inside the
+      // guard: a client that cannot be cleanly detached from this owner's
+      // handlers is not a client that can be proven safe for the next borrower.
+      try {
+        if (absorbing) client.removeListener("error", reportSanitizedPoolError);
+      } catch (error) {
+        destroy = errorValue(error);
+      }
+    }
+    // The one irreducible statement: pg-pool's `release()` is the terminal
+    // action itself, and there is no disposition available beyond it. It is
+    // reached unconditionally, exactly once, from every path above.
+    if (!destroy) {
+      client.release();
+      return "reused";
+    }
+    // The absorber installed above stays attached: a connection nothing will
+    // ever touch again must never let a second, delayed 'error' notification
+    // for the same root failure become an uncaught exception — pg-pool's own
+    // excision and this owner's are two windows, and each covers what the
+    // other does not.
+    client.release(destroy);
+    // Reporting is not disposition. The terminal action has already happened by
+    // the time this runs, so a warning listener that throws must not turn a
+    // correctly destroyed client into a reported disposal failure — and there
+    // is, by construction, nowhere left to report that failure to.
+    try {
+      reportDestroyedMigrationClient(destroy);
+    } catch {
+      // Intentionally ignored: see above.
+    }
+    return "destroyed";
+  })();
+}
+
+/**
+ * PB-10 Step 3 Phase 2d final review, CRITICAL 1: the reset-versus-destroy
+ * decision, extracted so that every fallible step of it sits inside the
+ * disposer's guarded region and none of it can stand between a client and its
+ * terminal release. Returns the reason the session must be destroyed, or
+ * undefined when it reset cleanly and proved its baseline.
+ */
+async function decideDisposition(
+  client: PoolClient,
+  request: DisposeClientRequest,
+  known: Error | undefined,
+): Promise<Error | undefined> {
+  let destroy = known;
+  if (!destroy && request.workSettled?.() === false) {
+    destroy = new Error("migration client work could not be proven settled; the session was destroyed rather than reset");
+  }
+  if (!destroy) {
+    const budget = new AbortController();
+    // Mapped to a value rather than left to reject: this promise can settle
+    // arbitrarily long after the budget below has already given up on it —
+    // in particular when destroying the client tears the socket out from
+    // under an in-flight reset statement — and a rejection nothing is
+    // awaiting by then would be an unhandled rejection in its own right.
+    // Owned synchronously here, exactly once, so it never can be.
+    const reset = resetPooledSession(client).then(
+      () => undefined,
+      (error: unknown) => errorValue(error),
+    );
+    // Deliberately a *referenced* timer, unlike the executor's unreferenced
+    // supervision sleeps. An unreferenced budget does not hold the event loop
+    // open, so a process whose only remaining work is a hung reset would
+    // simply exit — abandoning the disposal decision entirely and leaving the
+    // client neither reset nor destroyed, which is the one outcome this
+    // boundary exists to make impossible. The wait is short and hard-bounded,
+    // so holding the loop open for it costs nothing and guarantees the
+    // terminal action is actually reached.
+    const outcome = await Promise.race([
+      reset,
+      delay(SESSION_RESET_BUDGET_MS, "expired" as const, { signal: budget.signal }),
+    ]);
+    budget.abort();
+    if (outcome === "expired") {
+      destroy = new Error(`the pooled session reset did not complete within ${SESSION_RESET_BUDGET_MS}ms`);
+    } else if (outcome !== undefined) {
+      destroy = outcome;
+    }
+  }
+  return destroy;
+}
+
+/**
+ * PB-10 Step 3 Phase 2d: destroying a client is a correct, fail-closed outcome,
+ * but a silent one leaves an operator unable to tell "nothing happened" from
+ * "every deploy is discarding its migration connections". Narrowly scoped to
+ * the migration client lifecycle — this is not Phase 2e's broad diagnostic
+ * sanitization — and sanitized on exactly the same terms as every other
+ * absorbed PostgreSQL client diagnostic: at most one whitelisted short `.code`,
+ * never a message, stack, host, connection string, SQL text or raw object.
+ */
+function reportDestroyedMigrationClient(error: unknown): void {
+  process.emitWarning(
+    `[pg_migration_client_destroyed] a PostgreSQL connection used by the migration runner could not be proven reusable (code=${safePoolErrorCode(error)}); it was destroyed instead of returned to the pool`,
+    { code: "PB10_MIGRATION_CLIENT_DESTROYED" },
+  );
+}
+
+async function inspectLockContention(client: PoolClient): Promise<LockDiagnostic[]> {
+  const result = await client.query<LockDiagnostic>(`
+    select a.pid as holder_pid,
+           nullif(left(a.application_name, 80), '') as application_name,
+           left(coalesce(a.client_addr::text, a.client_hostname, 'local'), 80) as client_identity,
+           a.state,
+           case when a.xact_start is null then null else clock_timestamp() - a.xact_start end as transaction_age,
+           case when a.query_start is null then null else clock_timestamp() - a.query_start end as query_age,
+           a.wait_event_type,
+           case
+             when a.backend_type <> 'client backend' then 'non-client backend'
+             when a.query ~* '^[[:space:]]*select[[:space:]]+pg_(try_)?advisory_lock' then 'advisory-lock command'
+             else 'database command'
+           end as command_summary
+      from pg_catalog.pg_locks l
+      join pg_catalog.pg_stat_activity a on a.pid = l.pid
+     where l.locktype = 'advisory'
+       and l.classid = $1::oid
+       and l.objid = $2::oid
+       and l.objsubid = 2
+       and l.granted
+     order by a.pid
+  `, [...SCHEMA_ADVISORY_LOCK]);
+  return result.rows;
+}
+
+interface NormalizedSchemaLockOptions {
+  pollMs: number;
+  budgetMs: number;
+  now: () => number;
+  sleep: (milliseconds: number) => Promise<void>;
+  diagnose: (holders: LockDiagnostic[]) => void;
+}
+
+/**
+ * PB-10 Step 3 Phase 2d, CRITICAL 1: every deterministic caller-supplied lock
+ * option is validated and defaulted here, by a pure function that touches no
+ * connection at all — so the plan path can reject an invalid `pollMs` or
+ * `budgetMs` *before* it checks a client out of the pool.
+ *
+ * Validating after acquisition is exactly how a checked-out, migration-owned
+ * client used to escape with zero terminal release calls: the rejection
+ * happened between `pool.connect()` and the installation of the ownership
+ * boundary, so nothing ever released it. One such call permanently exhausts a
+ * `max: 1` pool. Deterministic input validation belongs before acquisition;
+ * everything after acquisition is covered by `withSchemaAdvisoryLock`'s
+ * finalizer regardless — which is unconditional because its protected region
+ * starts on the first statement of the function body and its disposal path
+ * does not depend on any object constructed after acquisition (final review,
+ * CRITICAL 2), not merely because a `finally` is written there.
+ */
+function normalizeSchemaLockOptions(options: SchemaLockOptions = {}): NormalizedSchemaLockOptions {
+  const pollMs = options.pollMs ?? SCHEMA_LOCK_POLL_MS;
+  const budgetMs = options.budgetMs ?? SCHEMA_LOCK_BUDGET_MS;
+  assertCondition(Number.isFinite(pollMs) && pollMs > 0, "Schema-lock poll interval must be positive");
+  assertCondition(Number.isFinite(budgetMs) && budgetMs >= 0, "Schema-lock budget must be nonnegative");
+  for (const [name, value] of [["now", options.now], ["sleep", options.sleep], ["diagnose", options.diagnose]] as const) {
+    assertCondition(value === undefined || typeof value === "function", `Schema-lock ${name} override must be a function`);
+  }
+  return {
+    pollMs,
+    budgetMs,
+    now: options.now ?? Date.now,
+    sleep: options.sleep ?? ((milliseconds: number) => delay(milliseconds, undefined, { ref: false })),
+    diagnose: options.diagnose ?? ((holders: LockDiagnostic[]) => {
+      console.warn(`[migration-plan] schema lock contention: ${JSON.stringify(holders)}`);
+    }),
+  };
+}
+
+/**
+ * PB-10 Step 3 Phase 2d: the action receives the terminal lifecycle boundary as
+ * its second argument, so the migration executor disposes of its *own*
+ * execution connection through the exact same code path this function disposes
+ * of the pinned control connection through — one implementation, one
+ * exactly-once guarantee, one reset-versus-destroy decision, for every
+ * migration-owned pooled client. A caller that does not own a second connection
+ * (the read-only plan path below) simply ignores it.
+ *
+ * PB-10 Step 3 Phase 2d, HIGH 1: this function, the disposer it hands out and
+ * every type naming either of them are module-private, and live here rather
+ * than in runner.ts precisely so that they can be. Both callers that need the
+ * boundary — `executeMigrations(pool)` and `runMigrationPlan(pool)` — are
+ * defined in this same file, so the ownership capability never crosses a module
+ * boundary and therefore never appears in an emitted runtime export or `.d.ts`
+ * declaration. Production code cannot obtain, invoke, replace, retain or wrap
+ * it; runner.ts's `runMigrationPlan` is a thin delegation to the approved entry
+ * point below, not a second way in.
+ *
+ * The exactly-once latch is created here, per call — as the first statement of
+ * the protected region, never before it (final review, CRITICAL 2) — and covers
+ * both clients: one migration run's ownership of a pooled client begins and ends
+ * inside one invocation of this function, and a later run through the same pool
+ * is a new episode that must dispose of its clients again from scratch.
+ */
+async function withSchemaAdvisoryLock<T>(
+  client: PoolClient,
+  action: (lockedClient: PoolClient, disposeClient: DisposeClient) => Promise<T>,
+  options: SchemaLockOptions = {},
+): Promise<T> {
+  // PB-10 Step 3 Phase 2d final review, CRITICAL 2: the control client is
+  // already checked out when this function is entered, so the protected region
+  // starts on the *first statement* of the body. Nothing fallible — not even
+  // the construction of the disposer that will finalize this client — is
+  // allowed to run ahead of it. The previous shape built the disposer before
+  // the `try`, which made the control client's finalization depend on the
+  // successful construction of another lifecycle object; the fallback in the
+  // `finally` below removes that dependency structurally rather than by
+  // arguing that one particular constructor happens not to throw.
+  //
+  // Option normalization, callback construction, listener installation and lock
+  // setup all happen inside the region too, so no rejection on any path can
+  // leave this client without exactly one terminal disposition. The caller's own
+  // deterministic options are additionally rejected before acquisition (see
+  // normalizeSchemaLockOptions); this is the defence that does not depend on the
+  // caller having done so.
+  let disposeClient: DisposeClient | undefined;
+  let acquired = false;
+  let connectionError: Error | undefined;
+  let onConnectionError: ((error: Error) => void) | undefined;
+  let value: T | undefined;
+  let actionError: Error | undefined;
+  let cleanupError: Error | undefined;
+  let disposalError: Error | undefined;
+  try {
+    const dispose = disposeClient = disposeOnce();
+    const { pollMs, budgetMs, now, sleep, diagnose } = normalizeSchemaLockOptions(options);
+    const startedAt = now();
+    let rejectConnectionLoss!: (error: Error) => void;
+    const connectionLost = new Promise<never>((_resolve, reject) => {
+      rejectConnectionLoss = reject;
+    });
+    // connectionLost is raced against below, but only while a race is
+    // actually in flight (lock polling, then the action itself). A
+    // connection-level error can also arrive later — during the advisory
+    // unlock attempt in the finally block, or in the gap immediately after —
+    // when nothing is racing this promise any more; without a permanent
+    // handler that later rejection would be an unhandled rejection in its own
+    // right, on top of the ownership problem this function exists to avoid.
+    connectionLost.catch(() => undefined);
+    onConnectionError = (error: Error) => {
+      connectionError = errorValue(error);
+      rejectConnectionLoss(connectionError);
+    };
+    // A persistent listener, not .once(): ownership requires staying informed
+    // of a connection failure for the client's entire held lifetime — lock
+    // acquisition, the action, and the unlock/release cleanup that follows —
+    // not just the first error observed before that cleanup begins. It is
+    // removed only once release/destruction below is complete, at which point
+    // the pool resumes its own management of the client.
+    client.on("error", onConnectionError);
+
+    // Bound every statement on the pinned connection before the first probe, so
+    // a plan blocked behind concurrent DDL cannot hold the schema lock forever.
+    //
+    // These are session-scoped, deliberately: SET LOCAL has nowhere to live
+    // outside a transaction, and this connection is in autocommit for its whole
+    // held lifetime. PB-10 Step 3 Phase 2d closes what that used to leave
+    // behind — the terminal boundary in the finally below resets and re-proves
+    // the session baseline before this client is ever handed to another
+    // borrower, so a shared pool is now as safe here as the single-use CLI pool.
+    for (const [setting, milliseconds] of [
+      ["statement_timeout", SCHEMA_STATEMENT_TIMEOUT_MS],
+      ["lock_timeout", SCHEMA_LOCK_TIMEOUT_MS],
+    ] as const) {
+      await client.query("select set_config($1, $2, false)", [setting, String(milliseconds)]);
+    }
+
+    while (!acquired) {
+      if (connectionError) throw connectionError;
+      const result = await client.query<{ acquired: boolean }>(
+        "select pg_try_advisory_lock($1, $2) as acquired",
+        [...SCHEMA_ADVISORY_LOCK],
+      );
+      acquired = result.rows[0]?.acquired === true;
+      if (acquired) break;
+
+      diagnose(await inspectLockContention(client));
+      const elapsed = now() - startedAt;
+      if (elapsed >= budgetMs) throw new Error(`Schema advisory lock was not acquired within ${budgetMs}ms`);
+      await Promise.race([sleep(Math.min(pollMs, budgetMs - elapsed)), connectionLost]);
+    }
+    // PB-10 Step 3 Phase 2c: the migration action is *never* raced against
+    // connectionLost, and never abandoned on a timer.
+    //
+    // Losing the pinned control connection is precisely the moment the action
+    // is performing its one mandatory durable step: arming the
+    // commit_outcome_unknown replay guard, deliberately over an independent
+    // connection this failure does not touch. Everything this function owns —
+    // the advisory lock, the pinned client, and the caller's own knowledge of
+    // the outcome — is what keeps a *second* execution from replaying a
+    // migration whose real outcome is unknown. Returning, releasing, or
+    // unlocking while that append is still in flight hands ownership away
+    // before the durable marker exists, which is the replay window itself.
+    //
+    // A deadline cannot make that safe: expiring one would abandon mandatory
+    // durability work and release ownership anyway, only less predictably. So
+    // there is no deadline here at all. The wait is bounded instead by the
+    // things that genuinely bound it — every query still outstanding on a
+    // lost connection is rejected by the driver as soon as it emits 'error',
+    // and the durable fallback carries its own finite connect timeout and a
+    // fixed retry count — and if the database is truly unreachable the action
+    // fails closed on its own and rethrows here.
+    const running = action(client, dispose);
+    // Owned synchronously: `running` is the only object that can carry the
+    // action's outcome, and nothing else ever attaches a handler to it, so an
+    // inert observer is taken here rather than left to chance.
+    running.catch(() => undefined);
+    // The action's own outcome is authoritative whenever it produced one: it
+    // — not the raw socket error — knows whether the ambiguity was durably
+    // recorded and which error class the run actually ended on. A connection
+    // failure observed while it was running is only surfaced when the action
+    // itself completed without reporting a failure of its own.
+    value = await running;
+    if (connectionError) throw connectionError;
+  } catch (error) {
+    actionError = errorValue(error);
+  } finally {
+    // The lock is only worth releasing if the connection wasn't already
+    // known bad going in, and doing so is skipped entirely once it is —
+    // never depend on an unlock succeeding when connection health is
+    // already uncertain. An ordinary SQL error from the action (or from
+    // this unlock query itself) does not set connectionError: that signal
+    // is reserved for the client's own 'error' event, which PostgreSQL
+    // drivers raise specifically for connection-level failures (backend
+    // termination, socket failure, connection reset) and never for a mere
+    // query rejection — exactly the distinction an ownership decision here
+    // needs to make.
+    if (!connectionError && acquired) {
+      try {
+        const result = await client.query<{ unlocked: boolean }>(
+          "select pg_advisory_unlock($1, $2) as unlocked",
+          [...SCHEMA_ADVISORY_LOCK],
+        );
+        assertCondition(result.rows[0]?.unlocked === true, "Schema advisory unlock returned false");
+      } catch (error) {
+        cleanupError = errorValue(error);
+      }
+    }
+    // connectionError is read again here, after the unlock attempt (if any):
+    // a connection failure observed at any point up to and including that
+    // attempt — even one that arrives just as an apparently-successful
+    // unlock response comes back — must still result in a destructive
+    // release, never a healthy one trusted back into the pool.
+    // PB-10 Step 3 Phase 2d: exactly one terminal disposition, through the one
+    // boundary, on every path. Reached only *after* the advisory unlock above,
+    // which is what keeps a healthy reset from ever being the thing that drops
+    // this run's schema lock: DISCARD ALL calls pg_advisory_unlock_all(), so
+    // resetting before the explicit unlock had been issued and asserted would
+    // have quietly replaced Phase 2c's proven unlock with an unproven one.
+    //
+    // A destructive disposition still owns a listener swap, and the boundary
+    // performs it: this client will never return to the pool, and a genuinely
+    // dead connection can still emit a second, delayed 'error' notification for
+    // the very same underlying failure (a query rejection and the raw socket's
+    // own event, both stemming from one root termination, are not guaranteed to
+    // be one event), which must never become an uncaught exception. A healthy
+    // disposition instead stops listening entirely, so the pool's own idle
+    // listener can attach. Both cases now live in one place.
+    //
+    // The session reset itself deliberately runs while onConnectionError is
+    // still attached: a connection that dies mid-reset both sets
+    // connectionError and rejects the reset statement, and either one alone
+    // already destroys the client. Fail-closed twice over, never once short.
+    //
+    // PB-10 Step 3 Phase 2d final review, CRITICAL 2: `disposeOnce()` is the
+    // first statement of the protected region, so the only way it can be
+    // missing here is that its own construction failed — in which case no
+    // disposer ever existed, no action ever ran and therefore nothing can
+    // already have disposed of this client. Finalizing it directly is then both
+    // safe and still exactly-once; ownership of the control client never
+    // depends on another object having been built successfully.
+    //
+    // PB-10 Step 3 Phase 2d final review, CRITICAL 3: the disposal's own
+    // failure is captured here rather than allowed to propagate out of this
+    // `finally`. An exception thrown from a `finally` discards whatever the
+    // `try` was already failing with, so an unguarded await on this line let a
+    // failed cleanup silently replace — and erase — the migration's own primary
+    // failure. It is composed with it below instead, exactly as the execution
+    // connection's disposal already is.
+    //
+    // A `try`/`catch` rather than a trailing `.catch(…)`: `.catch` is only
+    // attached once a promise exists, so it covers a *rejected* disposal and
+    // not a disposer that throws before returning one. Both are captured here.
+    try {
+      await (disposeClient ?? disposeMigrationClient)(client, {
+        destroy: connectionError ?? cleanupError,
+        ownerListener: onConnectionError,
+      });
+    } catch (error) {
+      disposalError = errorValue(error);
+    }
+  }
+
+  // Primary first, always: `actionError` is the migration's own outcome, and
+  // cleanup failures are additional information about it, never a replacement
+  // for it. A single failure is thrown as itself (unchanged from Phase 2c's
+  // contract); two or more are composed into one AggregateError whose first
+  // element is the primary failure.
+  const failures = [actionError, cleanupError, disposalError].filter((failure): failure is Error => failure !== undefined);
+  if (failures.length > 1) throw new AggregateError(failures, "Migration plan and lock cleanup failed");
+  if (failures.length === 1) throw failures[0];
+  return value as T;
+}
+
+/**
+ * The read-only migration plan, taken under the schema advisory lock and
+ * disposed of through the very same terminal ownership boundary as an
+ * execution run.
+ *
+ * PB-10 Step 3 Phase 2d, HIGH 1: this lives here, beside the boundary, so that
+ * the boundary itself never has to be exported. runner.ts keeps its own
+ * `runMigrationPlan` as a thin delegation to this function, preserving the
+ * existing public plan surface without providing a second way to reach the
+ * lock lifecycle or the client disposer.
+ */
+export async function runMigrationPlan(
+  pool: Pool,
+  options: SchemaLockOptions & { manifest?: MigrationManifest } = {},
+): Promise<MigrationPlan> {
+  const manifest = options.manifest ?? await checkManifest();
+  // PB-10 Step 3 Phase 2d, CRITICAL 1: deterministic caller input is rejected
+  // here, while this call still owns no database resources at all. Nothing
+  // between the acquisition below and the boundary's own unconditional
+  // finalizer can throw.
+  normalizeSchemaLockOptions(options);
+  const client = await pool.connect();
+  return withSchemaAdvisoryLock(client, async (lockedClient) => {
+    await verifyControlSchema(lockedClient);
+    const rows = await readAppliedRows(lockedClient);
+    await assertNoLegacyLedgerDivergence(lockedClient, rows, manifest);
+    return buildMigrationPlan(manifest, rows, options);
+  }, options);
+}
+
 async function executeVerifiedMigrations(
   pool: Pool,
   manifest: MigrationManifest,
@@ -3429,7 +4353,7 @@ async function executeVerifiedMigrations(
   const migrationDirectory = path.join(repositoryRoot, "db", "migrations");
 
   const control = await pool.connect();
-  return withSchemaAdvisoryLock(control, async (lockedControl) => {
+  return withSchemaAdvisoryLock(control, async (lockedControl, disposeClient) => {
     // Nothing below runs a single byte of migration SQL until the lock is held
     // and the control schema, manifest and applied ledger have all verified.
     await verifyControlSchema(lockedControl);
@@ -3453,8 +4377,10 @@ async function executeVerifiedMigrations(
 
     let controlLost: Error | undefined;
     let destroyExecution: Error | undefined;
-    let executionReleased = false;
-    const execution = await pool.connect();
+    let runError: Error | undefined;
+    let executionDisposalError: Error | undefined;
+    let controlCleanupError: Error | undefined;
+
     // PB-10 Step 3 Phase 2c: pg-pool removes its own idle-error listener the
     // moment a client is checked out (_acquireClient), so a checked-out
     // client normally has no 'error' listener at all — a query rejection
@@ -3465,44 +4391,154 @@ async function executeVerifiedMigrations(
     // own persistent listener below for exactly the same reason: whichever
     // outcome the query-rejection path already resolved to must be the only
     // one that matters, never a second, separately-emitted socket error.
+    //
+    // PB-10 Step 3 Phase 2d, CRITICAL 1: declared here, *installed* far below
+    // and only from inside the ownership boundary. Creating the function
+    // cannot throw; `execution.on(...)` can, and until this run's finalizer
+    // exists there is nothing that would release the client if it did.
     const onExecutionError = (): void => undefined;
-    execution.on("error", onExecutionError);
-    const releaseExecution = (error?: Error): void => {
-      if (executionReleased) return;
-      executionReleased = true;
-      if (error) {
-        // A connection nothing will ever touch again must never let a
-        // second, delayed 'error' notification for the same root failure
-        // become an uncaught exception — the same reasoning as the control
-        // connection's own destructive-release path below.
-        execution.removeListener("error", onExecutionError);
-        execution.on("error", reportSanitizedPoolError);
-      } else {
-        // Healthy release: ownership goes back to the pool, which attaches
-        // its own idle-error listener — this listener has no further job.
-        execution.removeListener("error", onExecutionError);
-      }
-      execution.release(error);
+
+    // PB-10 Step 3 Phase 2d: the count of operations that own this execution
+    // client and may still be using it. Every supervised operation and every
+    // batched batch is registered here the instant it starts, and the terminal
+    // boundary refuses to issue a single reset statement while any of them is
+    // unproven — a reset racing an operation that still holds the session is
+    // exactly the corruption Phase 2d exists to make impossible.
+    //
+    // A count, deliberately, rather than a drain: a client-owned operation that
+    // has not settled may never settle at all (a cancellation PostgreSQL never
+    // confirmed is precisely that case), so waiting on one is not an option the
+    // boundary can be given. Unsettled work destroys the client instead, which
+    // is both fail-closed and finite.
+    //
+    // `settle` cannot throw and the promise it is attached to already carries
+    // its own outcome handling at every call site, so neither `.then` arm can
+    // produce an unhandled rejection or an unowned outcome here.
+    let outstandingExecutionWork = 0;
+    const settle = (): void => { outstandingExecutionWork -= 1; };
+    const noteExecutionWork = (work: Promise<unknown>): void => {
+      outstandingExecutionWork += 1;
+      void work.then(settle, settle);
+    };
+
+    // PB-10 Step 3 Phase 2d, CRITICAL 1: acquisition. From this line until the
+    // `try` below, every statement is a bare declaration or a function-
+    // expression construction — operations the language cannot fail — so the
+    // finalizer is reachable from every state this client can be in. Listener
+    // installation, callback invocation, option access, RunLog construction,
+    // the independent-control acquirer and every other fallible step happen
+    // *inside* the boundary. An earlier revision installed the execution
+    // client's own 'error' listener here, between checkout and the try: a
+    // synchronous throw from that single `execution.on(...)` call left a
+    // checked-out client with zero terminal dispositions, and one such failure
+    // permanently exhausts a `max: 1` pool.
+    const execution = await pool.connect();
+
+    // PB-10 Step 3 Phase 2d: one owner, one terminal action, exactly once —
+    // and the exactly-once guarantee lives in the boundary itself (keyed by the
+    // client object), not in a latch here, so a second caller reaching this
+    // from a different code path can never issue a second release or a second
+    // reset. Memoized so the connection-loss path below can start disposal
+    // synchronously from an event handler while the run loop's own `finally`
+    // still awaits the very same promise rather than leaving it detached.
+    let executionDisposal: Promise<"reused" | "destroyed"> | undefined;
+    const disposeExecution = (error?: Error): Promise<"reused" | "destroyed"> => {
+      // PB-10 Step 3 Phase 2d final review, CRITICAL 2: the same CLAIM → EXECUTE
+      // → SETTLE ordering the episode latch itself now uses, applied to this
+      // run's own memo, because this is the *outer* of the two gates a reentrant
+      // caller passes through and it had the identical defect.
+      //
+      // The previous shape assigned the memo from the result of the call:
+      //
+      //     executionDisposal = (async () => disposeClient(execution, …))();
+      //
+      // The async wrapper's body runs synchronously up to its first `await`, and
+      // that body reaches straight into the disposer's listener installation.
+      // A synchronous re-entry from there — `newListener` is emitted before the
+      // listener is added, and the control client's 'error' handler below calls
+      // this very function — found `executionDisposal` still `undefined`,
+      // because the assignment had not happened yet, and started a second
+      // disposition of an execution client that already had one in flight.
+      //
+      // The memo is now published *before* the body runs, as a bare deferred
+      // whose construction is not observable to anything outside this function.
+      // Any second caller — synchronous, reentrant, or an ordinary concurrent
+      // one — receives this same handle and joins the disposition already
+      // claimed; its `error` argument is deliberately ignored, because the first
+      // claimant's reason is this episode's reason and a joiner must not be able
+      // to start a second terminal action.
+      if (executionDisposal) return executionDisposal;
+      let claim!: (outcome: Promise<"reused" | "destroyed">) => void;
+      executionDisposal = new Promise<"reused" | "destroyed">((resolve) => { claim = resolve; });
+      // Owned synchronously, the same way every other promise this run starts
+      // is: the connection-loss handler below starts disposal from an event
+      // callback and drops the returned promise, so an inert observer is taken
+      // here rather than relying on the run loop's own `finally` attaching one
+      // before the microtask checkpoint. The `finally` still awaits this exact
+      // promise and still captures its failure.
+      executionDisposal.catch(() => undefined);
+      claim((async () => disposeClient(execution, {
+        destroy: error,
+        ownerListener: onExecutionError,
+        workSettled: () => outstandingExecutionWork === 0,
+      }))());
+      return executionDisposal;
     };
     const onControlError = (error: Error) => {
-      controlLost = error instanceof Error ? error : new Error(String(error));
+      // PB-10 Step 3 Phase 2d final review, CRITICAL 1: the total conversion.
+      // `emit('error', x)` carries whatever value the emitter was given, and an
+      // inline `String(x)` here threw *before* the disposal below was started —
+      // an already-acquired execution client with zero terminal dispositions,
+      // reached from an event handler nothing was guarding.
+      controlLost = errorValue(error);
       // Destroy the execution connection immediately rather than at the end of
       // the run. Its transaction is still in flight, and without the control
       // connection nothing can record or supervise it — an orphaned COMMIT
-      // would write an applied row for a run that has already aborted.
-      releaseExecution(controlLost);
+      // would write an applied row for a run that has already aborted. The
+      // returned promise is retained, never dropped: the run loop's `finally`
+      // awaits this exact disposal, so nothing here is detached and no reset
+      // statement can be in flight after this function returns.
+      disposeExecution(controlLost);
     };
-    lockedControl.once("error", onControlError);
-
-    const runLog = new RunLog(lockedControl, runId, identity, manifest);
-    const runStartedAt = now();
-    // PB-10 Step 3 Phase 2c blocker 3: never contends with `lockedControl`/
-    // `execution` for one of the pool's own (as low as 2) slots — see
-    // independentControlAcquirer's own doc for why pool.connect() here would
-    // deadlock.
-    const acquireIndependentControl = independentControlAcquirer(pool);
-
+    // PB-10 Step 3 Phase 2d: ownership of `execution` becomes unconditional
+    // from here on. Everything between acquiring it and the run loop used to
+    // sit *outside* the try below — the execution client's own 'error'
+    // listener, the control listener, the RunLog, the independent-control
+    // acquirer — so a throw from any of them (a RunLog constructor that
+    // rejected its inputs, say) leaked a checked-out client that nothing would
+    // ever release: with a `max: 2` production pool, the second such failure
+    // exhausts the pool permanently. The try starts immediately after
+    // acquisition instead, so the terminal boundary in the `finally` is
+    // reachable from every path that can exist once the client is held.
     try {
+      // PB-10 Step 3 Phase 2d, CRITICAL 1: the first fallible statement of the
+      // run, and deliberately the first one inside the boundary.
+      //
+      // Failing to install it is classified destructive rather than reusable,
+      // through the ordinary reset-versus-destroy model rather than a
+      // special-case release path. The justification is substantive, not
+      // precautionary: this listener is the only thing standing between a
+      // raw connection-level 'error' on this session and an uncaught
+      // exception, the session reset the healthy path would otherwise run
+      // issues real statements on that unprotected session, and a client whose
+      // own EventEmitter contract just failed cannot be proven safe to hand to
+      // the next borrower. "Uncertain" is never "reusable".
+      try {
+        execution.on("error", onExecutionError);
+      } catch (error) {
+        destroyExecution = errorValue(error);
+        throw error;
+      }
+      lockedControl.once("error", onControlError);
+
+      const runLog = new RunLog(lockedControl, runId, identity, manifest);
+      const runStartedAt = now();
+      // PB-10 Step 3 Phase 2c blocker 3: never contends with `lockedControl`/
+      // `execution` for one of the pool's own (as low as 2) slots — see
+      // independentControlAcquirer's own doc for why pool.connect() here would
+      // deadlock.
+      const acquireIndependentControl = independentControlAcquirer(pool);
+
       for (const [index, pending] of plan.pendingMigrations.entries()) {
         if (controlLost) {
           throw new MigrationExecutionError("control_connection_lost", "the control connection was lost; execution aborted");
@@ -3533,6 +4569,7 @@ async function executeVerifiedMigrations(
           destroyExecution: () => {
             destroyExecution = new MigrationExecutionError("cancellation_unverified", "the execution connection was destroyed", entry.id);
           },
+          noteExecutionWork,
           acquireIndependentControl,
         };
 
@@ -3552,10 +4589,75 @@ async function executeVerifiedMigrations(
         });
         report.executedCount += 1;
       }
+    } catch (error) {
+      // PB-10 Step 3 Phase 2d, CRITICAL 1: held rather than propagated, so the
+      // disposal below cannot be skipped and cannot silently replace it — the
+      // same actionError/cleanupError composition withSchemaAdvisoryLock
+      // already applies to the control connection.
+      runError = errorValue(error);
     } finally {
-      lockedControl.removeListener("error", onControlError);
-      releaseExecution(destroyExecution);
+      // PB-10 Step 3 Phase 2d final review, CRITICAL 1: the execution client's
+      // terminal disposition is the *first* statement of this `finally`, and
+      // nothing fallible is allowed in front of it.
+      //
+      // The previous shape opened with `lockedControl.removeListener(…)` — a
+      // synchronous call on an object whose EventEmitter contract this code
+      // does not own. A throw from it skipped the disposal entirely: the
+      // execution client, already checked out, received *zero* terminal
+      // disposition attempts and stayed checked out forever, while the control
+      // client's own boundary went on releasing only the control client. One
+      // occurrence permanently consumes a slot of a bounded production pool.
+      //
+      // The correction is the ownership rule itself, not a guard around that
+      // one call: from the instant `execution` is acquired, the only statement
+      // that may run before its disposition is one that cannot fail, and every
+      // fallible operation that is *not* this client's disposition — listener
+      // bookkeeping for the control client included — happens after it, inside
+      // its own guard, and is composed into the run's outcome rather than
+      // thrown out of this `finally`.
+      //
+      // Awaited, never fired and forgotten: the session reset issues real SQL
+      // on this connection, and returning from here — let alone releasing the
+      // control connection and the schema advisory lock above it — while that
+      // is still in flight would hand ownership away mid-cleanup. Every durable
+      // Phase 2c step (reconciliation, the ambiguity marker, the applied row,
+      // every ledger event) has already completed by the time this runs: the
+      // run loop above is what performs them, and this `finally` cannot begin
+      // until it has left.
+      //
+      // The rejection is captured, never allowed to escape: a disposal that
+      // failed must not become the reported failure in place of the run's own
+      // error. It is composed with it below instead. A `try`/`catch` rather
+      // than a trailing `.catch(…)`, so a disposer that throws before returning
+      // a promise is captured on exactly the same terms as one that rejects.
+      try {
+        await disposeExecution(destroyExecution);
+      } catch (error) {
+        executionDisposalError = errorValue(error);
+      }
+      // Only now, and only inside its own guard: this is bookkeeping for a
+      // *different* client, whose terminal boundary is withSchemaAdvisoryLock's
+      // own `finally` and which is therefore disposed of regardless of what
+      // happens here. A failure is a cleanup failure — composed below, never
+      // thrown out of this `finally`, where it would silently replace the
+      // migration's own outcome.
+      try {
+        lockedControl.removeListener("error", onControlError);
+      } catch (error) {
+        controlCleanupError = errorValue(error);
+      }
     }
+
+    // Primary first, always, exactly as withSchemaAdvisoryLock composes the
+    // control connection's own failures: the run's own error is the migration's
+    // outcome, and a cleanup or disposal failure is additional information
+    // about it — never a replacement for it.
+    const failures = [runError, executionDisposalError, controlCleanupError]
+      .filter((failure): failure is Error => failure !== undefined);
+    if (failures.length > 1) {
+      throw new AggregateError(failures, "Migration execution and execution-connection disposal failed");
+    }
+    if (failures.length === 1) throw failures[0];
 
     if (controlLost) {
       throw new MigrationExecutionError("control_connection_lost", "the control connection was lost; execution aborted");

@@ -144,10 +144,24 @@ export function classify(error: unknown, errorClass: ErrorClass, migrationId: st
  */
 const SAFE_ERROR_CODE = /^[A-Za-z0-9_]{1,10}$/;
 
+/**
+ * PB-10 Step 3 Phase 2d final review, CRITICAL 1: guarded, because both
+ * remaining operations here can run code this module does not own. `"code" in x`
+ * invokes a Proxy's `has` trap and `x.code` invokes a getter, either of which
+ * may throw — and this function's callers are a client 'error' listener (where a
+ * throw becomes an uncaught exception) and the destroyed-client report issued
+ * immediately after a terminal `release()`. A diagnostic must never be able to
+ * outrank the thing it is describing, so an unreadable value simply reports
+ * UNKNOWN, exactly as a value with no code at all does.
+ */
 export function safePoolErrorCode(error: unknown): string {
-  if (error && typeof error === "object" && "code" in error) {
-    const code = (error as { code: unknown }).code;
-    if (typeof code === "string" && SAFE_ERROR_CODE.test(code)) return code;
+  try {
+    if (error && typeof error === "object" && "code" in error) {
+      const code = (error as { code: unknown }).code;
+      if (typeof code === "string" && SAFE_ERROR_CODE.test(code)) return code;
+    }
+  } catch {
+    // Intentionally ignored: see above.
   }
   return "UNKNOWN";
 }

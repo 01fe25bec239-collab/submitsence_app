@@ -451,9 +451,293 @@ Implemented and covered by durable regressions:
 
 Not implemented, and deliberately not claimed:
 
-- pooled-session reset after a destroyed/discarded connection — Phase 2d;
 - broader error and diagnostic sanitization beyond the fixed error-class vocabulary already
   enforced — Phase 2e.
+
+### Phase 2d — pooled-session ownership, reset and safe return
+
+Every PostgreSQL connection a migration run holds — the pinned control connection and, when there is
+work to do, the execution connection — is owned by one terminal lifecycle boundary, and reaches
+exactly one terminal disposition **attempt** through it.
+
+Two different guarantees are involved, and the distinction is load-bearing rather than pedantic:
+
+- **What this code guarantees.** From the instant a client is successfully checked out, every path —
+  success, migration failure, connection loss, timeout, a synchronous throw from any setup, cleanup
+  or bookkeeping step — reaches exactly one call to `release()` or `release(error)` for that client,
+  within that ownership episode. Never zero, never two.
+- **What this code cannot guarantee.** `release()` is `pg-pool`'s, not ours. A pathological
+  underlying `pg-pool` or `EventEmitter` implementation may perform an irreversible side effect and
+  *then* throw; application code cannot rewind an external side effect that has already happened. If
+  that occurs the connection may be unusable, or the pool's own accounting of it may be wrong, after
+  our attempt. We report the failure — composed with the run's own error, never in place of it — and
+  there is no further disposition available to us. "Exactly one application-level terminal
+  disposition attempt" is the strongest claim the implementation can honestly make; "the pool remains
+  physically reusable no matter how broken the client or the pool is" is not, and is not claimed
+  anywhere below.
+- **Error guarantee.** Once an original migration or action failure exists, nothing that happens
+  afterwards — cleanup, diagnostics, error normalization, or the terminal disposition itself — can
+  silently replace it. It is composed with the later failures, always in first position.
+- **Reentrancy guarantee.** A second disposer call for a client that already has an owner — including
+  a *synchronous* reentrant one reached from inside the first disposition's own first statement —
+  joins the ownership episode already claimed and returns its outcome. It cannot begin a second
+  terminal action, and it cannot supply a different destroy reason for an episode already underway.
+
+**Ownership boundary.** The boundary is a module-private declaration inside
+`backend/src/db/migrate/execute.ts`. It is not exported, its callback's client disposer is not
+exported, and no emitted `.js` or `.d.ts` in the build names either one; a regression in
+`backend/test/migration-execute.test.ts` compiles the project to a disposable directory and asserts
+that, including that **no exported function declares a callback parameter at all**, so there is no
+seam through which ownership control could be handed to a caller. The two entry points that need the
+boundary — `executeMigrations(pool)` and `runMigrationPlan(pool)` — are defined in that same file, so
+the capability never crosses a module boundary. `runner.ts` keeps `runMigrationPlan` as a thin
+delegation for compatibility; it acquires nothing and owns nothing.
+
+Ordering is fixed and asserted. It is stated below as what the implementation structurally
+guarantees, not as an aspiration: "the finalizer is unconditional" is only true because each of the
+steps below is placed where it is.
+
+**Control connection** (`executeMigrations(pool)` and `runMigrationPlan(pool)` alike):
+
+1. **pre-acquisition work.** Deterministic caller options (`pollMs`, `budgetMs`, and the
+   `now`/`sleep`/`diagnose` overrides) are validated, and the manifest is checked, **before** a
+   client is checked out of the pool, so an invalid option cannot strand an acquired connection;
+2. **acquisition.** `pool.connect()` returns the control client; the only statement between it and
+   the lock owner's own body is the call itself;
+3. **ownership established.** The lock owner's protected region starts on the *first statement* of
+   its body, so the client is covered by a `finally` before anything else runs. The per-episode
+   exactly-once latch is constructed **inside** that region, and the `finally` falls back to
+   disposing the client directly if that construction is the thing that failed — so finalization of
+   an already-acquired connection never depends on another lifecycle object having been built
+   successfully first;
+4. **fallible setup and action, all inside the region.** Option normalization, connection-loss
+   callback creation, the client's own `'error'` listener installation, statement/lock timeout setup,
+   lock polling and the migration action itself. A synchronous throw from any of them still reaches
+   the finalizer;
+5. Phase 2c's explicit `pg_advisory_unlock` is issued and asserted;
+6. **only then** the session reset runs. `DISCARD ALL` calls `pg_advisory_unlock_all()`, so resetting
+   earlier would silently replace Phase 2c's proven unlock with an unproven one;
+7. **terminal disposition,** exactly once: a normal release, or a destructive one.
+
+**Execution connection** (only when there is pending work): identical shape, one level in. The
+control connection's lock is already held and the control schema, manifest and ledger have all
+verified before it is acquired; between `pool.connect()` and its `try` there are only variable
+declarations and function-expression constructions — operations that evaluate no user code, read no
+property of an object this file did not create, and have no failure mode. Its own `'error'` listener
+is registered as the **first statement of the `try`**, not between checkout and it, along with
+callback creation, `RunLog` construction, the independent-control acquirer, handler lookup and every
+manifest-dependent step.
+
+On the way out, the same rule applies in reverse, and it is where the boundary previously leaked:
+the execution client's terminal disposition is the **first statement of the run's `finally`**, and
+everything that is not that client's disposition happens *after* it, each inside its own guard.
+Removing the *control* client's `'error'` listener used to run first; a synchronous throw from that
+one call — an `EventEmitter` method neither this file nor `pg` fully owns — skipped the disposal of
+an entirely different, already checked-out connection, which then reached zero terminal disposition
+attempts and stayed checked out for the life of the process. It now runs after the disposal, and a
+failure from it is a *cleanup* failure composed into the run's outcome, never an exception thrown out
+of a `finally`.
+
+`backend/test/migration-execute.test.ts` drives all of this through the real `executeMigrations(pool)`
+path: a synchronous listener-*registration* failure, a persistent one, a synchronous listener-*removal*
+failure on the control client, and a release that itself throws — each asserting exactly one terminal
+disposition attempt per client and a pool with nothing left checked out.
+
+**The disposer is itself inside the guarantee, not outside it.** The terminal boundary's own fallible
+steps — installing its absorbing `'error'` listener, interrogating whether client-owned work has
+settled, the reset, the baseline proof, and listener removal — all run inside a guarded region whose
+failures become the *destroy reason*. The `release()` sits after that region and is reached from
+every state the client can be in, which is true only because the sole operation standing between the
+guarded region and the release — converting the caught value into a destroy reason — is itself
+total (see the next paragraph). It was not always: for one class of thrown value, that conversion
+threw and the release was never reached at all. This matters concretely: a client whose EventEmitter
+contract itself fails (a wrapping proxy, a replaced max-listeners handler) used to make the disposer
+reject on its first line and issue no terminal action at all. Both suites drive exactly that client —
+control and execution — and assert one destructive disposition and an unexhausted pool.
+
+Reading the owner's request object is inside the guard too, for the same reason: once a client is
+held, even a property read on a caller-supplied object is a fallible operation that must not stand in
+front of the terminal action. The only statement deliberately left outside the guard is
+`client.release(...)` itself, because it *is* the terminal action and there is no disposition beyond
+it. A `release()` that throws is therefore still the one and only attempt (a second would be a
+duplicate disposition, which the model forbids and both suites' fakes detect); its failure is
+reported, and what state `pg-pool` is left in afterwards is the external-behaviour limit described at
+the top of this section. The sanitized destruction warning is emitted after the release and its own
+failure is ignored: reporting is not disposition, and a warning listener that throws must not turn a
+correctly destroyed client into a reported disposal failure.
+
+**Error normalization is total.** JavaScript permits `throw x` for any `x`, and the disposer converts
+a caught value to an `Error` from inside the `catch` that stands between an already-acquired client
+and its `release()`. That conversion was `error instanceof Error ? error : new Error(String(error))`,
+and both halves are fallible: `String(x)` performs `ToPrimitive`, which runs `Symbol.toPrimitive`,
+`valueOf` or `toString` — user code that may throw, and which is absent altogether on a
+null-prototype object such as `Object.create(null)`, where the language throws a `TypeError` of its
+own; and `instanceof` is not a safe pre-check either, because for a `Proxy` it walks the prototype
+chain through the `getPrototypeOf` trap. The independent review demonstrated the consequence on both
+ownership paths: a setup call that threw such a value made the conversion throw, and the client
+reached its `release()` **zero** times.
+
+There is now one conversion primitive and it is total — for every JavaScript value it returns an
+`Error` and does not throw:
+
+- a real `Error` is returned unchanged, so error *identity* (which the `AggregateError` ordering
+  contract and several tests depend on) is preserved;
+- values whose `typeof` already proves they are primitives — string, number, bigint, boolean, symbol,
+  `undefined` — and `null` are converted with `String()`, where the language guarantees no user code
+  runs, so ordinary thrown primitives stay diagnostically useful;
+- objects, functions and proxies are described by a fixed literal and never coerced, so a hostile
+  value degrades the diagnostic instead of aborting the disposition;
+- the whole thing, `instanceof` probe included, runs inside a guard, and the fallback message is a
+  constant requiring nothing from the value it describes.
+
+`JSON.stringify` (calls `toJSON`, throws on cycles and bigint), `util.inspect` (honours
+`Symbol.for("nodejs.util.inspect.custom")`) and `Object.prototype.toString.call` (reads
+`Symbol.toStringTag`) are all deliberately unused: each would reintroduce exactly the failure class
+this removes. The sanitized error-code reader used by the diagnostics is guarded on the same grounds,
+because `"code" in x` and `x.code` invoke `Proxy` traps and getters.
+
+Both unit suites drive the full matrix — a null-prototype object, an object whose `Symbol.toPrimitive`
+throws, one whose own `toString` and `valueOf` both throw, a `Proxy` whose `getPrototypeOf` trap
+throws, and a revoked `Proxy` — through the real entry points on **both** ownership paths, asserting
+one terminal disposition attempt each; and separately assert that ordinary primitives keep their own
+text. Composition is covered in both directions: an ordinary primary `Error` with a hostile cleanup
+throw value, and a hostile primary throw value with an ordinary cleanup `Error`.
+
+**Ownership is claimed before anything fallible or reentrant runs.** Disposition is three separate
+steps, in this order, and the order is the guarantee:
+
+1. **claim** terminal ownership of the episode;
+2. **execute** the terminal disposition;
+3. **settle** the shared result for every joiner.
+
+The claim is a bare deferred promise published into the episode's record *before* the disposal body
+is entered. Constructing it evaluates no caller-supplied code, touches no client and cannot re-enter
+anything, so publishing it first is safe; every later caller finds it and joins.
+
+Both gates on the way to a disposition — the run's own execution-client memo and the per-episode
+latch behind it — previously had the opposite order: they recorded the claim from the *result* of
+starting the disposal.
+
+```
+executionDisposal = (async () => disposeClient(execution, …))();     // memo, recorded after
+const running = (async () => disposeMigrationClient(client, …))();   // latch, recorded after
+disposed[disposed.length] = { client, running };
+```
+
+An `async` IIFE runs synchronously up to its first `await`, and the disposal body's first act is
+`client.on("error", …)`. Node's `EventEmitter` emits `newListener` **synchronously, before the
+listener is added**, so a `newListener` handler re-entered disposal while both records were still
+empty — and started a second, competing disposition of the same client. One ownership episode, two
+`release()` attempts. Creating the promise before recording it did *not* close that window, and the
+documentation previously claimed it did; the independent review disproved it against a real Node
+emitter. A memoized promise is only safe once its handle has actually been published.
+
+Per-episode bookkeeping additionally avoids keyed collections: the record is a plain array the
+boundary creates for itself, read and written by index. That is not a claim that array mutation is
+universally infallible — it is a claim that this path no longer calls `WeakMap.get`, `Map.set`,
+`Set.has` or any `Array.prototype` method, each of which is a real, replaceable, user-reachable
+function, and one of which (`WeakMap`) was demonstrably able to throw between an acquired client and
+its disposal. `backend/test/migration-execute.test.ts` proves it adversarially rather than by
+assertion about native behaviour — it replaces `WeakMap`, `Map`, `WeakSet` and `Set` for the duration
+of a real run so every keyed operation throws for the two client objects involved, and asserts both
+clients still reach exactly one disposition, that the migration still completes, and that a
+subsequent episode is not poisoned.
+
+Reentrancy is covered by durable regressions in both suites, driven through real `EventEmitter`
+semantics rather than an invented fake: a native `newListener` handler firing inside the disposer, a
+handler that re-enters on every installation it sees, re-entry from inside the terminal reset while
+real SQL is outstanding, re-entry from inside `release()` itself, and two concurrent asynchronous
+callers. Each asserts exactly one terminal disposition *attempt* — counted before the fake's
+duplicate-release assertion rejects a second one, because a count that only grows on success cannot
+see the defect at all.
+
+**Primary failures are never replaced by cleanup failures.** A failure during the advisory unlock,
+during disposal, or during post-disposal listener bookkeeping is *composed* with the run's own error,
+never substituted for it: a lone failure is thrown as itself (unchanged from Phase 2c's contract),
+two or more become one `AggregateError` whose **first element is the primary failure**. Both levels
+compose this way — the execution connection's inside the run, the control connection's in the lock
+owner — so an execution run that fails and then fails to clean up twice surfaces one `AggregateError`
+ordered *run error, execution-disposal error, control-cleanup error*.
+
+Every cleanup step in a `finally` is wrapped in `try`/`catch` rather than awaited with a trailing
+`.catch(...)`: `.catch` only exists once a promise does, so it covers a *rejected* disposal and not a
+disposer that throws before returning one, and an exception thrown from a `finally` discards whatever
+the `try` was already failing with. That is precisely how a failed cleanup could previously erase the
+migration error that actually ended the run. All four combinations (action succeeds/fails × cleanup
+succeeds/fails, in both the failed-unlock and failed-disposition flavours) are asserted for the
+control connection in `backend/test/migration-session-reset.test.ts`, and for the execution
+connection — with error *identity*, not message matching — in `backend/test/migration-execute.test.ts`.
+
+**Reset, and the baseline proof.** The reset is `ROLLBACK`, then `DISCARD ALL` alone in its own round
+trip (PostgreSQL rejects `DISCARD ALL` inside an open or failed transaction block, and wraps a
+multi-statement simple query in an implicit one), then a proof query. The proof is what makes a
+session reusable — success of `DISCARD ALL` alone is not evidence. It reports session-set GUCs
+(`source = 'session'`), advisory locks this backend still holds, `LISTEN` subscriptions, server-side
+prepared statements, open (including `WITH HOLD`) cursors, temporary objects, and
+`current_user = session_user`.
+
+`role` and `session_authorization` are *not* enumerable through `pg_settings` (PostgreSQL marks both
+`GUC_NO_SHOW_ALL`), which is why that last cross-check is not redundant: `SET ROLE` is caught by it.
+`SET SESSION AUTHORIZATION` moves `session_user` with it and so is caught by neither — it is
+superuser-only, and the migration execution role is required not to be a superuser (a superuser
+connection is refused outright by `verifyControlSchema`), so no migration this runner can legally
+execute can produce it. `DISCARD ALL` restores it regardless, which
+`backend/test/migration-session-reset.pg.test.ts` proves administratively, on a superuser session the
+test owns end to end.
+
+**Reset versus destroy.** A connection is returned to the pool only when every reset step completed
+*and* the proof came back clean. Every other outcome destroys it:
+
+| Outcome | Disposition |
+|---------|-------------|
+| Reset completed, baseline proven clean | released for reuse |
+| Owner already knows the session is unusable (ambiguous COMMIT, control loss, unverified cancellation) | destroyed, **no reset statement issued at all** |
+| Client-owned work cannot be proven settled | destroyed, no reset issued |
+| The client's own `'error'` listener could not be installed | destroyed, no reset issued — the listener is the only thing standing between a raw connection-level error and an uncaught exception, and the reset itself would run on that unprotected session |
+| Any step of the disposal itself threw (reading the owner's request, absorber installation, settled-work interrogation, listener removal) | destroyed — the failure becomes the destroy reason; the release is still reached |
+| `ROLLBACK` failed | destroyed |
+| `DISCARD ALL` failed | destroyed |
+| Reset did not answer within its 5s budget | destroyed |
+| Baseline proof failed, or returned no row | destroyed |
+| Connection lost during the reset | destroyed |
+| Advisory unlock returned false or failed | destroyed |
+
+"Uncertain" is never "reusable", and a normal release never follows a destructive one. A destroyed
+client keeps a single absorbing `'error'` listener, because a dead connection can emit a second,
+delayed notification for the same root failure; a released one keeps none, so the pool's own idle
+listener takes over. Destruction is reported once, as a sanitized `PB10_MIGRATION_CLIENT_DESTROYED`
+process warning carrying at most a whitelisted error code — never a message, host, connection string
+or SQL text.
+
+Exactly-once is scoped to **one ownership episode**, not to the client object: `pg` hands out the
+same `PoolClient` object on a later checkout, so a longer-lived latch would make the second run find
+the first run's finished disposition and issue neither a reset nor a `release()`, checking the client
+out forever.
+
+**CI enforcement.** Two counted, name-asserted steps, deliberately separate:
+
+- *Enforce the Phase 2d client-ownership unit contracts* — asserts zero failures, zero skips, an
+  exact pass count, and the presence of every mandatory lifecycle scenario **by name**, so one cannot
+  be renamed, skipped or deleted without failing the build. No database.
+
+  The evidence is bound to its *source*, not merely to an aggregate total. Node's test runner emits
+  one flat, ungrouped stream for a multi-file invocation, so an earlier version of this gate — which
+  ran `npm run test:unit:phase2d` and checked only the aggregate output — was satisfied by pointing
+  that script at a single wholly unrelated file declaring the same test names and the same total. It
+  is now bound three ways: the required file list is an immutable literal *in the workflow* rather
+  than in `package.json`; each file is invoked on its own so every count belongs to the path that
+  produced it; and each mandatory scenario must appear in the log of the specific file that owes it.
+  Each required file must additionally import the migration lifecycle module it claims to exercise,
+  and `test:unit:phase2d` is asserted to name exactly the same files so local runs and CI cannot
+  drift. Renaming a required file without updating the gate fails before a test runs.
+
+  What this does *not* prove is that a suite's assertions are meaningful — a file at the required
+  path with the required names, count and import could still assert nothing. That is why this gate is
+  additional to, and never a replacement for, the full application suite and the real-PostgreSQL step
+  below.
+- *Test pooled session reset and safe connection return against real PostgreSQL*
+  (`npm run test:pg:session-reset`) — the same contract against real sessions handed to a real next
+  borrower, with counts asserted so a suite that dies in `before()` cannot go green.
 
 ### Unresolved attempts and manual recovery
 

@@ -1,11 +1,8 @@
-import { setTimeout as delay } from "node:timers/promises";
 import { Pool, type PoolClient } from "pg";
 import {
-  checkManifest,
   type MigrationManifest,
   type MigrationManifestEntry,
 } from "./manifest";
-import { reportSanitizedPoolError } from "./execution-errors";
 
 export const SCHEMA_ADVISORY_LOCK = [1398096461, 1] as const;
 export const SCHEMA_LOCK_POLL_MS = 5_000;
@@ -67,7 +64,7 @@ export interface MigrationPlan {
   warnings: string[];
 }
 
-type LockDiagnostic = {
+export type LockDiagnostic = {
   holder_pid: number;
   application_name: string | null;
   client_identity: string | null;
@@ -279,9 +276,6 @@ function assertCondition(condition: unknown, message: string): asserts condition
   if (!condition) throw new Error(message);
 }
 
-function errorValue(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
-}
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
@@ -743,198 +737,7 @@ export async function verifyControlSchema(client: PoolClient): Promise<void> {
   );
 }
 
-async function inspectLockContention(client: PoolClient): Promise<LockDiagnostic[]> {
-  const result = await client.query<LockDiagnostic>(`
-    select a.pid as holder_pid,
-           nullif(left(a.application_name, 80), '') as application_name,
-           left(coalesce(a.client_addr::text, a.client_hostname, 'local'), 80) as client_identity,
-           a.state,
-           case when a.xact_start is null then null else clock_timestamp() - a.xact_start end as transaction_age,
-           case when a.query_start is null then null else clock_timestamp() - a.query_start end as query_age,
-           a.wait_event_type,
-           case
-             when a.backend_type <> 'client backend' then 'non-client backend'
-             when a.query ~* '^[[:space:]]*select[[:space:]]+pg_(try_)?advisory_lock' then 'advisory-lock command'
-             else 'database command'
-           end as command_summary
-      from pg_catalog.pg_locks l
-      join pg_catalog.pg_stat_activity a on a.pid = l.pid
-     where l.locktype = 'advisory'
-       and l.classid = $1::oid
-       and l.objid = $2::oid
-       and l.objsubid = 2
-       and l.granted
-     order by a.pid
-  `, [...SCHEMA_ADVISORY_LOCK]);
-  return result.rows;
-}
 
-export async function withSchemaAdvisoryLock<T>(
-  client: PoolClient,
-  action: (lockedClient: PoolClient) => Promise<T>,
-  options: SchemaLockOptions = {},
-): Promise<T> {
-  const pollMs = options.pollMs ?? SCHEMA_LOCK_POLL_MS;
-  const budgetMs = options.budgetMs ?? SCHEMA_LOCK_BUDGET_MS;
-  assertCondition(Number.isFinite(pollMs) && pollMs > 0, "Schema-lock poll interval must be positive");
-  assertCondition(Number.isFinite(budgetMs) && budgetMs >= 0, "Schema-lock budget must be nonnegative");
-  const now = options.now ?? Date.now;
-  const sleep = options.sleep ?? ((milliseconds: number) => delay(milliseconds, undefined, { ref: false }));
-  const diagnose = options.diagnose ?? ((holders: LockDiagnostic[]) => {
-    console.warn(`[migration-plan] schema lock contention: ${JSON.stringify(holders)}`);
-  });
-  const startedAt = now();
-  let acquired = false;
-  let connectionError: Error | undefined;
-  let rejectConnectionLoss!: (error: Error) => void;
-  const connectionLost = new Promise<never>((_resolve, reject) => {
-    rejectConnectionLoss = reject;
-  });
-  // connectionLost is raced against below, but only while a race is
-  // actually in flight (lock polling, then the action itself). A
-  // connection-level error can also arrive later — during the advisory
-  // unlock attempt in the finally block, or in the gap immediately after —
-  // when nothing is racing this promise any more; without a permanent
-  // handler that later rejection would be an unhandled rejection in its own
-  // right, on top of the ownership problem this function exists to avoid.
-  connectionLost.catch(() => undefined);
-  const onConnectionError = (error: Error) => {
-    connectionError = errorValue(error);
-    rejectConnectionLoss(connectionError);
-  };
-  // A persistent listener, not .once(): ownership requires staying informed
-  // of a connection failure for the client's entire held lifetime — lock
-  // acquisition, the action, and the unlock/release cleanup that follows —
-  // not just the first error observed before that cleanup begins. It is
-  // removed only once release/destruction below is complete, at which point
-  // the pool resumes its own management of the client.
-  client.on("error", onConnectionError);
-
-  let value: T | undefined;
-  let actionError: Error | undefined;
-  let cleanupError: Error | undefined;
-  try {
-    // Bound every statement on the pinned connection before the first probe, so
-    // a plan blocked behind concurrent DDL cannot hold the schema lock forever.
-    // ponytail: session-scoped; the CLI pool is single-use and ended straight
-    // after the plan. Reset these on release if a shared pool ever runs a plan.
-    for (const [setting, milliseconds] of [
-      ["statement_timeout", SCHEMA_STATEMENT_TIMEOUT_MS],
-      ["lock_timeout", SCHEMA_LOCK_TIMEOUT_MS],
-    ] as const) {
-      await client.query("select set_config($1, $2, false)", [setting, String(milliseconds)]);
-    }
-
-    while (!acquired) {
-      if (connectionError) throw connectionError;
-      const result = await client.query<{ acquired: boolean }>(
-        "select pg_try_advisory_lock($1, $2) as acquired",
-        [...SCHEMA_ADVISORY_LOCK],
-      );
-      acquired = result.rows[0]?.acquired === true;
-      if (acquired) break;
-
-      diagnose(await inspectLockContention(client));
-      const elapsed = now() - startedAt;
-      if (elapsed >= budgetMs) throw new Error(`Schema advisory lock was not acquired within ${budgetMs}ms`);
-      await Promise.race([sleep(Math.min(pollMs, budgetMs - elapsed)), connectionLost]);
-    }
-    // PB-10 Step 3 Phase 2c: the migration action is *never* raced against
-    // connectionLost, and never abandoned on a timer.
-    //
-    // Losing the pinned control connection is precisely the moment the action
-    // is performing its one mandatory durable step: arming the
-    // commit_outcome_unknown replay guard, deliberately over an independent
-    // connection this failure does not touch. Everything this function owns —
-    // the advisory lock, the pinned client, and the caller's own knowledge of
-    // the outcome — is what keeps a *second* execution from replaying a
-    // migration whose real outcome is unknown. Returning, releasing, or
-    // unlocking while that append is still in flight hands ownership away
-    // before the durable marker exists, which is the replay window itself.
-    //
-    // A deadline cannot make that safe: expiring one would abandon mandatory
-    // durability work and release ownership anyway, only less predictably. So
-    // there is no deadline here at all. The wait is bounded instead by the
-    // things that genuinely bound it — every query still outstanding on a
-    // lost connection is rejected by the driver as soon as it emits 'error',
-    // and the durable fallback carries its own finite connect timeout and a
-    // fixed retry count — and if the database is truly unreachable the action
-    // fails closed on its own and rethrows here.
-    const running = action(client);
-    // Owned synchronously: `running` is the only object that can carry the
-    // action's outcome, and nothing else ever attaches a handler to it, so an
-    // inert observer is taken here rather than left to chance.
-    running.catch(() => undefined);
-    // The action's own outcome is authoritative whenever it produced one: it
-    // — not the raw socket error — knows whether the ambiguity was durably
-    // recorded and which error class the run actually ended on. A connection
-    // failure observed while it was running is only surfaced when the action
-    // itself completed without reporting a failure of its own.
-    value = await running;
-    if (connectionError) throw connectionError;
-  } catch (error) {
-    actionError = errorValue(error);
-  } finally {
-    // The lock is only worth releasing if the connection wasn't already
-    // known bad going in, and doing so is skipped entirely once it is —
-    // never depend on an unlock succeeding when connection health is
-    // already uncertain. An ordinary SQL error from the action (or from
-    // this unlock query itself) does not set connectionError: that signal
-    // is reserved for the client's own 'error' event, which PostgreSQL
-    // drivers raise specifically for connection-level failures (backend
-    // termination, socket failure, connection reset) and never for a mere
-    // query rejection — exactly the distinction an ownership decision here
-    // needs to make.
-    if (!connectionError && acquired) {
-      try {
-        const result = await client.query<{ unlocked: boolean }>(
-          "select pg_advisory_unlock($1, $2) as unlocked",
-          [...SCHEMA_ADVISORY_LOCK],
-        );
-        assertCondition(result.rows[0]?.unlocked === true, "Schema advisory unlock returned false");
-      } catch (error) {
-        cleanupError = errorValue(error);
-      }
-    }
-    // connectionError is read again here, after the unlock attempt (if any):
-    // a connection failure observed at any point up to and including that
-    // attempt — even one that arrives just as an apparently-successful
-    // unlock response comes back — must still result in a destructive
-    // release, never a healthy one trusted back into the pool.
-    if (connectionError || cleanupError) {
-      // This client will never return to the pool, so there is no benefit
-      // to removing the listener outright — and every benefit to leaving
-      // one attached: a genuinely dead connection can still emit a second,
-      // delayed 'error' notification for the very same underlying failure
-      // (a query rejection and the raw socket's own event, both stemming
-      // from one root termination, are not guaranteed to be the same
-      // single event), and a connection nothing will ever touch again must
-      // never let that become an uncaught exception. Swapped for the shared
-      // sanitized reporter rather than onConnectionError itself (its captured
-      // result is already final) and rather than a silent no-op: absorbing a
-      // delayed connection error without a trace leaves an operator no signal
-      // at all that the pinned control connection died. The reporter emits a
-      // process warning carrying only a whitelisted driver error code — never
-      // a message, stack, host, connection string, SQL or raw object.
-      client.removeListener("error", onConnectionError);
-      client.on("error", reportSanitizedPoolError);
-      client.release(connectionError ?? cleanupError);
-    } else {
-      // Healthy release: ownership is handed back to the pool, which
-      // resumes its own error handling for the client from this point, so
-      // this is the one path where it is correct — and necessary, so the
-      // pool's own listener can attach — to stop listening entirely rather
-      // than leave anything behind.
-      client.removeListener("error", onConnectionError);
-      client.release();
-    }
-  }
-
-  if (actionError && cleanupError) throw new AggregateError([actionError, cleanupError], "Migration plan and lock cleanup failed");
-  if (actionError) throw actionError;
-  if (cleanupError) throw cleanupError;
-  return value as T;
-}
 
 /**
  * The legacy ledger has filenames and timestamps but no checksums. A compatible
@@ -1003,18 +806,28 @@ export async function readAppliedRows(client: PoolClient): Promise<AppliedMigrat
   return result.rows;
 }
 
+/**
+ * The read-only migration plan. Unchanged public surface, unchanged behavior.
+ *
+ * PB-10 Step 3 Phase 2d, HIGH 1: the schema-lock lifecycle boundary and the
+ * migration-client disposer it owns are module-private declarations inside
+ * execute.ts, so that no emitted runtime export and no emitted `.d.ts`
+ * declaration anywhere in the build hands a production caller the ability to
+ * obtain, invoke, replace, retain or wrap them. Both callers that need the
+ * boundary therefore live in that one file, and this function is a thin
+ * delegation to the one there — a compatibility surface, not a second entry
+ * point: it acquires nothing, owns nothing, and adds no capability of its own.
+ *
+ * Imported lazily for the same reason `main()` below imports the executor
+ * lazily: execute.ts depends on this module, so a top-level import would be a
+ * load-time cycle.
+ */
 export async function runMigrationPlan(
   pool: Pool,
   options: SchemaLockOptions & { manifest?: MigrationManifest } = {},
 ): Promise<MigrationPlan> {
-  const manifest = options.manifest ?? await checkManifest();
-  const client = await pool.connect();
-  return withSchemaAdvisoryLock(client, async (lockedClient) => {
-    await verifyControlSchema(lockedClient);
-    const rows = await readAppliedRows(lockedClient);
-    await assertNoLegacyLedgerDivergence(lockedClient, rows, manifest);
-    return buildMigrationPlan(manifest, rows, options);
-  }, options);
+  const { runMigrationPlan: planUnderSchemaLock } = await import("./execute");
+  return planUnderSchemaLock(pool, options);
 }
 
 async function main(): Promise<void> {
