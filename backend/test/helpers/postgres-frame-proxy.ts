@@ -106,6 +106,14 @@ export interface CommitProxy {
    */
   armDropRollback(): void;
   /**
+   * PB-10 Step 3 Phase 2d: the same treatment as armDropRollback, for any
+   * frontend statement — used to kill a connection *during* the terminal
+   * session reset (`discard all`), which is a genuine connection loss at the
+   * one moment the lifecycle boundary is deciding whether the session may be
+   * reused. Disarms itself on the first match.
+   */
+  armDropFrontendContaining(needle: string): void;
+  /**
    * PB-10 Step 3 Phase 2c final review, blocker 1: holds the first frontend
    * frame whose raw bytes contain `needle` — and every frontend frame after
    * it on that same connection — instead of forwarding them, until the
@@ -124,6 +132,7 @@ export function startCommitProxy(targetHost: string, targetPort: number): Promis
     let dropBeforeServer = false;
     let dropBeforeClient = false;
     let dropRollback = false;
+    let dropNeedle: Buffer | undefined;
     let stallNeedle: Buffer | undefined;
     let onStallEngaged: (() => void) | undefined;
     // Set once a connection is gated: the queued frontend frames plus the
@@ -168,6 +177,11 @@ export function startCommitProxy(targetHost: string, targetPort: number): Promis
           }
           if (dropRollback && frame.type === "Q" && simpleQueryText(frame.body) === "rollback") {
             dropRollback = false;
+            kill();
+            return;
+          }
+          if (dropNeedle !== undefined && frame.raw.includes(dropNeedle)) {
+            dropNeedle = undefined;
             kill();
             return;
           }
@@ -222,6 +236,7 @@ export function startCommitProxy(targetHost: string, targetPort: number): Promis
         armDropBeforeServer: () => { dropBeforeServer = true; },
         armDropBeforeClient: () => { dropBeforeClient = true; },
         armDropRollback: () => { dropRollback = true; },
+        armDropFrontendContaining: (needle: string) => { dropNeedle = Buffer.from(needle, "utf8"); },
         armStallFrontendContaining: (needle: string) => {
           stallNeedle = Buffer.from(needle, "utf8");
           const engaged = new Promise<void>((resolveEngaged) => { onStallEngaged = resolveEngaged; });

@@ -9,7 +9,7 @@ import { Client, Pool } from "pg";
 import type { MigrationManifest, MigrationManifestEntry } from "../src/db/migrate/manifest";
 import { assertDistinctDatabases } from "../src/db/migrate/database-identity";
 import { installControlSchema, type ControlSchemaInstall } from "./helpers/control-schema-install";
-import { withSchemaAdvisoryLock } from "../src/db/migrate/runner";
+import { runMigrationPlan } from "../src/db/migrate/runner";
 import { executeMigrationsForTest } from "./helpers/migration-execute";
 
 /**
@@ -243,14 +243,20 @@ if (!databaseUrl) {
     }
   });
 
-  // Real production-path control-client ownership: withSchemaAdvisoryLock —
-  // still its own exported function in runner.ts, unaffected by the
-  // execute.ts merge — against a real PostgreSQL control backend that is
-  // genuinely terminated (not merely a synthetic 'error' event) around the
-  // same window an action's own cancellation-driven failure is being
-  // handled and the advisory unlock is attempted. This proves the fix holds
-  // under real I/O timing, not just against the fully deterministic fakes
-  // used elsewhere in this repository.
+  // Real production-path control-client ownership against a real PostgreSQL
+  // control backend that is genuinely terminated (not merely a synthetic
+  // 'error' event) around the same window an action's own cancellation-driven
+  // failure is being handled and the advisory unlock is attempted. This proves
+  // the fix holds under real I/O timing, not just against the fully
+  // deterministic fakes used elsewhere in this repository.
+  //
+  // PB-10 Step 3 Phase 2d, HIGH 1: the schema-lock lifecycle boundary is no
+  // longer importable — it is a module-private declaration inside execute.ts,
+  // reachable only through an approved entry point — so this drives it through
+  // `runMigrationPlan(pool)`. The client, its socket, the advisory lock and the
+  // termination are all real; only the action's own late failure is injected,
+  // at the applied-ledger read, through a pass-through proxy over the very same
+  // pooled client the real pool handed out.
   test("pg: a real control-backend termination while control is still held ends in exactly one destructive release, with no uncaught client error", async () => {
     const pool = newPool(2);
     const uncaught: unknown[] = [];
@@ -262,15 +268,34 @@ if (!databaseUrl) {
         const execution = await pool.connect();
         try {
           const controlPid = await backendPid(control);
-
-          const pending = withSchemaAdvisoryLock(control, async () => {
-            await delay(200);
-            throw new Error("[cancellation_unverified] migration 0101: cancellation request was not accepted by PostgreSQL");
+          let actionStarted!: () => void;
+          const actionRunning = new Promise<void>((resolve) => { actionStarted = resolve; });
+          const owned = new Proxy(control, {
+            get(target, property) {
+              if (property === "query") {
+                return async (...parameters: unknown[]) => {
+                  const first = parameters[0];
+                  const sql = typeof first === "string" ? first : String((first as { text?: string })?.text ?? "");
+                  if (sql.includes("from migration_control.schema_migrations")) {
+                    actionStarted();
+                    await delay(200);
+                    throw new Error("[cancellation_unverified] migration 0101: cancellation request was not accepted by PostgreSQL");
+                  }
+                  return (target.query as (...args: unknown[]) => unknown).apply(target, parameters);
+                };
+              }
+              const value = Reflect.get(target, property, target) as unknown;
+              return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+            },
           });
+          const facade = { connect: async () => owned } as unknown as Pool;
+
+          const pending = runMigrationPlan(facade);
 
           await Promise.all([
             assert.rejects(pending),
             (async () => {
+              await actionRunning;
               await delay(75);
               await admin.query("select pg_terminate_backend($1)", [controlPid]).catch(() => undefined);
             })(),

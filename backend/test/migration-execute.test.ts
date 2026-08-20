@@ -24,6 +24,12 @@ import {
 } from "./helpers/control-schema-fixture";
 import { pgError } from "./helpers/pg-errors";
 import {
+  diagnosticThrowValues,
+  hostileThrowValues,
+  throws,
+  type ThrowInjection,
+} from "./helpers/hostile-throw-values";
+import {
   ProtectedPathError,
   ProtectedProofPath,
   type RecordedApplied,
@@ -236,23 +242,189 @@ function retryEvent(
 type QueryResult = { rows: unknown[]; rowCount: number | null };
 type Recorded = { client: "control" | "execution"; sql: string; values?: unknown[] };
 
+/**
+ * PB-10 Step 3 Phase 2d: the reusable-session baseline this fake reports back
+ * to the terminal lifecycle boundary's proof query. Mirrors real PostgreSQL:
+ * `discard all` restores every one of these, and the boundary refuses to return
+ * a client whose proof comes back anything but clean.
+ */
+type SessionBaseline = {
+  dirty_settings: string;
+  advisory_locks: string;
+  listens: string;
+  prepared_statements: string;
+  cursors: string;
+  temp_objects: string;
+  role_baseline: boolean;
+};
+
+const CLEAN_SESSION: SessionBaseline = {
+  dirty_settings: "0",
+  advisory_locks: "0",
+  listens: "0",
+  prepared_statements: "0",
+  cursors: "0",
+  temp_objects: "0",
+  role_baseline: true,
+};
+
 class FakeClient extends EventEmitter {
+  /** Real node-postgres exposes this plain-object named-query cache. */
+  readonly connection = { parsedStatements: {} as Record<string, string> };
   released = false;
   releasedWith: Error | undefined;
   releaseCount = 0;
+  /**
+   * PB-10 Step 3 Phase 2d final review, CRITICAL 2: terminal disposition
+   * *attempts*, counted before the duplicate-release assertion below rejects
+   * the second one — which is the only way "exactly one terminal action per
+   * ownership episode" is actually observable.
+   *
+   * `releaseCount` alone cannot see the defect: pg-pool (and this fake) throw
+   * on a second `release()`, so a run that genuinely started two dispositions
+   * still ended with `releaseCount === 1` and a swallowed AssertionError. The
+   * reentrancy the independent review demonstrated was invisible to every
+   * existing assertion for exactly that reason.
+   */
+  releaseAttempts = 0;
+  /**
+   * PB-10 Step 3 Phase 2d. `failReset` rejects the `discard all` statement;
+   * `hangReset` never answers it at all (the reset-budget case); `resetBaseline`
+   * overrides what the proof query reports, so a reset that "succeeds" but
+   * leaves the session dirty is still refused. `resetSql` is what the boundary
+   * actually issued, in order, so ordering can be asserted rather than assumed.
+   */
+  failReset: Error | undefined;
+  hangReset = false;
+  resetBaseline: SessionBaseline = { ...CLEAN_SESSION };
+  readonly resetSql: string[] = [];
+  /** Set by the harness the instant the boundary issues its first reset statement. */
+  onResetStatement: ((sql: string) => void) | undefined;
+  /**
+   * PB-10 Step 3 Phase 2d, CRITICAL 1: makes the *first* `on('error', …)`
+   * registration this client receives throw synchronously, and only that one.
+   *
+   * A real pg client's EventEmitter can throw here (a non-function listener,
+   * an emitter whose max-listeners handling was replaced, a wrapping proxy),
+   * and that call sits between checkout and the run's ownership boundary. Only
+   * the first registration fails, so the terminal boundary's own absorber still
+   * installs exactly as it would against a real client — otherwise the test
+   * would be proving that disposal cannot run, not that it does.
+   */
+  failFirstErrorListener: ThrowInjection;
+  /**
+   * PB-10 Step 3 Phase 2d final review, CRITICAL 1: the same failure, but
+   * *persistent* — a client whose EventEmitter contract is broken rather than
+   * one that happened to refuse a single registration. This is the realistic
+   * shape (the client is what is broken, not the call), and it is the one the
+   * terminal boundary itself could not survive: its own absorber installation
+   * used to be the disposer's first, unguarded statement, so a client like this
+   * rejected disposal before issuing any terminal action at all and was never
+   * released.
+   */
+  failEveryErrorListener: ThrowInjection;
+  /**
+   * PB-10 Step 3 Phase 2d final review, CRITICAL 1: makes every
+   * `removeListener` call on this client throw synchronously.
+   *
+   * This is the exact operation the independent review found sitting *in front
+   * of* the execution client's terminal disposition, on the control client — an
+   * EventEmitter method neither this code nor pg owns outright (a wrapping
+   * proxy, a patched emitter, a listener registry that rejects) and whose
+   * failure used to skip the disposal of an entirely different, already
+   * checked-out client.
+   */
+  failRemoveListener: ThrowInjection;
+  /**
+   * PB-10 Step 3 Phase 2d final review: makes the terminal `release()` itself
+   * throw, *after* recording that the attempt was made — the disposal failure a
+   * caller can genuinely observe as a rejected disposition promise, and the one
+   * that must be composed with a primary migration failure rather than replace
+   * it.
+   */
+  failRelease: ThrowInjection;
+  /** Every `on('error', …)`/`once('error', …)` registration attempted, in order. */
+  readonly errorListeners: string[] = [];
+  /** Set by the owning FakePool, so "still checked out" is provable, not assumed. */
+  pool: { checkedOut: number } | undefined;
 
   constructor(readonly role: "control" | "execution", readonly log: Recorded[]) {
     super();
+  }
+
+  private registerErrorListener(kind: "on" | "once"): void {
+    this.errorListeners.push(kind);
+    if (this.failEveryErrorListener) throw this.failEveryErrorListener.value;
+    const failure = this.failFirstErrorListener;
+    if (!failure) return;
+    this.failFirstErrorListener = undefined;
+    throw failure.value;
+  }
+
+  override on(event: string | symbol, listener: (...args: never[]) => void): this {
+    if (event === "error") this.registerErrorListener("on");
+    return super.on(event, listener as (...args: unknown[]) => void);
+  }
+
+  override once(event: string | symbol, listener: (...args: never[]) => void): this {
+    if (event === "error") this.registerErrorListener("once");
+    return super.once(event, listener as (...args: unknown[]) => void);
+  }
+
+  override removeListener(event: string | symbol, listener: (...args: never[]) => void): this {
+    if (this.failRemoveListener) throw this.failRemoveListener.value;
+    return super.removeListener(event, listener as (...args: unknown[]) => void);
   }
 
   record(sql: string, values?: unknown[]): void {
     this.log.push({ client: this.role, sql: sql.trim(), values });
   }
 
+  /**
+   * Answers the terminal reset sequence, or returns undefined when `sql` is not
+   * part of it. Both fake clients delegate here, because in production both are
+   * disposed through the very same boundary.
+   */
+  protected resetAnswer(sql: string): Promise<QueryResult> | undefined {
+    if (sql === "discard all") {
+      this.resetSql.push(sql);
+      this.onResetStatement?.(sql);
+      if (this.failReset) return Promise.reject(this.failReset);
+      if (this.hangReset) return new Promise<QueryResult>(() => undefined);
+      return Promise.resolve({ rows: [], rowCount: null });
+    }
+    if (sql.includes("dirty_settings")) {
+      this.resetSql.push("baseline-proof");
+      this.onResetStatement?.("baseline-proof");
+      return Promise.resolve({ rows: [this.resetBaseline], rowCount: 1 });
+    }
+    return undefined;
+  }
+
+  /**
+   * Fired at the top of every terminal disposition attempt, before anything is
+   * recorded — the hook a reentrancy case uses to call back into disposal from
+   * inside the terminal action itself.
+   */
+  onReleaseAttempt: (() => void) | undefined;
+
   release(error?: Error): void {
+    // Counted first, unconditionally: the assertion below rejects a second
+    // release, so a duplicate would otherwise leave no trace at all.
+    this.releaseAttempts += 1;
+    this.onReleaseAttempt?.();
+    // pg-pool answers a second release by throwing, so the fake must too:
+    // "exactly one terminal disposition" is only a real assertion if a
+    // duplicate would actually be detected here.
+    assert.equal(this.released, false, `${this.role} client released twice`);
     this.released = true;
     this.releasedWith = error;
     this.releaseCount += 1;
+    if (this.pool) this.pool.checkedOut -= 1;
+    // Recorded before it throws: a release that fails is still the one and only
+    // terminal action attempted against this client, so a second attempt would
+    // be caught by the assertion above rather than hidden by this one.
+    if (this.failRelease) throw this.failRelease.value;
   }
 }
 
@@ -318,6 +490,16 @@ class ControlClient extends FakeClient {
   async query(sql: string, values?: unknown[]): Promise<QueryResult> {
     this.record(sql, values);
     if (this.dead) throw this.dead;
+    // PB-10 Step 3 Phase 2d: the control connection is disposed through the
+    // same boundary as the execution connection, so it answers `rollback` (a
+    // documented no-op outside a transaction) and the reset sequence too.
+    if (sql === "rollback") {
+      this.resetSql.push(sql);
+      this.onResetStatement?.(sql);
+      return { rows: [], rowCount: null };
+    }
+    const reset = this.resetAnswer(sql);
+    if (reset) return reset;
     // CRITICAL 2, half two: the durable binding, written on the control
     // connection in autocommit. The fake schema verifies the receipt against a
     // key this client cannot read and enforces both partial unique indexes, so
@@ -506,6 +688,14 @@ class ExecutionClient extends FakeClient {
   async query(sql: string, values?: unknown[]): Promise<QueryResult> {
     this.record(sql, values);
     if (this.diedAfterCommit) throw new Error("connection terminated unexpectedly");
+    // PB-10 Step 3 Phase 2d: `discard all` and the baseline proof belong to the
+    // terminal boundary, never to a migration. `rollback` deliberately does not
+    // come through here — it is both a migration-owned statement and a reset
+    // statement, and the existing failRollback/currentXact modelling below is
+    // what makes "the reset's own rollback failed" indistinguishable from a
+    // migration's, exactly as it is in PostgreSQL.
+    const reset = this.resetAnswer(sql);
+    if (reset) return reset;
     if (sql.includes("set_config")) return { rows: [{ set_config: String(values?.[1]) }], rowCount: 1 };
     if (sql === "begin") {
       this.currentXact = this.xactId;
@@ -520,6 +710,8 @@ class ExecutionClient extends FakeClient {
       return { rows: [], rowCount: null };
     }
     if (sql === "rollback") {
+      this.resetSql.push(sql);
+      this.onResetStatement?.(sql);
       if (this.failRollback) throw new Error("rollback failed");
       this.currentXact = null;
       return { rows: [], rowCount: null };
@@ -566,9 +758,24 @@ class FakePool extends EventEmitter {
   readonly control = new ControlClient(this.log, this.proof);
   readonly execution = new ExecutionClient(this.log, this.proof);
   connects = 0;
+  /**
+   * PB-10 Step 3 Phase 2d, CRITICAL 1: clients currently held by the run, the
+   * direct equivalent of a bounded production pool's exhausted slot count. A
+   * client that escapes finalization never decrements this, so "no client
+   * remains checked out" becomes a real assertion rather than an inference
+   * from release counts.
+   */
+  checkedOut = 0;
+
+  constructor() {
+    super();
+    this.control.pool = this;
+    this.execution.pool = this;
+  }
 
   async connect(): Promise<PoolClient> {
     this.connects += 1;
+    this.checkedOut += 1;
     return (this.connects === 1 ? this.control : this.execution) as unknown as PoolClient;
   }
 
@@ -579,7 +786,12 @@ class FakePool extends EventEmitter {
       && !sql.includes("pg_backend_pid")
       && !sql.includes("migration_control.claim_transaction")
       && !sql.includes("migration_control.record_applied_migration")
-      && !["begin", "commit", "rollback", "select 1"].includes(sql));
+      // PB-10 Step 3 Phase 2d: the terminal reset sequence is executor cleanup,
+      // never migration SQL. Excluded here so "no migration SQL ran" keeps
+      // meaning exactly that — and asserted directly, in its own right, by the
+      // Phase 2d ownership tests below.
+      && !sql.includes("dirty_settings")
+      && !["begin", "commit", "rollback", "select 1", "discard all"].includes(sql));
   }
 }
 
@@ -589,6 +801,47 @@ const isReadOnly = (sql: string): boolean => {
   return /^(select|with)/i.test(withoutLiterals)
     && !/\b(insert|update|delete|create|alter|drop|truncate)\b/i.test(withoutLiterals);
 };
+
+/**
+ * PB-10 Step 3 Phase 2d: strips — and, in the same pass, *asserts* — the
+ * terminal reset sequence the lifecycle boundary issues on a client it is about
+ * to return to the pool.
+ *
+ * This is deliberately not a blanket "ignore rollback and discard all" filter.
+ * `rollback` is both a migration statement and a reset statement, so filtering
+ * it wholesale would silently erase the migration's own rollback from cases
+ * that exist to prove it happened. Instead the reset is identified by *shape
+ * and position*: exactly `rollback`, `discard all` and the baseline proof, in
+ * that order, as the final three statements on the client. A client that was
+ * destroyed rather than returned issues none of them and is returned unchanged.
+ *
+ * The result is a strictly stronger assertion than the pre-Phase-2d code it
+ * replaces: cases that said "execution never began" still say exactly that,
+ * and every one of them now additionally proves the reset ran last, in order,
+ * and only once.
+ */
+function withoutTerminalReset(statements: Recorded[]): Recorded[] {
+  const proof = statements.findIndex(({ sql }) => sql.includes("dirty_settings"));
+  if (proof === -1) {
+    assert.equal(
+      statements.some(({ sql }) => sql === "discard all"), false,
+      "a client that never ran the baseline proof must never have run `discard all` either",
+    );
+    return statements;
+  }
+  assert.equal(proof, statements.length - 1, "the baseline proof is the last statement the boundary ever issues");
+  assert.deepEqual(
+    statements.slice(proof - 2, proof).map(({ sql }) => sql),
+    ["rollback", "discard all"],
+    "the terminal reset is exactly `rollback` then `discard all`, immediately before the baseline proof",
+  );
+  const remaining = statements.slice(0, proof - 2);
+  assert.equal(
+    remaining.some(({ sql }) => sql === "discard all"), false,
+    "`discard all` is issued exactly once, by the terminal boundary, and never by a migration",
+  );
+  return remaining;
+}
 
 const never = () => new Promise<void>(() => undefined);
 
@@ -766,7 +1019,7 @@ test("production build exposes exactly the approved public surface, and no other
         for (const [key, value] of Object.entries(target)) {
           if (typeof value === "function" && name === "execute.js") {
             assert.ok(
-              ["executeMigrations", "inspectConcurrentIndex", "renderExecutionReport", "MigrationExecutionError"].includes(key),
+              ["executeMigrations", "inspectConcurrentIndex", "renderExecutionReport", "runMigrationPlan", "MigrationExecutionError"].includes(key),
               "execute.js exports an unapproved callable: " + key,
             );
           }
@@ -783,12 +1036,48 @@ test("production build exposes exactly the approved public surface, and no other
         "ERROR_CLASSES", "MigrationExecutionError", "CANCELLATION_GRACE_MS",
         "TIMEOUT_CEILINGS", "TRANSACTIONAL_WALL_CLOCK_CEILING_MS", "NONTRANSACTIONAL_WALL_CLOCK_CEILING_MS",
         "SCHEMA_RUNNER_WALL_CLOCK_MS", "inspectConcurrentIndex", "renderExecutionReport", "executeMigrations",
+        // PB-10 Step 3 Phase 2d, HIGH 1: the read-only plan, moved here from
+        // runner.ts so that the advisory-lock lifecycle owner and the client
+        // disposer it creates never have to cross a module boundary and can
+        // therefore stay module-private. runner.runMigrationPlan is now a thin
+        // delegation to this function; it is not a second execution entry
+        // point and confers no ownership capability of its own.
+        "runMigrationPlan",
       ]);
       assert.deepEqual(new Set(Object.keys(executeTarget)), approvedRuntimeKeys, "execute.js's runtime export set must be exactly the approved public surface");
       // G: executeMigrations is the sole callable production execution entry
       // point, and still accepts exactly one Pool argument.
       assert.equal(executeTarget.executeMigrations.length, 1);
       assert.equal(typeof executeTarget.executeMigrations, "function");
+
+      // PB-10 Step 3 Phase 2d, HIGH 1: the migration-client disposer and the
+      // advisory-lock lifecycle boundary are module-private, so no emitted
+      // module may export them under any name — and, crucially, no exported
+      // *function* may hand one back through a callback either. Export names
+      // alone are not sufficient evidence: the finding this replaces was a
+      // function whose name looked innocuous and whose second callback
+      // argument was the disposer.
+      const runnerTarget = require(path.join(migrationOutput, "runner.js"));
+      assert.equal("withSchemaAdvisoryLock" in runnerTarget, false, "runner.js must not export the advisory-lock lifecycle owner");
+      assert.equal("withSchemaAdvisoryLock" in executeTarget, false, "nor may execute.js");
+      const capabilityPattern = /dispose|disposition|discard|sessionReset|ownerListener|workSettled|AdvisoryLock/i;
+      for (const [name, target] of [["runner.js", runnerTarget], ["execute.js", executeTarget]]) {
+        for (const key of Object.keys(target)) {
+          assert.doesNotMatch(key, capabilityPattern, name + " exports a lifecycle-ownership capability: " + key);
+        }
+      }
+      // Every emitted runtime export is a value with no callback seam of its
+      // own: no exported function is a higher-order function that could hand a
+      // caller-supplied callback anything at all. Function.length counts
+      // declared parameters, and the declaration inspection below proves what
+      // those parameters are; together they leave no position from which an
+      // ownership capability could be handed out.
+      for (const [name, target] of [["runner.js", runnerTarget], ["execute.js", executeTarget]]) {
+        for (const [key, value] of Object.entries(target)) {
+          if (typeof value !== "function") continue;
+          assert.ok(value.length <= 3, name + "." + key + " declares an unexpected number of parameters");
+        }
+      }
 
       // H: no environment bypass, registry, hook, or alternate subpath.
       assert.equal(executeTarget.executeMigrations.toString().includes("NODE_ENV"), false);
@@ -848,6 +1137,45 @@ test("production build exposes exactly the approved public surface, and no other
     const lockDeclaration = readFileSync(path.join(migrationOutput, "runner.d.ts"), "utf8");
     assert.match(lockDeclaration, /interface SchemaLockOptions/, "the declaration actually inspected is the one declaring the lock options");
     assert.doesNotMatch(lockDeclaration, timingHookPattern, "SchemaLockOptions must declare no test-only timing override");
+
+    // ── PB-10 Step 3 Phase 2d, HIGH 1 ───────────────────────────────────────
+    // Export *names* are not sufficient evidence, and the finding this
+    // regression replaces is the proof: `withSchemaAdvisoryLock` was an
+    // innocuously named exported function whose second argument was a
+    // callback, and that callback's own second parameter was the
+    // migration-client disposer — full ownership control over any PoolClient,
+    // reachable by a plain deep import of the emitted build. So every emitted
+    // declaration is inspected for the *capability*, not merely for the name:
+    //
+    //   1. no declaration may name the disposer, its request shape, its
+    //      disposition type, or the lock lifecycle owner;
+    //   2. no exported signature may take a callback at all — a public API
+    //      with no callback parameter has no position from which to hand a
+    //      caller anything, ownership capability or otherwise.
+    const ownershipPattern = /disposeClient|DisposeClient|ClientDisposition|DisposeClientRequest|ownerListener|workSettled|withSchemaAdvisoryLock|resetPooledSession|disposeOnce|disposeMigrationClient/;
+    const declarationFiles = emittedFiles.filter((name: string) => name.endsWith(".d.ts"));
+    assert.ok(declarationFiles.includes("runner.d.ts") && declarationFiles.includes("execute.d.ts"), "both migrate declarations are emitted and inspected");
+    for (const name of declarationFiles) {
+      const emitted = readFileSync(path.join(migrationOutput, name), "utf8");
+      assert.doesNotMatch(emitted, ownershipPattern, `${name} must not declare or name the migration-client disposer or the lock lifecycle owner`);
+
+      // Every exported function signature, with its parameter list extracted
+      // and checked for a callback (`=>`) in any position — including one
+      // hidden behind a named type alias, since a named alias for a function
+      // type would have to be declared in this same file and is caught by the
+      // same scan.
+      for (const signature of emitted.match(/^export declare function [^\n]*$/gm) ?? []) {
+        const parameters = signature.slice(signature.indexOf("("), signature.lastIndexOf("):") + 1);
+        assert.doesNotMatch(
+          parameters, /=>/,
+          `${name} exports a higher-order function; a callback parameter is a seam through which ownership control could be handed to a caller: ${signature}`,
+        );
+      }
+    }
+    // And the specific capability, spelled out: the plan path is a plain
+    // (pool, options) call, and execution is a single-Pool call.
+    assert.match(lockDeclaration, /export declare function runMigrationPlan\(pool: Pool, options\?: SchemaLockOptions & \{/);
+    assert.doesNotMatch(lockDeclaration, /PoolClient\) => /, "runner.d.ts must expose no PoolClient-bearing callback");
 
     assert.throws(() => require.resolve("../src/db/migrate/execute-internal"));
 
@@ -927,8 +1255,12 @@ test("legacy payload is sent byte-for-byte, unwrapped, and records its observed 
   // No outer transaction was opened around the legacy file on the execution
   // connection; the file's own BEGIN/COMMIT is the only transaction.
   const executionControlStatements = pool.log
-    .filter(({ client, sql }) => client === "execution" && ["begin", "commit", "rollback"].includes(sql));
-  assert.deepEqual(executionControlStatements, []);
+    .filter(({ client }) => client === "execution");
+  assert.deepEqual(
+    withoutTerminalReset(executionControlStatements).filter(({ sql }) => ["begin", "commit", "rollback"].includes(sql)),
+    [],
+    "the only transaction-control statement on the execution connection is the terminal boundary's own rollback",
+  );
 
   const checksum = sha256(files["0001_legacy_demo.sql"]);
   assert.equal(report.executed[0].appliedChecksumSha256, checksum);
@@ -1191,6 +1523,320 @@ test("loss of the control connection aborts execution and destroys the execution
   assert.deepEqual(pool.execution.appliedInserts, []);
 });
 
+// 15a ─────────────────────────────────────────────────────────────────────────
+// PB-10 Step 3 Phase 2d, CRITICAL 1: acquisition must be followed immediately
+// by an unconditional ownership boundary — nothing fallible may run in between.
+//
+// The execution client's own 'error' listener used to be installed in exactly
+// that gap: `pool.connect()` returned it, `execution.on("error", …)` was the
+// very next statement, and the ownership try/finally only began sixty lines
+// later. A synchronous throw from that single call rejected the whole run with
+// a client still checked out and *zero* terminal dispositions against it. With
+// a bounded production pool that is unrecoverable — the slot never comes back.
+//
+// Reached the way production reaches it: the real executeMigrations(pool) entry
+// point, the real acquisition path, the real terminal boundary. No private
+// helper is called and nothing on the ownership path is monkey-patched; the
+// only substitution is the listener registration itself failing, which is the
+// defect's own trigger.
+test("a synchronous throw while installing the execution client's 'error' listener still yields exactly one terminal disposition", async () => {
+  const pool = new FakePool();
+  const listenerFailure = new Error("the execution client refused its error listener");
+  pool.execution.failFirstErrorListener = throws(listenerFailure);
+
+  await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
+    // Primary-error preservation: cleanup neither replaces nor wraps it.
+    assert.equal(error, listenerFailure, "the original listener-installation error is the reported failure");
+    return true;
+  });
+
+  assert.equal(pool.connects, 2, "the execution client really was checked out before the failure");
+
+  // The finding itself: zero dispositions before the fix, exactly one after.
+  assert.equal(pool.execution.releaseCount, 1, "exactly one terminal disposition — never zero, never two");
+  assert.equal(pool.execution.releasedWith, listenerFailure, "destructive, carrying the original failure as its reason");
+  assert.deepEqual(pool.execution.errorListeners, ["on", "on"], "the run's own registration failed; the boundary's absorber still installed");
+  // Reset-versus-destroy, decided by the existing model rather than a weaker
+  // special case: a session whose error listener could not be installed has
+  // nothing to catch a raw socket failure, so it cannot be proven reusable and
+  // never goes back to the pool.
+  assert.deepEqual(pool.execution.resetSql, [], "a destroyed client is never reset: no normal release follows a destructive one");
+  assert.deepEqual(pool.migrationSql(), [], "no migration SQL runs on a client that failed to take ownership");
+  assert.deepEqual(pool.execution.appliedInserts, []);
+
+  // Control ownership stays entirely separate: one client's finalizer is never
+  // responsible for the other's, and the control connection completed its own
+  // healthy episode — unlock proven, reset issued, returned to the pool.
+  assert.equal(pool.control.releaseCount, 1, "the control client is disposed of exactly once, through its own boundary");
+  assert.equal(pool.control.releasedWith, undefined, "the execution client's failure is not the control client's disposition");
+  assert.equal(pool.control.unlocked, true, "the schema advisory lock is still verifiably released");
+
+  // Nothing is left held, so an equivalently bounded pool is not exhausted.
+  assert.equal(pool.checkedOut, 0, "no client remains checked out");
+
+  // Duplicate cleanup cannot produce a second terminal action: the boundary's
+  // absorber deliberately stays attached to a destroyed client, so a delayed
+  // second notification for the same root failure is neither an uncaught
+  // exception nor a second release.
+  pool.execution.emit("error", new Error("a late socket error on a connection nobody owns"));
+  assert.equal(pool.execution.releaseCount, 1, "a late error on a destroyed client must not dispose of it again");
+});
+
+// PB-10 Step 3 Phase 2d final review, CRITICAL 1: the defence above assumed the
+// terminal boundary itself always works. It did not.
+//
+// The disposer opened with its own `client.on('error', …)` absorber
+// installation — a fallible call sitting before anything that guaranteed a
+// `release()`. A client whose EventEmitter contract is genuinely broken (rather
+// than one that refuses a single registration) therefore failed *both* the
+// run's own listener install and the boundary's, and the disposal rejected from
+// its first line: the execution client reached zero terminal dispositions and
+// was never returned. That is the exact leak the boundary exists to prevent,
+// produced by the boundary, and one occurrence permanently consumes a slot of a
+// bounded production pool.
+//
+// The correction is structural, not a wrapped throw site: every fallible step
+// of disposal — absorber installation, the settled-work interrogation, the
+// reset, the baseline proof and listener removal — now runs inside a guarded
+// region whose failures become the destroy reason, and the release itself sits
+// after that region, unconditional. Any *future* synchronous failure in that
+// region is covered by the same structure.
+test("an execution client whose error-listener registration always throws still reaches exactly one terminal disposition", async () => {
+  const pool = new FakePool();
+  const brokenEmitter = new Error("the execution client's error listener could not be registered");
+  pool.execution.failEveryErrorListener = throws(brokenEmitter);
+
+  await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
+    // Primary-error preservation: the disposal's own trouble neither replaces
+    // nor wraps the failure that ended the run.
+    assert.equal(error, brokenEmitter, "the original registration failure is the reported failure");
+    return true;
+  });
+
+  assert.equal(pool.connects, 2, "the execution client really was checked out before the failure");
+  // The finding itself: zero dispositions before the fix, exactly one after.
+  assert.equal(pool.execution.releaseCount, 1, "exactly one terminal disposition — never zero, never two");
+  assert.equal(pool.execution.releasedWith, brokenEmitter, "destructive, carrying the original failure as its reason");
+  assert.deepEqual(
+    pool.execution.errorListeners, ["on", "on"],
+    "both the run's own registration and the boundary's absorber were attempted, and both failed",
+  );
+  assert.deepEqual(pool.execution.resetSql, [], "a session with no working error handling is never reset for reuse");
+  assert.deepEqual(pool.migrationSql(), [], "no migration SQL runs on a client that failed to take ownership");
+  assert.deepEqual(pool.execution.appliedInserts, []);
+
+  // Control ownership is entirely separate and completed its own healthy
+  // episode — the schema advisory lock is still verifiably released.
+  assert.equal(pool.control.releaseCount, 1, "the control client is disposed of exactly once, through its own boundary");
+  assert.equal(pool.control.releasedWith, undefined, "the execution client's failure is not the control client's disposition");
+  assert.equal(pool.control.unlocked, true);
+
+  // Nothing is left held, so an equivalently bounded pool is not exhausted.
+  assert.equal(pool.checkedOut, 0, "no client remains checked out");
+});
+
+// PB-10 Step 3 Phase 2d final review, CRITICAL 1 ────────────────────────────
+//
+// The run loop's `finally` used to open with
+//
+//     lockedControl.removeListener("error", onControlError);
+//     await disposeExecution(destroyExecution)…
+//
+// so a synchronous throw from that first line skipped the second one entirely.
+// The execution client — a *different*, already checked-out connection — then
+// received zero terminal disposition attempts and was never returned, while the
+// control client's own boundary went on disposing only the control client. With
+// a bounded production pool the slot never comes back.
+//
+// The correction is the ownership rule rather than a guard around that one
+// call: the terminal disposition is the first statement of the `finally`, and
+// every fallible operation that is not this client's disposition happens after
+// it, guarded, and is composed into the run's outcome.
+test("a failure removing the control listener never skips the execution client's terminal disposition", async () => {
+  const pool = new FakePool();
+  const removalFailure = new Error("the control client refused to drop its error listener");
+  pool.control.failRemoveListener = throws(removalFailure);
+
+  await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
+    // D. Cleanup-only failure: no migration failure exists, so the cleanup
+    // failure is surfaced as itself rather than swallowed — and, being the only
+    // failure, is thrown unwrapped exactly as Phase 2c's contract requires.
+    assert.equal(error, removalFailure, "the cleanup failure is reported, never swallowed");
+    assert.ok(!(error instanceof AggregateError), "a lone failure is thrown as itself, not wrapped");
+    return true;
+  });
+
+  assert.equal(pool.connects, 2, "both clients really were checked out");
+  // The finding itself: zero dispositions before the fix, exactly one after.
+  assert.equal(pool.execution.releaseCount, 1, "the execution client is disposed of exactly once — never zero, never two");
+  assert.equal(pool.execution.releasedWith, undefined, "the migration succeeded on it, so it is reset and returned, not destroyed");
+  assert.deepEqual(
+    pool.execution.resetSql, ["rollback", "discard all", "baseline-proof"],
+    "and its session really was reset, in order, before return",
+  );
+
+  // Control ownership stays separate and still terminates exactly once. Its own
+  // disposer meets the same broken emitter when it drops the owner listener,
+  // which the reset-versus-destroy model classifies the way it classifies every
+  // other uncertain outcome: destroyed, never handed to the next borrower.
+  assert.equal(pool.control.releaseCount, 1, "the control client is disposed of exactly once, through its own boundary");
+  assert.equal(pool.control.releasedWith, removalFailure, "destructive, carrying the failure that made it unprovable");
+  assert.equal(pool.control.unlocked, true, "the schema advisory lock is still verifiably released first");
+
+  assert.equal(pool.checkedOut, 0, "no client remains checked out: a bounded pool is not consumed");
+});
+
+test("a control-listener removal failure is composed with a primary migration failure, never in place of it", async () => {
+  const pool = new FakePool();
+  // A primary failure whose *identity* is preserved end to end, so the ordering
+  // assertion below compares objects rather than message text.
+  const primary = new Error("the execution client's error listener could not be registered");
+  pool.execution.failEveryErrorListener = throws(primary);
+  const removalFailure = new Error("the control client refused to drop its error listener");
+  pool.control.failRemoveListener = throws(removalFailure);
+
+  await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
+    assert.ok(error instanceof AggregateError, "both failures are retained");
+    assert.equal(error.errors.length, 2, "and only those two");
+    assert.equal(error.errors[0], primary, "PRIMARY FIRST: the migration's own failure, by identity");
+    assert.equal(error.errors[1], removalFailure, "the cleanup failure is retained alongside it, never in place of it");
+    return true;
+  });
+
+  assert.equal(pool.execution.releaseCount, 1, "the execution client is still disposed of exactly once");
+  assert.equal(pool.execution.releasedWith, primary, "destructively, carrying the failure that condemned it");
+  assert.deepEqual(pool.execution.resetSql, [], "no reset for reuse on a session whose error handling never installed");
+  assert.equal(pool.control.releaseCount, 1, "the control client is disposed of exactly once");
+  assert.deepEqual(pool.migrationSql(), [], "no migration SQL ran");
+  assert.deepEqual(pool.execution.appliedInserts, []);
+  assert.equal(pool.checkedOut, 0, "no client remains checked out");
+});
+
+test("an execution-client release failure is composed with a primary migration failure, never in place of it", async () => {
+  const pool = new FakePool();
+  const primary = new Error("the execution client's error listener could not be registered");
+  pool.execution.failEveryErrorListener = throws(primary);
+  const releaseFailure = new Error("release called on a client which has already been released");
+  pool.execution.failRelease = throws(releaseFailure);
+
+  await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
+    assert.ok(error instanceof AggregateError, "both failures are retained");
+    assert.equal(error.errors[0], primary, "PRIMARY FIRST: the migration's own failure, by identity");
+    assert.equal(error.errors[1], releaseFailure, "the disposal failure is observable, never silently dropped");
+    return true;
+  });
+
+  // The distinction the boundary actually guarantees: exactly one terminal
+  // disposition *attempt*. Whether pg-pool's own release machinery then leaves
+  // the connection physically reusable is not, and cannot be, ours to promise.
+  assert.equal(pool.execution.releaseCount, 1, "exactly one terminal disposition attempt was made");
+  assert.equal(pool.control.releaseCount, 1, "and the control client is finalized independently, exactly once");
+});
+
+/**
+ * PB-10 Step 3 Phase 2d final review, CRITICAL 2.
+ *
+ * The per-episode exactly-once latch used to be a `WeakMap`, and its `get`/`set`
+ * sat between an already-acquired client and its terminal disposition: a lookup
+ * that throws means no disposal is ever started, which is the zero-disposition
+ * escape the boundary exists to make impossible. The independent review proved
+ * it by breaking exactly that assumption.
+ *
+ * This is the adversarial construction, aimed at the mechanism rather than at
+ * one line: every keyed collection the process constructs while the run is in
+ * flight throws for these two client objects — `WeakMap`, `Map`, `WeakSet` and
+ * `Set`, on `get`, `set`, `has`, `add` and `delete` alike. Any per-episode
+ * bookkeeping built on any of them therefore fails synchronously at its first
+ * touch. Collections keyed by anything else are untouched, so nothing outside
+ * the code under test is destabilised.
+ *
+ * The implementation answers it structurally: the latch is a plain array
+ * literal read and written by index, so there is no keyed-collection operation
+ * on the path at all.
+ */
+class HostileBookkeeping {
+  private static guarded: Set<object> = new Set();
+  private static failure = new Error("per-episode lifecycle bookkeeping is unavailable");
+
+  private static check(key: unknown): void {
+    if (typeof key === "object" && key !== null && HostileBookkeeping.guarded.has(key)) throw HostileBookkeeping.failure;
+  }
+
+  static async run<T>(keys: object[], body: () => Promise<T>): Promise<T> {
+    const realSet = Set;
+    HostileBookkeeping.guarded = new realSet(keys);
+    class HostileWeakMap<K extends object, V> extends WeakMap<K, V> {
+      override get(key: K): V | undefined { HostileBookkeeping.check(key); return super.get(key); }
+      override set(key: K, value: V): this { HostileBookkeeping.check(key); return super.set(key, value); }
+      override has(key: K): boolean { HostileBookkeeping.check(key); return super.has(key); }
+      override delete(key: K): boolean { HostileBookkeeping.check(key); return super.delete(key); }
+    }
+    class HostileMap<K, V> extends Map<K, V> {
+      override get(key: K): V | undefined { HostileBookkeeping.check(key); return super.get(key); }
+      override set(key: K, value: V): this { HostileBookkeeping.check(key); return super.set(key, value); }
+      override has(key: K): boolean { HostileBookkeeping.check(key); return super.has(key); }
+      override delete(key: K): boolean { HostileBookkeeping.check(key); return super.delete(key); }
+    }
+    class HostileWeakSet<K extends object> extends WeakSet<K> {
+      override add(key: K): this { HostileBookkeeping.check(key); return super.add(key); }
+      override has(key: K): boolean { HostileBookkeeping.check(key); return super.has(key); }
+      override delete(key: K): boolean { HostileBookkeeping.check(key); return super.delete(key); }
+    }
+    class HostileSet<K> extends Set<K> {
+      override add(key: K): this { HostileBookkeeping.check(key); return super.add(key); }
+      override has(key: K): boolean { HostileBookkeeping.check(key); return super.has(key); }
+      override delete(key: K): boolean { HostileBookkeeping.check(key); return super.delete(key); }
+    }
+    const restore = {
+      WeakMap: globalThis.WeakMap, Map: globalThis.Map, WeakSet: globalThis.WeakSet, Set: globalThis.Set,
+    };
+    globalThis.WeakMap = HostileWeakMap as unknown as WeakMapConstructor;
+    globalThis.Map = HostileMap as unknown as MapConstructor;
+    globalThis.WeakSet = HostileWeakSet as unknown as WeakSetConstructor;
+    globalThis.Set = HostileSet as unknown as SetConstructor;
+    try {
+      return await body();
+    } finally {
+      globalThis.WeakMap = restore.WeakMap;
+      globalThis.Map = restore.Map;
+      globalThis.WeakSet = restore.WeakSet;
+      globalThis.Set = restore.Set;
+      HostileBookkeeping.guarded = new realSet();
+    }
+  }
+}
+
+test("per-episode lifecycle bookkeeping that fails synchronously still yields exactly one disposition per client", async () => {
+  const pool = new FakePool();
+  const report = await HostileBookkeeping.run(
+    [pool.control, pool.execution],
+    () => run(pool, { manifest: manifestOf(entries.transactional) }),
+  );
+
+  // Zero-disposition is impossible, and so is a duplicate: the fake `release`
+  // throws on a second call, so `releaseCount === 1` is a real assertion on
+  // both sides at once.
+  assert.equal(report.executedCount, 1, "the migration still ran to completion");
+  assert.equal(pool.execution.releaseCount, 1, "the execution client: exactly one terminal disposition");
+  assert.equal(pool.execution.releasedWith, undefined, "healthy, so reset and returned rather than destroyed");
+  assert.equal(pool.control.releaseCount, 1, "the control client: exactly one terminal disposition");
+  assert.equal(pool.control.releasedWith, undefined, "healthy, so reset and returned rather than destroyed");
+  assert.equal(pool.checkedOut, 0, "no client remains checked out");
+
+  // Later episodes are not poisoned: a second, independent run — still under
+  // the same hostile bookkeeping — is finalized on its own terms, which is what
+  // a process-global latch would have prevented.
+  const second = new FakePool();
+  const secondReport = await HostileBookkeeping.run(
+    [second.control, second.execution, pool.control, pool.execution],
+    () => run(second, { manifest: manifestOf(entries.transactional) }),
+  );
+  assert.equal(secondReport.executedCount, 1, "the next episode still runs");
+  assert.equal(second.execution.releaseCount, 1, "and finalizes its own execution client exactly once");
+  assert.equal(second.control.releaseCount, 1, "and its own control client exactly once");
+  assert.equal(second.checkedOut, 0, "leaving nothing checked out");
+});
+
 async function waitUntil(predicate: () => boolean, description: string): Promise<void> {
   for (let attempt = 0; attempt < 1000; attempt += 1) {
     if (predicate()) return;
@@ -1296,8 +1942,14 @@ test("a zero-pending run performs no writes at all", async () => {
   assert.equal(pool.connects, 1, "no execution connection is opened when nothing is pending");
   assert.deepEqual(pool.control.events, []);
   assert.deepEqual(pool.control.appliedInserts, []);
-  const writes = pool.log.filter(({ sql }) => !isReadOnly(sql));
+  // PB-10 Step 3 Phase 2d: only the control connection exists on a zero-pending
+  // run, and the boundary still resets it before returning it — a run that
+  // wrote nothing must still not hand back the session-level statement_timeout
+  // and lock_timeout the advisory-lock path set on it.
+  const writes = withoutTerminalReset(pool.log).filter(({ sql }) => !isReadOnly(sql));
   assert.deepEqual(writes.map(({ sql }) => sql), [], "a zero-pending run issues only read-only statements");
+  assert.deepEqual(pool.control.resetSql, ["rollback", "discard all", "baseline-proof"]);
+  assert.equal(pool.control.releasedWith, undefined, "a reset, proven-clean control client is returned to the pool");
 });
 
 // 19 ──────────────────────────────────────────────────────────────────────────
@@ -1686,7 +2338,7 @@ test("transactional rollback failure after confirmed cancellation durably blocks
     statement_ordinal: null,
   }];
   await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), /commit_outcome_unknown/);
-  const executionSql = pool.log.filter(({ client }) => client === "execution").map(({ sql }) => sql);
+  const executionSql = withoutTerminalReset(pool.log.filter(({ client }) => client === "execution")).map(({ sql }) => sql);
   assert.deepEqual(executionSql, [], "no BEGIN and no migration SQL are ever sent while a cancellation-driven ambiguity is unreconciled");
 });
 
@@ -1838,7 +2490,7 @@ test("an unreconciled commit_outcome_unknown from a previous run blocks the next
     statement_ordinal: null,
   }];
   await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), /commit_outcome_unknown/);
-  const executionSql = pool.log.filter(({ client }) => client === "execution").map(({ sql }) => sql);
+  const executionSql = withoutTerminalReset(pool.log.filter(({ client }) => client === "execution")).map(({ sql }) => sql);
   assert.deepEqual(executionSql, [], "no BEGIN, no migration SQL, and no COMMIT are ever sent while the ambiguity is unreconciled");
   assert.deepEqual(pool.control.eventTypes(), [], "the guard throws before a fresh started event is ever recorded");
 });
@@ -1878,7 +2530,7 @@ test("C1: a started attempt with no terminal event blocks the next attempt befor
   const pool = new FakePool();
   pool.control.priorEvents = [abandonedStart()];
   await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), /commit_outcome_unknown/);
-  const executionSql = pool.log.filter(({ client }) => client === "execution").map(({ sql }) => sql);
+  const executionSql = withoutTerminalReset(pool.log.filter(({ client }) => client === "execution")).map(({ sql }) => sql);
   assert.deepEqual(executionSql, [], "no BEGIN is ever sent while an earlier attempt's outcome is unaccounted for");
   assert.deepEqual(pool.control.eventTypes(), [], "and nothing is recorded for the refused attempt");
 });
@@ -2403,7 +3055,7 @@ for (const [label, overrides] of unrelatedLaterEvents) {
     const pool = new FakePool();
     pool.control.priorEvents = [ambiguousStart, ambiguousEvent, validResolution(overrides)];
     await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), /commit_outcome_unknown/);
-    assert.deepEqual(pool.log.filter(({ client }) => client === "execution"), [], "execution must never begin while any unrelated later event is mistaken for a resolution");
+    assert.deepEqual(withoutTerminalReset(pool.log.filter(({ client }) => client === "execution")), [], "execution must never begin while any unrelated later event is mistaken for a resolution");
   });
 }
 
@@ -2428,7 +3080,7 @@ test("blocker 5 (final review): an armed event whose own recorded checksum does 
   // corrupt/wrong and can never be trusted as a valid identity to resolve.
   pool.control.priorEvents = [ambiguousStart, wrongChecksumArmed, validResolution()];
   await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), /commit_outcome_unknown/);
-  assert.deepEqual(pool.log.filter(({ client }) => client === "execution"), []);
+  assert.deepEqual(withoutTerminalReset(pool.log.filter(({ client }) => client === "execution")), []);
 });
 
 test("blocker 5 (final review): a resolution whose resolved_checksum_sha256 matches the current migration but not the armed event's own recorded checksum is rejected", async () => {
@@ -2446,7 +3098,7 @@ test("blocker 5 (final review): a resolution whose resolved_checksum_sha256 matc
   });
   pool.control.priorEvents = [ambiguousStart, ambiguousEvent, misleadingResolution];
   await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), /commit_outcome_unknown/);
-  assert.deepEqual(pool.log.filter(({ client }) => client === "execution"), []);
+  assert.deepEqual(withoutTerminalReset(pool.log.filter(({ client }) => client === "execution")), []);
 });
 
 test("blocker 5 (final review): an armed event with an extra unrecognised metadata field is never well-formed enough to resolve", async () => {
@@ -2581,6 +3233,67 @@ test("legacy-verbatim unverified cancellation (pg_cancel_backend rejected) destr
     assert.deepEqual(pool.control.eventTypes(), ["started", "heartbeat", "heartbeat", "execution_failed"]);
     assert.equal(pool.execution.releaseCount, 1);
     assert.ok(pool.execution.releasedWith);
+  });
+});
+
+/**
+ * PB-10 Step 3 Phase 2d, the two terminal-boundary contracts that inherently
+ * need a *second* migration-owned client and therefore cannot be proven from
+ * the read-only plan path in migration-session-reset.test.ts. Both are named
+ * scenarios the dedicated Phase 2d unit CI gate enforces by name: deleting,
+ * renaming or skipping either of them fails that step.
+ */
+test("phase2d: no release while registered client-owned work remains unsettled", async () => {
+  await withStrictUnhandledRejection(async () => {
+    const pool = new FakePool();
+    // An unconfirmed cancellation deliberately abandons the operation still
+    // pending — nothing can prove what that backend is doing — so the
+    // execution session is still registered as owned when disposal is reached.
+    pool.execution.hangMigrationSql = true;
+    const originalQuery = pool.control.query.bind(pool.control);
+    pool.control.query = async (sql: string, values?: unknown[]) => {
+      if (sql.includes("pg_cancel_backend")) throw new Error("control connection unavailable");
+      return originalQuery(sql, values);
+    };
+    const sleepController = controllableSleep();
+
+    const pending = run(pool, { sleep: sleepController.sleep });
+    await tickUntilFirstSleep(sleepController);
+    sleepController.fire(0);
+    await assert.rejects(pending, /cancellation_unverified/);
+
+    assert.deepEqual(
+      pool.execution.resetSql, [],
+      "a reset must never race an operation that may still be using the same session",
+    );
+    assert.ok(pool.execution.releasedWith instanceof Error, "unprovable work destroys the session rather than returning it");
+    assert.equal(pool.execution.releaseCount, 1, "exactly one terminal disposition");
+  });
+});
+
+test("phase2d: duplicate finalization of one execution client is exactly once", async () => {
+  await withStrictUnhandledRejection(async () => {
+    const pool = new FakePool();
+    pool.execution.hangMigrationSql = true;
+    const lost = new Error("control connection lost");
+
+    // Two independent owners reach for the same client: the control-loss
+    // handler disposes of it the instant control dies, and the run loop's own
+    // `finally` disposes of it again on the way out. The boundary's
+    // per-episode latch must collapse them into one decision, one terminal
+    // action, and no second reset sequence.
+    const pending = run(pool, { manifest: manifestOf(entries.transactional) });
+    setImmediate(() => {
+      pool.control.dead = lost;
+      pool.control.emit("error", lost);
+      pool.execution.settlePendingOperation();
+    });
+    await assert.rejects(pending, /control connection lost/);
+
+    assert.equal(pool.execution.releaseCount, 1, "exactly one terminal disposition, from two independent disposal calls");
+    assert.ok(pool.execution.releasedWith instanceof Error, "and it is the destructive one");
+    assert.deepEqual(pool.execution.resetSql, [], "no reset sequence is issued, let alone two");
+    assert.equal(pool.control.releaseCount, 1, "the control client is likewise disposed of exactly once");
   });
 });
 
@@ -3765,4 +4478,262 @@ test("H2: stale_legacy_attempt is never emitted by any new execution path", asyn
     pool.control.events.every(({ values }) => values[9] !== "stale_legacy_attempt"),
     "no current execution path writes the historical legacy class",
   );
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// PB-10 Step 3 Phase 2d final review, CRITICAL 1 and CRITICAL 2, on the
+// EXECUTION ownership path — the second migration-owned client, disposed of
+// through the same boundary but reached through a second memo of its own.
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * CRITICAL 1. The execution client's disposal converted a caught value with
+ * `new Error(String(error))`, from inside the `catch` that stands between an
+ * already-acquired client and its `release()`. `String(x)` performs ToPrimitive,
+ * so a legal thrown value with no usable primitive conversion made the
+ * conversion itself throw: the disposal rejected before the terminal action and
+ * the client reached *zero* disposition attempts, permanently consuming a slot
+ * of a bounded production pool.
+ *
+ * Reached through the real `executeMigrations(pool)` entry point. The only
+ * substitution is the listener registration failing, which is the defect's own
+ * trigger.
+ */
+for (const { name, make } of hostileThrowValues) {
+  test(`phase2d: an execution listener throwing ${name} still reaches exactly one terminal disposition`, async () => {
+    const pool = new FakePool();
+    pool.execution.failEveryErrorListener = throws(make());
+
+    let reported: unknown;
+    await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
+      reported = error;
+      return true;
+    });
+
+    // The finding itself is asserted first: zero attempts before the fix.
+    assert.equal(pool.connects, 2, "the execution client really was checked out before the failure");
+    assert.equal(pool.execution.releaseAttempts, 1, "exactly one terminal disposition attempt — never zero, never two");
+    assert.ok(reported instanceof Error, "a usable Error reaches the caller, never the raw hostile value");
+    assert.ok(
+      !(reported instanceof AggregateError),
+      "and a lone failure is still thrown as itself: normalization added no second failure of its own",
+    );
+    assert.ok(pool.execution.releasedWith instanceof Error, "destructive, with a real Error as its reason");
+    assert.deepEqual(pool.execution.resetSql, [], "a session with no working error handling is never reset for reuse");
+    assert.deepEqual(pool.migrationSql(), [], "no migration SQL runs on a client that failed to take ownership");
+    // Control ownership is separate and completed its own healthy episode.
+    assert.equal(pool.control.releaseAttempts, 1, "the control client is disposed of exactly once, through its own boundary");
+    assert.equal(pool.control.unlocked, true, "the schema advisory lock is still verifiably released");
+    assert.equal(pool.checkedOut, 0, "no client remains checked out: a bounded pool is not consumed");
+  });
+}
+
+for (const { name, make } of diagnosticThrowValues) {
+  test(`phase2d: an execution listener throwing ${name} is normalized without losing its text`, async () => {
+    const pool = new FakePool();
+    const thrown = make();
+    pool.execution.failEveryErrorListener = throws(thrown);
+
+    let reported: Error | undefined;
+    await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
+      assert.ok(error instanceof Error, "a usable Error reaches the caller");
+      reported = error;
+      return true;
+    });
+
+    assert.equal(reported?.message, String(thrown as string), "the primitive's own text survives normalization");
+    assert.equal(pool.execution.releaseAttempts, 1, "exactly one terminal disposition attempt");
+    assert.equal(pool.checkedOut, 0, "no client remains checked out");
+  });
+}
+
+test("phase2d: a hostile cleanup throw value never displaces a primary migration failure", async () => {
+  // Requirement E: the migration's own Error stays primary *by identity* while
+  // the cleanup that follows throws something that cannot be described at all.
+  const pool = new FakePool();
+  const primary = pgError("boom", "42601");
+  pool.execution.failMigrationSql = primary;
+  pool.control.failRemoveListener = throws(Object.create(null) as unknown);
+
+  await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
+    assert.ok(error instanceof AggregateError, "both failures are retained");
+    assert.equal(error.errors.length, 2, "and only those two");
+    assert.ok(
+      error.errors[0] instanceof Error && /sql_failed/.test(error.errors[0].message),
+      "PRIMARY FIRST: the migration's own failure, unchanged",
+    );
+    assert.ok(error.errors[1] instanceof Error, "the hostile cleanup value is normalized, never dropped and never raw");
+    return true;
+  });
+
+  assert.equal(pool.execution.releaseAttempts, 1, "exactly one terminal disposition attempt on the execution client");
+  assert.equal(pool.control.releaseAttempts, 1, "and exactly one on the control client");
+  assert.equal(pool.checkedOut, 0, "no client remains checked out");
+});
+
+test("phase2d: a hostile throw from release() itself is still exactly one attempt, composed rather than raw", async () => {
+  const pool = new FakePool();
+  const primary = new Error("the execution client's error listener could not be registered");
+  pool.execution.failEveryErrorListener = throws(primary);
+  pool.execution.failRelease = throws(Object.create(null) as unknown);
+
+  await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
+    assert.ok(error instanceof AggregateError, "both failures are retained");
+    assert.equal(error.errors[0], primary, "PRIMARY FIRST, by identity");
+    assert.ok(error.errors[1] instanceof Error, "the disposal failure is normalized, never the raw hostile value");
+    return true;
+  });
+
+  // The guarantee is one *attempt*: what pg-pool's release machinery then does
+  // physically is not, and cannot be, this code's to promise.
+  assert.equal(pool.execution.releaseAttempts, 1, "exactly one terminal disposition attempt was made");
+  assert.equal(pool.control.releaseAttempts, 1, "and the control client is finalized independently, exactly once");
+});
+
+/**
+ * CRITICAL 2 — the regression the independent review demonstrated.
+ *
+ * Both gates on the way to a disposition recorded their claim *after* starting
+ * the disposal body:
+ *
+ *     executionDisposal = (async () => disposeClient(execution, …))();   // memo
+ *     const running = (async () => disposeMigrationClient(client, …))(); // latch
+ *     disposed[disposed.length] = { client, running };
+ *
+ * An `async` IIFE runs synchronously up to its first `await`, and the disposal
+ * body's first act is `client.on("error", …)`. Node's EventEmitter emits
+ * `newListener` *synchronously, before* the listener is added — real Node
+ * semantics, exercised here through Node's own `super.on`, not a fake — so a
+ * `newListener` handler re-entered disposal while both the memo and the latch
+ * were still empty. One ownership episode, two `release()` attempts.
+ *
+ * The claim is now published before the body runs, so the reentrant caller
+ * joins the disposition already owned instead of starting a second one.
+ */
+test("phase2d: a native newListener handler firing inside the execution disposer cannot start a second disposition", async () => {
+  const pool = new FakePool();
+  let reentries = 0;
+  pool.execution.on("newListener", (event: string, listener: { name?: string }) => {
+    // Only the boundary's own absorber installation, and only once: this is the
+    // exact synchronous window that existed before the first `await` of the
+    // disposal body.
+    if (event !== "error" || listener?.name !== "reportSanitizedPoolError" || reentries > 0) return;
+    reentries += 1;
+    // The production path that re-enters `disposeExecution` synchronously: the
+    // control client's own 'error' handler.
+    pool.control.emit("error", new Error("the control connection died inside the execution disposer"));
+  });
+
+  await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
+    assert.ok(error instanceof Error, "the connection failure is reported");
+    return true;
+  });
+
+  assert.equal(reentries, 1, "the reentrant path really was taken, from inside the disposal body");
+  assert.equal(
+    pool.execution.releaseAttempts, 1,
+    "one ownership episode, exactly one terminal disposition attempt — two before the fix",
+  );
+  assert.equal(pool.control.releaseAttempts, 1, "the control client is finalized exactly once, independently");
+  assert.equal(pool.checkedOut, 0, "no client remains checked out");
+});
+
+test("phase2d: repeated native newListener re-entry cannot accumulate terminal actions", async () => {
+  // Beyond the review's own probe: the handler re-enters on *every* absorber
+  // installation it sees, up to a bound. A claim published only after the body
+  // runs would compound — each new disposition installing another listener that
+  // re-enters again — so this both reproduces the defect and proves the fix does
+  // not merely deduplicate the first duplicate.
+  const pool = new FakePool();
+  let reentries = 0;
+  pool.execution.on("newListener", (event: string, listener: { name?: string }) => {
+    if (event !== "error" || listener?.name !== "reportSanitizedPoolError" || reentries >= 3) return;
+    reentries += 1;
+    pool.control.emit("error", new Error(`re-entry ${reentries} from inside the execution disposer`));
+  });
+
+  await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }));
+
+  assert.equal(reentries, 1, "there is only ever one absorber installation to re-enter from");
+  assert.equal(pool.execution.releaseAttempts, 1, "and still exactly one terminal disposition attempt");
+  assert.equal(pool.checkedOut, 0, "no client remains checked out");
+});
+
+test("phase2d: re-entering disposal while the terminal reset is in flight joins the disposition already claimed", async () => {
+  // Requirement C/F: the reentrant call arrives *after* the first `await`, with
+  // real SQL outstanding on the session. It must join, never start a second
+  // reset or a second release on a client whose reset has not answered yet.
+  const pool = new FakePool();
+  let reentries = 0;
+  pool.execution.onResetStatement = (sql: string) => {
+    if (sql !== "discard all" || reentries > 0) return;
+    reentries += 1;
+    pool.control.emit("error", new Error("the control connection died mid-reset"));
+  };
+
+  await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
+    assert.ok(error instanceof Error, "the connection failure is reported");
+    return true;
+  });
+
+  assert.equal(reentries, 1, "the reentrant path really was taken, mid-reset");
+  assert.equal(pool.execution.releaseAttempts, 1, "exactly one terminal disposition attempt");
+  assert.deepEqual(
+    pool.execution.resetSql, ["rollback", "discard all", "baseline-proof"],
+    "and exactly one reset sequence was issued, in order — never a second one racing the first",
+  );
+  assert.equal(pool.checkedOut, 0, "no client remains checked out");
+});
+
+test("phase2d: re-entering disposal from inside release() itself cannot produce a second terminal action", async () => {
+  // The last window in the disposal body: the terminal action is running and the
+  // outcome has not settled. A joiner here must receive the outcome in flight
+  // rather than issue a second release against a client already handed back.
+  const pool = new FakePool();
+  let reentries = 0;
+  pool.execution.onReleaseAttempt = () => {
+    if (reentries > 0) return;
+    reentries += 1;
+    pool.control.emit("error", new Error("the control connection died as the execution client was handed back"));
+  };
+
+  // The migration itself completed; losing the control connection during the
+  // hand-back is still reported, because a run whose control connection died is
+  // never allowed to pass for a clean one.
+  await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), /control_connection_lost/);
+
+  assert.equal(reentries, 1, "the reentrant path really was taken, from inside the terminal action");
+  assert.deepEqual(
+    pool.execution.resetSql, ["rollback", "discard all", "baseline-proof"],
+    "the execution session was reset exactly once, in order, before the hand-back",
+  );
+  assert.equal(pool.execution.releaseAttempts, 1, "exactly one terminal disposition attempt");
+  assert.equal(pool.checkedOut, 0, "no client remains checked out");
+});
+
+test("phase2d: two concurrent disposition callers share one terminal action", async () => {
+  // Requirement D: an asynchronous second caller, arriving while the first
+  // disposition is suspended on its reset, must join it. The control client's
+  // 'error' handler is the production path that produces one; the run loop's own
+  // `finally` is the other, and both await the same promise.
+  const pool = new FakePool();
+  pool.execution.hangReset = false;
+  let armed = false;
+  pool.execution.onResetStatement = (sql: string) => {
+    if (sql !== "rollback" || armed) return;
+    armed = true;
+    // Deliberately asynchronous, so this lands on a later tick than the
+    // disposal body's own synchronous prologue.
+    queueMicrotask(() => pool.control.emit("error", new Error("a concurrent owner also decided to dispose")));
+  };
+
+  await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
+    assert.ok(error instanceof Error, "the connection failure is reported");
+    return true;
+  });
+
+  assert.equal(armed, true, "the concurrent caller really did run");
+  assert.equal(pool.execution.releaseAttempts, 1, "exactly one terminal disposition attempt");
+  assert.equal(pool.control.releaseAttempts, 1, "and exactly one on the control client");
+  assert.equal(pool.checkedOut, 0, "no client remains checked out");
 });
