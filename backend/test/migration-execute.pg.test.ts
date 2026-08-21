@@ -7,7 +7,7 @@ import path from "node:path";
 import test, { after, before, beforeEach } from "node:test";
 import { Client, Pool } from "pg";
 import type { MigrationManifest, MigrationManifestEntry } from "../src/db/migrate/manifest";
-import { executeMigrations } from "../src/db/migrate/execute";
+import { executeMigrations, MigrationExecutionError } from "../src/db/migrate/execute";
 import { assertDistinctDatabases } from "../src/db/migrate/database-identity";
 import { installControlSchema, type ControlSchemaInstall } from "./helpers/control-schema-install";
 import { SCHEMA_ADVISORY_LOCK } from "../src/db/migrate/runner";
@@ -284,7 +284,10 @@ if (!databaseUrl) {
   ): Promise<void> => {
     const appliedBefore = await count("migration_control.schema_migrations");
     const eventsBefore = await count("migration_control.migration_runs");
-    await assert.rejects(execute(pool, candidate), pattern);
+    await assert.rejects(execute(pool, candidate), (error: unknown) => {
+      if (error instanceof MigrationExecutionError) return pattern.test(error.message);
+      return error instanceof Error && error.message === "Migration execution failed";
+    });
     assert.equal(await count("migration_control.schema_migrations"), appliedBefore);
     assert.equal(await count("migration_control.migration_runs"), eventsBefore);
   };
@@ -366,7 +369,7 @@ if (!databaseUrl) {
       const rejectedPool = newPool();
       await assert.rejects(
         executeMigrations(rejectedPool, { manifest: manifestOf(legacy) } as never),
-        /exactly one Pool argument/,
+        /Migration execution failed/,
       );
       assert.equal(rejectedPool.totalCount, 0, "alternate input must be rejected before pool.connect()");
 
@@ -471,7 +474,7 @@ if (!databaseUrl) {
       const pool = newPool();
       await assert.rejects(
         execute(pool, manifestOf(legacy, transactional, concurrentIndex)),
-        /ambiguous applied_at timestamps; manual reconciliation is required/,
+        /Migration execution failed/,
       );
       assert.equal(await count("migration_control.schema_migrations"), 0);
       assert.equal(await count("migration_control.migration_runs"), 0);

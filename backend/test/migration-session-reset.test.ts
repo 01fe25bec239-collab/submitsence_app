@@ -252,6 +252,14 @@ function plan(client: ResetClient, options: Record<string, unknown> = {}): Promi
   return runMigrationPlan(pool.asPool(), { manifest, ...options }) as Promise<{ pendingCount: number }>;
 }
 
+function isPlanDiagnostic(error: unknown): boolean {
+  assert.ok(error instanceof Error);
+  assert.equal(error.message, "Migration plan failed");
+  assert.equal((error as Error & { code?: string }).code, "PB10_MIGRATION_PLAN_FAILED");
+  assert.equal(error.stack, undefined);
+  return true;
+}
+
 /** Fails if an uncaughtException or unhandledRejection fires while `run` executes. */
 async function withStrictProcessErrors<T>(run: () => Promise<T>): Promise<T> {
   const uncaught: unknown[] = [];
@@ -373,7 +381,7 @@ test("an owner that already knows the session is unusable destroys it without is
   const cause = new Error("the migration transaction's outcome is unknown");
   client.actionHook = () => { client.emit("error", cause); };
 
-  await assert.rejects(withStrictProcessErrors(() => plan(client)), /outcome is unknown/);
+  await assert.rejects(withStrictProcessErrors(() => plan(client)), isPlanDiagnostic);
   assert.deepEqual(client.reset, [], "no statement is issued on a session already known to be unsafe");
   assert.deepEqual(client.terminal, ["destroy"]);
   assert.equal(client.releasedWith, cause, "the destructive release carries the original cause");
@@ -524,8 +532,7 @@ test("cleanup failure never replaces a primary execution failure", async () => {
   await assert.rejects(
     withStrictProcessErrors(() => plan(client)),
     (error: unknown) => {
-      assert.equal(error, primary, "the migration's own outcome is what the caller sees");
-      return true;
+      return isPlanDiagnostic(error);
     },
   );
   assert.deepEqual(client.terminal, ["destroy"], "and the failed cleanup still destroyed the client");
@@ -557,27 +564,25 @@ test("the boundary leaves no dangling timer: the process can exit immediately af
  * `max: 1` pool would fail to acquire a client at all.
  */
 test("invalid plan lock options are rejected before any client is acquired, and never leak one", async () => {
-  const rejected: Array<[string, Record<string, unknown>, RegExp]> = [
-    ["pollMs zero", { pollMs: 0 }, /poll interval must be positive/],
-    ["pollMs negative", { pollMs: -1 }, /poll interval must be positive/],
-    ["pollMs NaN", { pollMs: Number.NaN }, /poll interval must be positive/],
-    ["pollMs infinite", { pollMs: Number.POSITIVE_INFINITY }, /poll interval must be positive/],
-    ["budgetMs negative", { budgetMs: -1 }, /budget must be nonnegative/],
-    ["budgetMs NaN", { budgetMs: Number.NaN }, /budget must be nonnegative/],
-    ["budgetMs infinite", { budgetMs: Number.POSITIVE_INFINITY }, /budget must be nonnegative/],
-    ["now not callable", { now: 0 }, /now override must be a function/],
-    ["sleep not callable", { sleep: "soon" }, /sleep override must be a function/],
-    ["diagnose not callable", { diagnose: {} }, /diagnose override must be a function/],
+  const rejected: Array<[string, Record<string, unknown>]> = [
+    ["pollMs zero", { pollMs: 0 }],
+    ["pollMs negative", { pollMs: -1 }],
+    ["pollMs NaN", { pollMs: Number.NaN }],
+    ["pollMs infinite", { pollMs: Number.POSITIVE_INFINITY }],
+    ["budgetMs negative", { budgetMs: -1 }],
+    ["budgetMs NaN", { budgetMs: Number.NaN }],
+    ["budgetMs infinite", { budgetMs: Number.POSITIVE_INFINITY }],
+    ["now not callable", { now: 0 }],
+    ["sleep not callable", { sleep: "soon" }],
+    ["diagnose not callable", { diagnose: {} }],
   ];
 
-  for (const [label, options, message] of rejected) {
+  for (const [label, options] of rejected) {
     const client = new ResetClient();
     client.episodes = 2;
     const pool = new SingleClientPool(client);
 
-    await assert.rejects(
-      withStrictProcessErrors(() => plan(client, options)), message, `${label}: the option is rejected`,
-    );
+    await assert.rejects(withStrictProcessErrors(() => plan(client, options)), isPlanDiagnostic, `${label}: the option is rejected`);
     assert.equal(pool.connects, 0, `${label}: no client may be checked out before the option is validated`);
     assert.equal(pool.checkedOut, 0, `${label}: nothing is left checked out`);
     assert.deepEqual(client.terminal, [], `${label}: an unacquired client has nothing to dispose of`);
@@ -612,7 +617,7 @@ test("a lock option that can only fail after acquisition still reaches exactly o
     client.episodes = 2;
     const pool = new SingleClientPool(client);
 
-    await assert.rejects(withStrictProcessErrors(() => plan(client, options)), /unavailable/, `${label}: the failure surfaces`);
+    await assert.rejects(withStrictProcessErrors(() => plan(client, options)), isPlanDiagnostic, `${label}: the failure surfaces`);
     assert.equal(pool.connects, 1, `${label}: the client really was acquired first`);
     assert.equal(pool.checkedOut, 0, `${label}: and it was returned`);
     assert.equal(client.terminal.length, 1, `${label}: exactly one terminal disposition`);
@@ -658,10 +663,7 @@ test("a control client whose error-listener registration always throws still rea
   client.failErrorListener = throws(brokenEmitter);
 
   await assert.rejects(withStrictProcessErrors(() => plan(client)), (error: unknown) => {
-    // Primary-error preservation: the disposal neither replaces nor hides the
-    // failure that condemned the session.
-    assert.equal(error, brokenEmitter, "the original registration failure is what the caller sees");
-    return true;
+    return isPlanDiagnostic(error);
   });
 
   assert.equal(pool.connects, 1, "the client really was checked out before the failure");
@@ -708,7 +710,7 @@ test("primary and cleanup failures compose: the migration's own error is never r
     const client = new ResetClient();
     client.unlockResult = false;
     await assert.rejects(withStrictProcessErrors(() => plan(client)), (error: unknown) => {
-      assert.ok(error instanceof Error && /unlock returned false/.test(error.message), "B1: the cleanup failure is reported");
+      isPlanDiagnostic(error);
       assert.ok(!(error instanceof AggregateError), "B1: a lone failure is thrown as itself, not wrapped");
       return true;
     });
@@ -720,8 +722,7 @@ test("primary and cleanup failures compose: the migration's own error is never r
     const client = new ResetClient();
     client.failRelease = throws(disposalFailure);
     await assert.rejects(withStrictProcessErrors(() => plan(client)), (error: unknown) => {
-      assert.equal(error, disposalFailure, "B2: the disposal failure is reported when it is the only failure");
-      return true;
+      return isPlanDiagnostic(error);
     });
     assert.deepEqual(client.terminal, ["release"], "B2: exactly one terminal action was attempted");
   }
@@ -731,8 +732,7 @@ test("primary and cleanup failures compose: the migration's own error is never r
     const client = new ResetClient();
     client.actionHook = () => { throw primary; };
     await assert.rejects(withStrictProcessErrors(() => plan(client)), (error: unknown) => {
-      assert.equal(error, primary, "C: the migration's own outcome is what the caller sees");
-      return true;
+      return isPlanDiagnostic(error);
     });
     assert.deepEqual(client.terminal, ["release"], "C: a clean session is still returned to the pool");
   }
@@ -744,8 +744,8 @@ test("primary and cleanup failures compose: the migration's own error is never r
     client.unlockResult = false;
     await assert.rejects(withStrictProcessErrors(() => plan(client)), (error: unknown) => {
       assert.ok(error instanceof AggregateError, "D1: both failures are retained");
-      assert.equal(error.errors[0], primary, "D1: the migration failure remains identifiable as the primary failure");
       assert.equal(error.errors.length, 2, "D1: and the cleanup failure is retained alongside it");
+      assert.ok(error.errors.every(isPlanDiagnostic));
       return true;
     });
     assert.deepEqual(client.terminal, ["destroy"], "D1: exactly one terminal disposition still holds");
@@ -759,8 +759,8 @@ test("primary and cleanup failures compose: the migration's own error is never r
     client.failRelease = throws(disposalFailure);
     await assert.rejects(withStrictProcessErrors(() => plan(client)), (error: unknown) => {
       assert.ok(error instanceof AggregateError, "D2: both failures are retained");
-      assert.equal(error.errors[0], primary, "D2: the migration failure remains identifiable as the primary failure");
-      assert.equal(error.errors[1], disposalFailure, "D2: the disposal failure is observable, never silently dropped");
+      assert.equal(error.errors.length, 2);
+      assert.ok(error.errors.every(isPlanDiagnostic));
       return true;
     });
     assert.deepEqual(client.terminal, ["release"], "D2: exactly one terminal action was attempted");
@@ -862,7 +862,7 @@ for (const { name, make } of diagnosticThrowValues) {
     // String(x) on a primitive is defined by the language and runs no user
     // code, so the value's own text is safe to keep — and keeping it is what
     // makes the diagnostic worth having.
-    assert.equal(reported?.message, String(thrown as string), "the primitive's own text survives normalization");
+    assert.equal(reported?.message, "Migration plan failed", "raw primitive text is removed at the public boundary");
     assert.equal(client.attempts, 1, "exactly one terminal disposition attempt");
     assert.deepEqual(client.terminal, ["destroy"], "and it completed, destructively");
     assert.equal(pool.checkedOut, 0, "nothing is left checked out");
@@ -881,11 +881,7 @@ test("phase2d: a hostile primary throw value composes deterministically with an 
   await assert.rejects(withStrictProcessErrors(() => plan(client)), (error: unknown) => {
     assert.ok(error instanceof AggregateError, "both failures are retained");
     assert.equal(error.errors.length, 2, "and only those two");
-    assert.ok(error.errors[0] instanceof Error, "PRIMARY FIRST: the action's own failure, normalized, not the raw value");
-    assert.ok(
-      /unlock returned false/.test(String((error.errors[1] as Error).message)),
-      "the cleanup failure is retained alongside it, in second place",
-    );
+    assert.ok(error.errors.every(isPlanDiagnostic), "both members are rebuilt as fixed public diagnostics");
     return true;
   });
 
@@ -904,8 +900,8 @@ test("phase2d: an ordinary primary failure survives a hostile cleanup throw valu
 
   await assert.rejects(withStrictProcessErrors(() => plan(client)), (error: unknown) => {
     assert.ok(error instanceof AggregateError, "both failures are retained");
-    assert.equal(error.errors[0], primary, "PRIMARY FIRST, by identity: the action's own Error is unchanged");
-    assert.ok(error.errors[1] instanceof Error, "the disposal failure is normalized, never dropped and never raw");
+    assert.equal(error.errors.length, 2);
+    assert.ok(error.errors.every(isPlanDiagnostic), "both members are rebuilt as fixed public diagnostics");
     return true;
   });
 

@@ -178,6 +178,29 @@ jobs:
                 || fail "$file is missing mandatory Phase 2d scenario: $scenario"
             done < "$manifest"
           done
+      - name: Enforce the Phase 2e external diagnostic boundary
+        run: |
+          set -u -o pipefail
+          fail() { echo "PHASE 2E GATE FAILED: $*" >&2; exit 1; }
+          expected_script='node --import tsx --test test/migration-sanitization.test.ts'
+          actual_script=$(node -p 'require("./backend/package.json").scripts["test:unit:phase2e"] || ""')
+          [ "$actual_script" = "$expected_script" ] || fail "backend test:unit:phase2e does not name the required suite"
+          log=/tmp/pb10-phase2e.log
+          ( cd backend && node --import tsx --test --test-reporter=tap test/migration-sanitization.test.ts ) | tee "$log"
+          grep -qx '# pass 7' "$log" || fail "Phase 2e suite did not report exactly seven passing tests"
+          grep -qx '# fail 0' "$log" || fail "Phase 2e suite reported a failure"
+          grep -qx '# skipped 0' "$log" || fail "Phase 2e suite skipped a test"
+          for scenario in \
+            'executeMigrations strips forged trust, AggregateError properties, cycles, proxies, and secrets' \
+            'application executeMigrations rejection is sanitized while safe execution classification survives' \
+            'public runMigrationPlan rejection is sanitized at the application boundary' \
+            'fresh emitted modules expose no trusted constructor or sanitizer internals' \
+            'CI binds both diagnostic streams, sanitizer status, and PostgreSQL scenario provenance' \
+            'CLI runner and manifest stderr boundaries emit only fixed diagnostics' \
+            'warning boundaries allowlist code and cannot interrupt finalization'
+          do
+            grep -qF -- "- phase2e: $scenario" "$log" || fail "missing mandatory scenario: $scenario"
+          done
       - run: npm run build --prefix backend
       - run: npm audit --prefix backend --omit=dev --audit-level=high
       - run: npm ci --prefix web
@@ -188,6 +211,27 @@ jobs:
 
   database:
     runs-on: ubuntu-latest
+    # Every run-step stream is captured before it can reach the Actions log.
+    # The wrapper allowlists safe TAP provenance on stdout, replaces all other
+    # output with a fixed diagnostic, waits for both sanitizers, and combines
+    # their status with the original command status.
+    #
+    # PB-10 Step 3 Phase 2e, A4 round 2, HIGH: the sanitizer path here MUST be
+    # resolvable by the Actions runner itself. A custom shell definition is not
+    # run through a shell — the runner splits it into an executable plus
+    # arguments and substitutes {0} with the generated script — so `$VAR`,
+    # `$(...)` and any other shell interpolation inside this value are passed
+    # through literally, and a `$GITHUB_WORKSPACE/...` reference resolves to a
+    # nonexistent path (`No such file or directory`, exit 127) on every single
+    # run step. A repository-relative path is no good either: several steps
+    # below set `working-directory: backend`, and the runner uses the step's
+    # working directory as the process cwd, so a relative path would break for
+    # exactly those steps. `${{ github.workspace }}` is an Actions *expression*
+    # — evaluated by the workflow engine before the runner ever sees the value
+    # — so what reaches the runner is already a literal absolute path.
+    defaults:
+      run:
+        shell: bash --noprofile --norc ${{ github.workspace }}/infra/scripts/sanitize-ci-stderr.sh {0}
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -225,6 +269,8 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: backend/package-lock.json
+      - name: Verify CI diagnostic stream and status propagation
+        run: bash infra/scripts/sanitize-ci-stderr.sh --self-test
       - run: npm ci --prefix backend
       - name: Verify frozen previous-schema fixture integrity
         run: db/control/test-fixture-integrity.sh
@@ -377,7 +423,7 @@ jobs:
         # removing the C1/C2 coverage it exists to provide.
         run: |
           set -o pipefail
-          npm run test:pg:proof --prefix backend 2>&1 | tee /tmp/pg-proof.log
+          npm run test:pg:proof --prefix backend | tee /tmp/pg-proof.log
           grep -qx '# fail 0' /tmp/pg-proof.log
           grep -qx '# skipped 0' /tmp/pg-proof.log
           grep -qx '# pass 17' /tmp/pg-proof.log
@@ -394,7 +440,7 @@ jobs:
         # coverage it exists to provide.
         run: |
           set -o pipefail
-          npm run test:pg:h2-recovery --prefix backend 2>&1 | tee /tmp/pg-h2.log
+          npm run test:pg:h2-recovery --prefix backend | tee /tmp/pg-h2.log
           grep -qx '# fail 0' /tmp/pg-h2.log
           grep -qx '# skipped 0' /tmp/pg-h2.log
           grep -qx '# pass 22' /tmp/pg-h2.log
@@ -411,7 +457,7 @@ jobs:
         # skips would remove that coverage while the step still went green.
         run: |
           set -o pipefail
-          npm run test:pg:session-reset --prefix backend 2>&1 | tee /tmp/pg-session-reset.log
+          npm run test:pg:session-reset --prefix backend | tee /tmp/pg-session-reset.log
           grep -qx '# fail 0' /tmp/pg-session-reset.log
           grep -qx '# skipped 0' /tmp/pg-session-reset.log
           grep -qx '# pass 18' /tmp/pg-session-reset.log
@@ -451,7 +497,7 @@ jobs:
             echo "plan unexpectedly succeeded against an unbaselined legacy ledger"
             exit 1
           fi
-          grep -q "Legacy migration ledger public.infrastructure_schema_migrations" /tmp/divergence.err
+          grep -qx "Migration plan failed" /tmp/divergence.err
           test "$(psql "$ADMIN_PLAN_DATABASE_URL" -XAtq -v ON_ERROR_STOP=1 -c "select (select count(*) from migration_control.schema_migrations) || ':' || (select count(*) from public.infrastructure_schema_migrations)")" = "0:1"
           psql "$ADMIN_PLAN_DATABASE_URL" -v ON_ERROR_STOP=1 -q -c "drop table public.infrastructure_schema_migrations"
       - name: Test migration execution modes
@@ -465,7 +511,7 @@ jobs:
         # Counted, so a suite that silently stops running fails CI.
         run: |
           set -o pipefail
-          node --import tsx --test test/migration-error-class-compatibility.test.ts 2>&1 | tee /tmp/h1.log
+          node --import tsx --test test/migration-error-class-compatibility.test.ts | tee /tmp/h1.log
           grep -qx '# fail 0' /tmp/h1.log
           grep -qx '# skipped 0' /tmp/h1.log
           grep -qx '# pass 3' /tmp/h1.log
@@ -480,6 +526,23 @@ jobs:
           MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
           TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/application_test
         run: npm run test:pg:migration --prefix backend
+      - name: Test Phase 2e sanitization against real PostgreSQL
+        env:
+          MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/migration_execution_test
+        run: |
+          log=/tmp/pg-phase2e.log
+          npm run test:pg:phase2e --prefix backend | tee "$log"
+          grep -qx '# pass 4' "$log"
+          grep -qx '# fail 0' "$log"
+          grep -qx '# skipped 0' "$log"
+          for scenario in \
+            'a real PostgreSQL ErrorResponse is sanitized at executeMigrations' \
+            'real PostgreSQL query text and driver fields never cross the application boundary' \
+            'a real PostgreSQL ErrorResponse is sanitized at public runMigrationPlan' \
+            'advisory-lock contention ages cross the diagnostic allowlist as bounded text'
+          do
+            grep -qF -- "- phase2e pg: $scenario" "$log"
+          done
       - name: Test cancellation-confirmation hardening against real PostgreSQL
         env:
           # Both credentials, deliberately: this suite drops and reinstalls
@@ -495,7 +558,7 @@ jobs:
         # quietly removing its own coverage.
         run: |
           set -o pipefail
-          npm run test:pg:supervision --prefix backend 2>&1 | tee /tmp/pg-supervision.log
+          npm run test:pg:supervision --prefix backend | tee /tmp/pg-supervision.log
           grep -qx '# pass 6' /tmp/pg-supervision.log
           grep -qx '# fail 0' /tmp/pg-supervision.log
           grep -qx '# skipped 0' /tmp/pg-supervision.log
@@ -539,7 +602,7 @@ jobs:
         # to a skip while the step still went green.
         run: |
           set -o pipefail
-          npm run test:pg:commit-ambiguity --prefix backend 2>&1 | tee /tmp/pg-commit-ambiguity.log
+          npm run test:pg:commit-ambiguity --prefix backend | tee /tmp/pg-commit-ambiguity.log
           grep -qx '# fail 0' /tmp/pg-commit-ambiguity.log
           grep -qx '# skipped 0' /tmp/pg-commit-ambiguity.log
           grep -q 'explicit host/user/password credentials' /tmp/pg-commit-ambiguity.log

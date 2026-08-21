@@ -862,8 +862,12 @@ async function main(): Promise<void> {
 }
 
 if (require.main === module) {
-  main().catch((error: unknown) => {
-    console.error(error instanceof Error ? error.message : error);
+  main().catch(() => {
+    try {
+      process.stderr.write(process.argv[2] === "execute" ? "Migration execution failed\n" : "Migration plan failed\n");
+    } catch {
+      // The command has already failed; never create a raw fallback path.
+    }
     process.exitCode = 1;
   });
 }
