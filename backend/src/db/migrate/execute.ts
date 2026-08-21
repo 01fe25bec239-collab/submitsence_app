@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { Client, type Pool, type PoolClient } from "pg";
+import { Client, DatabaseError, type Pool, type PoolClient } from "pg";
 import {
   checkManifest,
   type MigrationManifest,
@@ -25,10 +25,81 @@ import {
   type MigrationPlan,
   type SchemaLockOptions,
 } from "./runner";
-import { ERROR_CLASSES, MigrationExecutionError, SQLSTATE, assertCondition, classify, reportSanitizedPoolError, safePoolErrorCode, sqlstateOf, type ErrorClass } from "./execution-errors";
+import { ERROR_CLASSES, MigrationExecutionError as MigrationExecutionErrorBase, SQLSTATE, assertCondition, reportDestroyedMigrationClient, reportSanitizedPoolError, safePoolErrorCode, type ErrorClass } from "./execution-errors";
 
 export { ERROR_CLASSES, MigrationExecutionError, type ErrorClass } from "./execution-errors";
 import { batchedHandlerFor, nontransactionalHandlerFor } from "./handlers";
+
+type DiagnosticCode = "PB10_MIGRATION_EXECUTION_FAILED" | "PB10_MIGRATION_PLAN_FAILED";
+type TrustedErrorDetails = Readonly<{
+  errorClass: ErrorClass;
+  detail: string;
+  migrationId: string | null;
+  sqlstate: string | null;
+}>;
+
+const trustedExecutionErrors = new WeakMap<MigrationExecutionErrorBase, TrustedErrorDetails>();
+
+/** Trusted construction exists only inside the execution module that knows provenance. */
+class MigrationExecutionError extends MigrationExecutionErrorBase {
+  constructor(errorClass: ErrorClass, detail: string, migrationId: string | null = null, sqlstate: string | null = null) {
+    super(errorClass, detail, migrationId, sqlstate);
+    trustedExecutionErrors.set(this, Object.freeze({ errorClass, detail, migrationId, sqlstate }));
+  }
+}
+
+class SanitizedDiagnosticError extends Error {
+  readonly code: DiagnosticCode;
+
+  constructor(code: DiagnosticCode) {
+    super(code === "PB10_MIGRATION_PLAN_FAILED" ? "Migration plan failed" : "Migration execution failed");
+    this.name = "SanitizedDiagnosticError";
+    this.code = code;
+    this.stack = undefined;
+  }
+}
+
+function sqlstateOf(error: unknown): string | null {
+  if (!(error instanceof DatabaseError)) return null;
+  const code = error.code;
+  return typeof code === "string" && SQLSTATE.test(code) ? code : null;
+}
+
+function classify(error: unknown, errorClass: ErrorClass, migrationId: string, detail: string): MigrationExecutionError {
+  if (error instanceof MigrationExecutionError && trustedExecutionErrors.has(error)) return error;
+  return new MigrationExecutionError(errorClass, detail, migrationId, sqlstateOf(error));
+}
+
+/** Fresh, allowlist-only conversion for both public application boundaries. */
+function sanitizeMigrationError(
+  error: unknown,
+  fallbackCode: DiagnosticCode,
+  seen = new WeakSet<object>(),
+): Error {
+  const fallback = () => new SanitizedDiagnosticError(fallbackCode);
+  try {
+    if ((typeof error === "object" && error !== null) || typeof error === "function") {
+      if (seen.has(error as object)) return fallback();
+      seen.add(error as object);
+    }
+    if (error instanceof MigrationExecutionErrorBase) {
+      const details = trustedExecutionErrors.get(error);
+      if (!details) return fallback();
+      return new MigrationExecutionErrorBase(details.errorClass, details.detail, details.migrationId, details.sqlstate);
+    }
+    if (error instanceof AggregateError) {
+      const members = error.errors;
+      if (!Array.isArray(members) || members.length > 16) return fallback();
+      const sanitized = members.map((member) => sanitizeMigrationError(member, fallbackCode, seen));
+      const aggregate = new AggregateError(sanitized, "Multiple migration failures occurred");
+      aggregate.stack = undefined;
+      return aggregate;
+    }
+  } catch {
+    // Hostile proxies/getters, cycles and malformed known errors fail closed.
+  }
+  return fallback();
+}
 
 // PB-10 Step 3 Phase 2c final review: executeMigrations(pool) is the sole
 // production migration-execution entry point, and — unlike the prior
@@ -2126,7 +2197,7 @@ async function appendAmbiguityDurably(
 
 /** The error's own classification when it carries one; a generic SQL failure otherwise. */
 function recordedErrorClass(error: unknown): ErrorClass {
-  return error instanceof MigrationExecutionError ? error.errorClass : "sql_failed";
+  return error instanceof MigrationExecutionErrorBase ? error.errorClass : "sql_failed";
 }
 
 /**
@@ -2136,7 +2207,7 @@ function recordedErrorClass(error: unknown): ErrorClass {
  * nothing. This looks in both places.
  */
 function errorSqlstate(error: unknown): string | null {
-  return error instanceof MigrationExecutionError ? error.sqlstate : sqlstateOf(error);
+  return error instanceof MigrationExecutionErrorBase ? error.sqlstate : sqlstateOf(error);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -3997,21 +4068,21 @@ async function decideDisposition(
  * absorbed PostgreSQL client diagnostic: at most one whitelisted short `.code`,
  * never a message, stack, host, connection string, SQL text or raw object.
  */
-function reportDestroyedMigrationClient(error: unknown): void {
-  process.emitWarning(
-    `[pg_migration_client_destroyed] a PostgreSQL connection used by the migration runner could not be proven reusable (code=${safePoolErrorCode(error)}); it was destroyed instead of returned to the pool`,
-    { code: "PB10_MIGRATION_CLIENT_DESTROYED" },
-  );
-}
-
 async function inspectLockContention(client: PoolClient): Promise<LockDiagnostic[]> {
   const result = await client.query<LockDiagnostic>(`
     select a.pid as holder_pid,
-           nullif(left(a.application_name, 80), '') as application_name,
-           left(coalesce(a.client_addr::text, a.client_hostname, 'local'), 80) as client_identity,
+           null::text as application_name,
+           null::text as client_identity,
            a.state,
-           case when a.xact_start is null then null else clock_timestamp() - a.xact_start end as transaction_age,
-           case when a.query_start is null then null else clock_timestamp() - a.query_start end as query_age,
+           -- ::text deliberately, in the database. node-postgres decodes an
+           -- interval into a PostgresInterval *object*, which the diagnostic
+           -- allowlist below (correctly) refuses, so against real PostgreSQL
+           -- both ages silently became null and the one bounded, non-sensitive
+           -- duration signal an operator has was lost. Casting here keeps the
+           -- allowlist narrow — it still only ever accepts a short string of
+           -- digits and separators — rather than teaching it about objects.
+           case when a.xact_start is null then null else (clock_timestamp() - a.xact_start)::text end as transaction_age,
+           case when a.query_start is null then null else (clock_timestamp() - a.query_start)::text end as query_age,
            a.wait_event_type,
            case
              when a.backend_type <> 'client backend' then 'non-client backend'
@@ -4028,6 +4099,27 @@ async function inspectLockContention(client: PoolClient): Promise<LockDiagnostic
      order by a.pid
   `, [...SCHEMA_ADVISORY_LOCK]);
   return result.rows;
+}
+
+function sanitizedLockDiagnostics(holders: LockDiagnostic[]): LockDiagnostic[] {
+  return holders.map((holder) => {
+    try {
+      return {
+        holder_pid: Number.isSafeInteger(holder.holder_pid) ? holder.holder_pid : 0,
+        application_name: null,
+        client_identity: null,
+        state: typeof holder.state === "string" && /^[a-z ]{1,32}$/.test(holder.state) ? holder.state : null,
+        transaction_age: typeof holder.transaction_age === "string" && /^[0-9: .+-]{1,40}$/.test(holder.transaction_age) ? holder.transaction_age : null,
+        query_age: typeof holder.query_age === "string" && /^[0-9: .+-]{1,40}$/.test(holder.query_age) ? holder.query_age : null,
+        wait_event_type: typeof holder.wait_event_type === "string" && /^[A-Za-z ]{1,40}$/.test(holder.wait_event_type) ? holder.wait_event_type : null,
+        command_summary: ["non-client backend", "advisory-lock command", "database command"].includes(holder.command_summary)
+          ? holder.command_summary
+          : "database command",
+      };
+    } catch {
+      return { holder_pid: 0, application_name: null, client_identity: null, state: null, transaction_age: null, query_age: null, wait_event_type: null, command_summary: "database command" };
+    }
+  });
 }
 
 interface NormalizedSchemaLockOptions {
@@ -4181,7 +4273,7 @@ async function withSchemaAdvisoryLock<T>(
       acquired = result.rows[0]?.acquired === true;
       if (acquired) break;
 
-      diagnose(await inspectLockContention(client));
+      diagnose(sanitizedLockDiagnostics(await inspectLockContention(client)));
       const elapsed = now() - startedAt;
       if (elapsed >= budgetMs) throw new Error(`Schema advisory lock was not acquired within ${budgetMs}ms`);
       await Promise.race([sleep(Math.min(pollMs, budgetMs - elapsed)), connectionLost]);
@@ -4324,19 +4416,19 @@ export async function runMigrationPlan(
   pool: Pool,
   options: SchemaLockOptions & { manifest?: MigrationManifest } = {},
 ): Promise<MigrationPlan> {
-  const manifest = options.manifest ?? await checkManifest();
-  // PB-10 Step 3 Phase 2d, CRITICAL 1: deterministic caller input is rejected
-  // here, while this call still owns no database resources at all. Nothing
-  // between the acquisition below and the boundary's own unconditional
-  // finalizer can throw.
-  normalizeSchemaLockOptions(options);
-  const client = await pool.connect();
-  return withSchemaAdvisoryLock(client, async (lockedClient) => {
-    await verifyControlSchema(lockedClient);
-    const rows = await readAppliedRows(lockedClient);
-    await assertNoLegacyLedgerDivergence(lockedClient, rows, manifest);
-    return buildMigrationPlan(manifest, rows, options);
-  }, options);
+  try {
+    const manifest = options.manifest ?? await checkManifest();
+    normalizeSchemaLockOptions(options);
+    const client = await pool.connect();
+    return await withSchemaAdvisoryLock(client, async (lockedClient) => {
+      await verifyControlSchema(lockedClient);
+      const rows = await readAppliedRows(lockedClient);
+      await assertNoLegacyLedgerDivergence(lockedClient, rows, manifest);
+      return buildMigrationPlan(manifest, rows, options);
+    }, options);
+  } catch (error) {
+    throw sanitizeMigrationError(error, "PB10_MIGRATION_PLAN_FAILED");
+  }
 }
 
 async function executeVerifiedMigrations(
@@ -4671,9 +4763,13 @@ async function executeVerifiedMigrations(
  * input is derived internally before a database connection is acquired.
  */
 export async function executeMigrations(pool: Pool): Promise<ExecutionReport> {
-  if (arguments.length !== 1) {
-    throw new Error("executeMigrations accepts exactly one Pool argument; alternate execution inputs are not supported");
+  try {
+    if (arguments.length !== 1) {
+      throw new Error("executeMigrations accepts exactly one Pool argument; alternate execution inputs are not supported");
+    }
+    const manifest = await checkManifest();
+    return await executeVerifiedMigrations(pool, manifest, identityFromEnvironment());
+  } catch (error) {
+    throw sanitizeMigrationError(error, "PB10_MIGRATION_EXECUTION_FAILED");
   }
-  const manifest = await checkManifest();
-  return executeVerifiedMigrations(pool, manifest, identityFromEnvironment());
 }

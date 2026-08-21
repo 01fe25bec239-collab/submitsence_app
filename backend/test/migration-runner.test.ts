@@ -12,11 +12,13 @@ import {
 } from "./helpers/control-schema-fixture";
 import {
   SCHEMA_ADVISORY_LOCK,
+  assertNoLegacyLedgerDivergence,
   buildMigrationPlan,
   renderMigrationPlan,
   runMigrationPlan,
   verifyControlSchema,
   type AppliedMigrationRow,
+  type LockDiagnostic,
 } from "../src/db/migrate/runner";
 
 const repositoryRoot = path.resolve(__dirname, "../..");
@@ -272,6 +274,14 @@ function plan(client: LockClient, options: Record<string, unknown> = {}): Promis
   return runMigrationPlan(poolOf(client), { manifest, ...options });
 }
 
+function isPlanDiagnostic(error: unknown): boolean {
+  assert.ok(error instanceof Error);
+  assert.equal(error.message, "Migration plan failed");
+  assert.equal((error as Error & { code?: string }).code, "PB10_MIGRATION_PLAN_FAILED");
+  assert.equal(error.stack, undefined);
+  return true;
+}
+
 /** Fails if an uncaughtException or unhandledRejection fires while `run` executes. */
 async function withStrictProcessErrors<T>(run: () => Promise<T>): Promise<T> {
   const uncaught: unknown[] = [];
@@ -332,7 +342,7 @@ test("lock timeout is bounded and still releases a non-lock-bearing client", asy
       sleep: async (milliseconds: number) => { clock += milliseconds; },
       diagnose: () => undefined,
     }),
-    /within 12ms/,
+    isPlanDiagnostic,
   );
   assert.equal(clock, 12);
   assert.deepEqual(client.events.slice(-1), ["release"]);
@@ -344,14 +354,27 @@ test("contention diagnostics expose bounded classifications, never raw query tex
   client.probes = [false, true];
   client.diagnostics = [{
     holder_pid: 42,
-    application_name: "migration-task",
-    client_identity: "127.0.0.1",
+    application_name: "phase2e-application-secret",
+    client_identity: "phase2e-host.internal",
     state: "active",
     transaction_age: "00:00:01",
     query_age: "00:00:01",
     wait_event_type: null,
     command_summary: "database command",
-  }];
+  }, {
+    // The shape node-postgres actually decodes a PostgreSQL interval into.
+    // The allowlist must keep refusing it (an arbitrary object never crosses
+    // the boundary) — which is exactly why the contention query casts both
+    // ages to text in the database, asserted below.
+    holder_pid: 43,
+    application_name: null,
+    client_identity: null,
+    state: "idle in transaction",
+    transaction_age: { years: 0, months: 0, days: 0, hours: 0, minutes: 0, seconds: 1, milliseconds: 250, toPostgres: () => "1.25 seconds" },
+    query_age: { years: 0, months: 0, days: 0, hours: 0, minutes: 0, seconds: 1, milliseconds: 250, toPostgres: () => "1.25 seconds" },
+    wait_event_type: null,
+    command_summary: "advisory-lock command",
+  } as unknown as LockDiagnostic, new Proxy({}, { get() { throw new Error("phase2e-getter-secret"); } })];
   const seen: unknown[] = [];
   await plan(client, {
     pollMs: 1,
@@ -365,8 +388,14 @@ test("contention diagnostics expose bounded classifications, never raw query tex
   });
   const rendered = JSON.stringify(seen);
   assert.match(rendered, /holder_pid/);
-  assert.doesNotMatch(rendered, /select .*from|secret|password/i);
+  assert.doesNotMatch(rendered, /select .*from|secret|password|phase2e-host/i);
+  assert.match(rendered, /"holder_pid":0/, "an uninspectable holder fails closed without escaping the callback boundary");
   assert.ok(client.queries.some(({ sql }) => sql.includes("pg_locks") && sql.includes("pg_stat_activity")));
+  assert.match(rendered, /"holder_pid":43,[^}]*"transaction_age":null,"query_age":null/, "a raw driver interval object is refused, never rendered");
+  // ...and because it is refused, the ages have to arrive as text already.
+  const contention = client.queries.find(({ sql }) => sql.includes("pg_stat_activity"))?.sql ?? "";
+  assert.match(contention, /\(clock_timestamp\(\) - a\.xact_start\)::text end as transaction_age/);
+  assert.match(contention, /\(clock_timestamp\(\) - a\.query_start\)::text end as query_age/);
 });
 
 test("control-connection loss aborts and destroys the client", async () => {
@@ -378,7 +407,7 @@ test("control-connection loss aborts and destroys the client", async () => {
   // failure of its own, which is exactly the case where the connection
   // failure is the outcome the caller must see.
   client.actionHook = () => { client.emit("error", new Error("control connection lost")); };
-  await assert.rejects(plan(client), /control connection lost/);
+  await assert.rejects(plan(client), isPlanDiagnostic);
   assert.match(client.releasedWith?.message ?? "", /control connection lost/);
   assert.ok(!client.events.includes("unlock"));
 });
@@ -433,7 +462,7 @@ test("ownership: a lost connection never returns, unlocks, or releases while the
     assert.ok(!client.events.includes("marker-persisted"), "the durable marker genuinely has not been written yet");
 
     persist();
-    await assert.rejects(pending, /commit_outcome_unknown/, "the action's own outcome is what the caller sees");
+    await assert.rejects(pending, isPlanDiagnostic, "the public boundary reports only the fixed plan diagnostic");
     assert.deepEqual(
       client.events.slice(-2),
       ["marker-persisted", "release-error"],
@@ -450,10 +479,7 @@ test("unlock false and unlock errors destroy the pinned client", async () => {
     const client = new PlanClient();
     if (failure === "false") client.unlockResult = false;
     else client.unlockError = new Error("unlock query failed");
-    await assert.rejects(
-      plan(client),
-      failure === "false" ? /returned false/ : /unlock query failed/,
-    );
+    await assert.rejects(plan(client), isPlanDiagnostic);
     assert.ok(client.releasedWith instanceof Error);
     assert.deepEqual(client.events.slice(-2), ["unlock", "release-error"]);
   }
@@ -465,7 +491,7 @@ test("plan action failures still unlock before release", async () => {
     client.events.push("plan-failed");
     throw new Error("catalog drift");
   };
-  await assert.rejects(plan(client), /catalog drift/);
+  await assert.rejects(plan(client), isPlanDiagnostic);
   assert.deepEqual(client.events, ["probe", "plan-failed", "unlock", "reset-rollback", "reset-discard", "reset-proof", "release"]);
 });
 
@@ -502,7 +528,7 @@ test("ownership: cancellation query rejects first, then a late client 'error' ev
     client.emit("error", new Error("terminating connection due to administrator command"));
     client.settleUnlock(); // the unlock response itself still arrives, reporting success
 
-    await assert.rejects(pending, /cancellation_unverified/);
+    await assert.rejects(pending, isPlanDiagnostic);
     assert.equal(client.releaseCount, 1, "the control client must be released exactly once");
     assert.ok(client.releasedWith instanceof Error, "a late connection error must still force a destructive release, even after an apparently-successful unlock");
     // A discarded connection intentionally keeps a (no-op) listener attached
@@ -534,8 +560,7 @@ test("ownership: cancellation query rejects first, then the unlock attempt itsel
       // must be preserved rather than silently dropping one.
       assert.ok(error instanceof AggregateError, `expected AggregateError, got: ${error.constructor.name}: ${error.message}`);
       assert.equal(error.errors.length, 2);
-      assert.match(String(error.errors[0]), /cancellation_unverified/);
-      assert.match(String(error.errors[1]), /Connection terminated unexpectedly/);
+      assert.ok(error.errors.every(isPlanDiagnostic));
       return true;
     });
     assert.equal(client.releaseCount, 1, "the control client must be released exactly once");
@@ -563,7 +588,7 @@ test("ownership: a control 'error' event occurs before the cancellation query it
     };
     const pending = plan(client);
 
-    await assert.rejects(pending, /cancellation_unverified/);
+    await assert.rejects(pending, isPlanDiagnostic);
     assert.ok(!client.events.includes("unlock"), "an already-uncertain connection must never be depended on for a healthy unlock");
     assert.equal(client.releaseCount, 1, "the control client must be released exactly once");
     assert.ok(client.releasedWith instanceof Error);
@@ -579,7 +604,7 @@ test("ownership: an ordinary non-connection cancellation-query error still allow
     };
     const pending = plan(client);
 
-    await assert.rejects(pending, /permission denied/);
+    await assert.rejects(pending, isPlanDiagnostic);
     assert.deepEqual(client.events, ["probe", "unlock", "reset-rollback", "reset-discard", "reset-proof", "release"], "an ordinary SQL-level failure, with no connection-level signal, must still unlock and release healthily");
     assert.equal(client.releaseCount, 1);
     assert.equal(client.releasedWith, undefined, "a merely logical failure must never destroy a healthy connection");
@@ -599,8 +624,7 @@ test("ownership: advisory unlock fails after the action has already failed, with
     await assert.rejects(pending, (error: Error) => {
       assert.ok(error instanceof AggregateError);
       assert.equal(error.errors.length, 2);
-      assert.match(String(error.errors[0]), /syntax error/);
-      assert.match(String(error.errors[1]), /could not send data to server/);
+      assert.ok(error.errors.every(isPlanDiagnostic));
       return true;
     });
     assert.equal(client.releaseCount, 1);
@@ -797,8 +821,12 @@ test("plan fails closed when the legacy ledger diverges from an empty control le
   diverged.legacyLedgerRows = manifest.migrations.map(({ filename }) => filename);
   const pool = { connect: async () => diverged as unknown as PoolClient } as unknown as Pool;
   await assert.rejects(
-    runMigrationPlan(pool, { manifest }),
+    assertNoLegacyLedgerDivergence(diverged as unknown as PoolClient, [], manifest),
     /incompatible.*legacy rows: 24, control rows: 0/,
+  );
+  await assert.rejects(
+    runMigrationPlan(pool, { manifest }),
+    isPlanDiagnostic,
   );
   assert.ok(diverged.queries.some(({ sql }) => /select\s+filename/i.test(sql)));
   assert.deepEqual(diverged.events.slice(-5), ["unlock", "reset-rollback", "reset-discard", "reset-proof", "release"]);
@@ -826,8 +854,10 @@ test("complete legacy and control ledgers must match exactly", async () => {
     client.legacyLedgerPresent = true;
     client.legacyLedgerRows = legacy;
     const pool = { connect: async () => client as unknown as PoolClient } as unknown as Pool;
-    if (pattern) await assert.rejects(runMigrationPlan(pool, { manifest }), pattern);
-    else await runMigrationPlan(pool, { manifest });
+    if (pattern) {
+      await assert.rejects(assertNoLegacyLedgerDivergence(client as unknown as PoolClient, control, manifest), pattern);
+      await assert.rejects(runMigrationPlan(pool, { manifest }), isPlanDiagnostic);
+    } else await runMigrationPlan(pool, { manifest });
   };
 
   await check(
@@ -878,8 +908,10 @@ test("legacy applied_at values must be valid, finite, distinct timestamps", asyn
     client.legacyLedgerRows = filenames;
     client.legacyLedgerTimestamps = timestamps;
     const pool = { connect: async () => client as unknown as PoolClient } as unknown as Pool;
-    if (pattern) await assert.rejects(runMigrationPlan(pool, { manifest }), pattern);
-    else assert.equal((await runMigrationPlan(pool, { manifest })).appliedCount, filenames.length);
+    if (pattern) {
+      await assert.rejects(assertNoLegacyLedgerDivergence(client as unknown as PoolClient, client.ledgerRows, manifest), pattern);
+      await assert.rejects(runMigrationPlan(pool, { manifest }), isPlanDiagnostic);
+    } else assert.equal((await runMigrationPlan(pool, { manifest })).appliedCount, filenames.length);
   };
 
   const [first, second, third] = manifest.migrations;
@@ -960,12 +992,12 @@ test("unsupported execution commands fail clearly before connecting", () => {
   for (const command of ["run", "apply", "clean-install", "baseline-adopt", ""]) {
     const result = spawn(command);
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /supports only: plan, execute/);
+    assert.match(result.stderr, /Migration plan failed/);
   }
 
   // execute is recognised, but still refuses to run without a target database.
   const recognised = spawn("execute", "--json");
   assert.notEqual(recognised.status, 0);
-  assert.doesNotMatch(recognised.stderr, /supports only/);
-  assert.match(recognised.stderr, /DATABASE_URL is required/);
+  assert.doesNotMatch(recognised.stderr, /supports only|DATABASE_URL/);
+  assert.match(recognised.stderr, /Migration execution failed/);
 });

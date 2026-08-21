@@ -86,8 +86,8 @@ async function readManifest(root: string): Promise<{ manifest: MigrationManifest
   let parsed: unknown;
   try {
     parsed = JSON.parse(source);
-  } catch (error) {
-    throw new Error(`Invalid migration manifest JSON: ${(error as Error).message}`);
+  } catch {
+    throw new Error("Invalid migration manifest JSON");
   }
   validateManifest(parsed);
   return { manifest: parsed, source };
@@ -327,8 +327,12 @@ async function main(): Promise<void> {
 }
 
 if (require.main === module) {
-  main().catch((error: unknown) => {
-    console.error(error instanceof Error ? error.message : error);
+  main().catch(() => {
+    try {
+      process.stderr.write("Migration manifest operation failed\n");
+    } catch {
+      // The command has already failed; never create a raw fallback path.
+    }
     process.exitCode = 1;
   });
 }

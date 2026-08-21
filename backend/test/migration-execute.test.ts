@@ -7,8 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import test, { after, mock } from "node:test";
 import type { Pool, PoolClient } from "pg";
-import type { MigrationManifest, MigrationManifestEntry } from "../src/db/migrate/manifest";
-import type { AppliedMigrationRow } from "../src/db/migrate/runner";
+import { checkManifest, type MigrationManifest, type MigrationManifestEntry } from "../src/db/migrate/manifest";
+import { assertNoLegacyLedgerDivergence, buildMigrationPlan, type AppliedMigrationRow } from "../src/db/migrate/runner";
 import {
   SCHEMA_RUNNER_WALL_CLOCK_MS,
   TIMEOUT_CEILINGS,
@@ -858,6 +858,14 @@ function options(pool: FakePool, overrides: Partial<TestExecuteOptions> = {}): T
 const run = (pool: FakePool, overrides: Partial<TestExecuteOptions> = {}) =>
   executeMigrationsForTest(pool as unknown as Pool, options(pool, overrides));
 
+function isExecutionDiagnostic(error: unknown): boolean {
+  assert.ok(error instanceof Error);
+  assert.equal(error.message, "Migration execution failed");
+  assert.equal((error as Error & { code?: string }).code, "PB10_MIGRATION_EXECUTION_FAILED");
+  assert.equal(error.stack, undefined);
+  return true;
+}
+
 async function expectManifestPreflightRejection(
   mutate: (fixtureRoot: string) => void,
   pattern: RegExp,
@@ -867,11 +875,13 @@ async function expectManifestPreflightRejection(
   cpSync(root, fixtureRoot, { recursive: true });
   try {
     mutate(fixtureRoot);
+    await assert.rejects(checkManifest(fixtureRoot), pattern, "the intended manifest invariant must be the one that failed");
     const pool = new FakePool();
-    await assert.rejects(
-      executeMigrationsForTest(pool as unknown as Pool, { repositoryRoot: fixtureRoot, identity }),
-      pattern,
-    );
+    await assert.rejects(executeMigrationsForTest(pool as unknown as Pool, { repositoryRoot: fixtureRoot, identity }), (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, "PB10_MIGRATION_EXECUTION_FAILED");
+      assert.equal((error as Error).message, "Migration execution failed");
+      return true;
+    });
     assert.equal(pool.connects, 0, "manifest rejection must precede control-client acquisition");
     assert.deepEqual(pool.control.events, []);
     assert.deepEqual(pool.migrationSql(), []);
@@ -895,7 +905,7 @@ test("direct JavaScript callers cannot inject any execution boundary input", asy
     const pool = new FakePool();
     await assert.rejects(
       executeMigrations(pool as unknown as Pool, injected as never),
-      /exactly one Pool argument/,
+      /Migration execution failed/,
     );
     assert.equal(pool.connects, 0);
   }
@@ -1225,14 +1235,25 @@ test("ambiguous or invalid legacy timestamps fail before migration SQL or ledger
     [[new Date(Number.POSITIVE_INFINITY)], /invalid applied_at timestamps; manual reconciliation is required/],
     [["2030-01-01T00:00:00.000Z", "not-a-timestamp"], /invalid applied_at timestamps; manual reconciliation is required/],
   ] as Array<[unknown[], RegExp]>) {
+    const manifest = manifestOf(entries.legacy, entries.transactional);
+    const validation = new FakePool();
+    validation.control.legacyLedgerRows = timestamps.map((_, index) => (
+      [entries.legacy.filename, entries.transactional.filename][index]
+    ));
+    validation.control.legacyLedgerTimestamps = timestamps;
+    await assert.rejects(
+      assertNoLegacyLedgerDivergence(validation.control as unknown as PoolClient, [], manifest),
+      pattern,
+      "the legacy timestamp validator must distinguish ambiguous from invalid evidence",
+    );
     const pool = new FakePool();
     pool.control.legacyLedgerRows = timestamps.map((_, index) => (
       [entries.legacy.filename, entries.transactional.filename][index]
     ));
     pool.control.legacyLedgerTimestamps = timestamps;
     await assert.rejects(
-      run(pool, { manifest: manifestOf(entries.legacy, entries.transactional) }),
-      pattern,
+      run(pool, { manifest }),
+      /Migration execution failed/,
     );
     assert.deepEqual(pool.migrationSql(), []);
     assert.deepEqual(pool.control.appliedInserts, []);
@@ -1445,7 +1466,7 @@ test("production handlers are private and unsupported modes fail closed", async 
   const handlers = { nontransactional: new Map([["0101", { inspect: async () => "valid" }]]), batched: new Map() };
   await assert.rejects(
     executeMigrations(injected as unknown as Pool, { handlers } as never),
-    /exactly one Pool argument/,
+    /Migration execution failed/,
   );
   assert.equal(injected.connects, 0);
 });
@@ -1502,7 +1523,7 @@ test("loss of the control connection aborts execution and destroys the execution
     pool.execution.settlePendingOperation();
   });
 
-  await assert.rejects(pending, /control connection lost/);
+  await assert.rejects(pending, /Migration execution failed/);
   assert.ok(pool.control.releasedWith instanceof Error, "the control client is destroyed, not returned");
   assert.equal(pool.control.unlocked, false, "a lost connection must not be trusted to unlock");
   assert.equal(pool.control.releaseCount, 1, "the control client must be released exactly once — never twice");
@@ -1545,9 +1566,7 @@ test("a synchronous throw while installing the execution client's 'error' listen
   pool.execution.failFirstErrorListener = throws(listenerFailure);
 
   await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
-    // Primary-error preservation: cleanup neither replaces nor wraps it.
-    assert.equal(error, listenerFailure, "the original listener-installation error is the reported failure");
-    return true;
+    return isExecutionDiagnostic(error);
   });
 
   assert.equal(pool.connects, 2, "the execution client really was checked out before the failure");
@@ -1607,10 +1626,7 @@ test("an execution client whose error-listener registration always throws still 
   pool.execution.failEveryErrorListener = throws(brokenEmitter);
 
   await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
-    // Primary-error preservation: the disposal's own trouble neither replaces
-    // nor wraps the failure that ended the run.
-    assert.equal(error, brokenEmitter, "the original registration failure is the reported failure");
-    return true;
+    return isExecutionDiagnostic(error);
   });
 
   assert.equal(pool.connects, 2, "the execution client really was checked out before the failure");
@@ -1658,10 +1674,7 @@ test("a failure removing the control listener never skips the execution client's
   pool.control.failRemoveListener = throws(removalFailure);
 
   await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
-    // D. Cleanup-only failure: no migration failure exists, so the cleanup
-    // failure is surfaced as itself rather than swallowed — and, being the only
-    // failure, is thrown unwrapped exactly as Phase 2c's contract requires.
-    assert.equal(error, removalFailure, "the cleanup failure is reported, never swallowed");
+    isExecutionDiagnostic(error);
     assert.ok(!(error instanceof AggregateError), "a lone failure is thrown as itself, not wrapped");
     return true;
   });
@@ -1698,8 +1711,7 @@ test("a control-listener removal failure is composed with a primary migration fa
   await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
     assert.ok(error instanceof AggregateError, "both failures are retained");
     assert.equal(error.errors.length, 2, "and only those two");
-    assert.equal(error.errors[0], primary, "PRIMARY FIRST: the migration's own failure, by identity");
-    assert.equal(error.errors[1], removalFailure, "the cleanup failure is retained alongside it, never in place of it");
+    assert.ok(error.errors.every(isExecutionDiagnostic), "both externally visible members are rebuilt as fixed diagnostics");
     return true;
   });
 
@@ -1721,8 +1733,8 @@ test("an execution-client release failure is composed with a primary migration f
 
   await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
     assert.ok(error instanceof AggregateError, "both failures are retained");
-    assert.equal(error.errors[0], primary, "PRIMARY FIRST: the migration's own failure, by identity");
-    assert.equal(error.errors[1], releaseFailure, "the disposal failure is observable, never silently dropped");
+    assert.equal(error.errors.length, 2);
+    assert.ok(error.errors.every(isExecutionDiagnostic), "both externally visible members are rebuilt as fixed diagnostics");
     return true;
   });
 
@@ -1984,9 +1996,19 @@ test("checksum, filename, order and mode drift all block execution", async () =>
     [{ applied_checksum_sha256: "0".repeat(64) }, /Applied checksum mismatch/],
     [{ ordinal: 2 }, /contiguous ordinal prefix/],
   ] as Array<[Partial<AppliedMigrationRow>, RegExp]>) {
+    const manifest = manifestOf(entries.legacy, entries.transactional);
+    assert.throws(
+      () => buildMigrationPlan(manifest, [appliedRow(entries.legacy, 1, overrides)]),
+      pattern,
+      "the plan validator must distinguish the specific ledger drift",
+    );
     const pool = new FakePool();
     pool.control.ledgerRows = [appliedRow(entries.legacy, 1, overrides)];
-    await assert.rejects(run(pool, { manifest: manifestOf(entries.legacy, entries.transactional) }), pattern);
+    await assert.rejects(run(pool, { manifest }), (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, "PB10_MIGRATION_EXECUTION_FAILED");
+      assert.equal((error as Error).message, "Migration execution failed");
+      return true;
+    });
     assert.deepEqual(pool.migrationSql(), []);
   }
 });
@@ -3288,7 +3310,7 @@ test("phase2d: duplicate finalization of one execution client is exactly once", 
       pool.control.emit("error", lost);
       pool.execution.settlePendingOperation();
     });
-    await assert.rejects(pending, /control connection lost/);
+    await assert.rejects(pending, /Migration execution failed/);
 
     assert.equal(pool.execution.releaseCount, 1, "exactly one terminal disposition, from two independent disposal calls");
     assert.ok(pool.execution.releasedWith instanceof Error, "and it is the destructive one");
@@ -4541,7 +4563,7 @@ for (const { name, make } of diagnosticThrowValues) {
       return true;
     });
 
-    assert.equal(reported?.message, String(thrown as string), "the primitive's own text survives normalization");
+    assert.equal(reported?.message, "Migration execution failed", "raw primitive text is removed at the application boundary");
     assert.equal(pool.execution.releaseAttempts, 1, "exactly one terminal disposition attempt");
     assert.equal(pool.checkedOut, 0, "no client remains checked out");
   });
@@ -4579,8 +4601,8 @@ test("phase2d: a hostile throw from release() itself is still exactly one attemp
 
   await assert.rejects(run(pool, { manifest: manifestOf(entries.transactional) }), (error: unknown) => {
     assert.ok(error instanceof AggregateError, "both failures are retained");
-    assert.equal(error.errors[0], primary, "PRIMARY FIRST, by identity");
-    assert.ok(error.errors[1] instanceof Error, "the disposal failure is normalized, never the raw hostile value");
+    assert.equal(error.errors.length, 2);
+    assert.ok(error.errors.every(isExecutionDiagnostic), "the hostile disposal value and primary are both rebuilt safely");
     return true;
   });
 

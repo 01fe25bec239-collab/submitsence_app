@@ -12,8 +12,6 @@
  * itself a new public entry point.
  */
 
-import { DatabaseError } from "pg";
-
 export const SQLSTATE = /^[0-9A-Z]{5}$/;
 
 /**
@@ -86,6 +84,7 @@ export class MigrationExecutionError extends Error {
     this.errorClass = errorClass;
     this.sqlstate = sqlstate;
     this.migrationId = migrationId;
+    this.stack = undefined;
   }
 }
 
@@ -109,22 +108,6 @@ export function assertCondition(condition: unknown, message: string): asserts co
  * an `instanceof Error` check with a five-character `.code` — is refused as
  * authoritative here, no matter how it was constructed.
  */
-export function sqlstateOf(error: unknown): string | null {
-  if (!(error instanceof DatabaseError)) return null;
-  const code = error.code;
-  return typeof code === "string" && SQLSTATE.test(code) ? code : null;
-}
-
-/**
- * Collapses any driver or server error into the fixed vocabulary. The original
- * message is dropped on purpose: it can contain SQL text, bound parameters or
- * conflicting row values.
- */
-export function classify(error: unknown, errorClass: ErrorClass, migrationId: string, detail: string): MigrationExecutionError {
-  if (error instanceof MigrationExecutionError) return error;
-  return new MigrationExecutionError(errorClass, detail, migrationId, sqlstateOf(error));
-}
-
 /**
  * PB-10 Step 3 Phase 2c final review, HIGH 6: the single sanitized diagnostic
  * path for any PostgreSQL client error the migration runner absorbs rather
@@ -185,8 +168,23 @@ export function reportSanitizedPoolError(error: unknown): void {
     if (alreadyReported.has(error)) return;
     alreadyReported.add(error);
   }
-  process.emitWarning(
-    `[pg_pool_client_error] a PostgreSQL connection used by the migration runner reported a delayed error (code=${safePoolErrorCode(error)}); the affected connection was already excised and is never reused`,
-    { code: "PB10_MIGRATION_POOL_ERROR" },
-  );
+  try {
+    process.emitWarning(
+      `[pg_pool_client_error] a PostgreSQL connection used by the migration runner reported a delayed error (code=${safePoolErrorCode(error)}); the affected connection was already excised and is never reused`,
+      { code: "PB10_MIGRATION_POOL_ERROR" },
+    );
+  } catch {
+    // Diagnostics never outrank connection ownership/finalization.
+  }
+}
+
+export function reportDestroyedMigrationClient(error: unknown): void {
+  try {
+    process.emitWarning(
+      `[pg_migration_client_destroyed] a PostgreSQL connection used by the migration runner could not be proven reusable (code=${safePoolErrorCode(error)}); it was destroyed instead of returned to the pool`,
+      { code: "PB10_MIGRATION_CLIENT_DESTROYED" },
+    );
+  } catch {
+    // The destructive terminal action has already completed.
+  }
 }
